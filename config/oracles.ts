@@ -1,0 +1,264 @@
+import { HOUR, DAY, NetworkName, resolveNetwork } from "./common";
+
+export type OracleVerifyMode = "none" | "etherscan" | "sourcify" | "both";
+
+const ORACLE_STALENESS_BUFFER = 12 * HOUR;
+const ORACLE_MAX_DELAY = DAY + ORACLE_STALENESS_BUFFER;
+
+export interface OracleNetworkDefaults {
+  maxDelay: number;
+  minimumSnapshotDelay: number;
+  maximumSnapshotAge: number;
+}
+
+export const ORACLE_TARGET_DECIMALS = 8;
+
+export const ORACLE_DEFAULTS_BY_NETWORK: Record<
+  NetworkName,
+  OracleNetworkDefaults
+> = {
+  mainnet: {
+    maxDelay: ORACLE_MAX_DELAY,
+    minimumSnapshotDelay: HOUR,
+    maximumSnapshotAge: 30 * DAY,
+  },
+  fork: {
+    maxDelay: ORACLE_MAX_DELAY,
+    minimumSnapshotDelay: HOUR,
+    maximumSnapshotAge: 30 * DAY,
+  },
+};
+
+export const DEFAULT_VERIFY_MODE: OracleVerifyMode = "none";
+
+export interface OracleFeedConfig {
+  id: string;
+  symbol: string;
+  address: string;
+  decimals: number;
+  description: string;
+}
+
+export interface OracleReserveConfig {
+  symbol: string;
+  reserveAddress: string;
+  reserveDecimals: number;
+}
+
+export interface RatioOraclePreset {
+  id: string;
+  label: string;
+  reserveSymbol: string;
+  ratioFeed: OracleFeedConfig;
+  baseFeed: OracleFeedConfig;
+  source: "aave-v3-neverland";
+  maxDelay?: number;
+}
+
+export interface YieldOraclePreset {
+  id: string;
+  label: string;
+  reserveSymbol: string;
+  baseFeed: OracleFeedConfig;
+  sharesContract: string;
+  sharesDecimals: number;
+  assetDecimals: number;
+  source: "aave-v3-neverland";
+  maxDelay?: number;
+  minimumSnapshotDelay?: number;
+  maximumSnapshotAge?: number;
+  description: string;
+  initialGrowthCapBps?: number;
+  initialRejectionGraceBps?: number;
+}
+
+export interface OracleNetworkConfig {
+  poolAddressesProvider: string;
+  feeds: Record<string, OracleFeedConfig>;
+  reserves: Record<string, OracleReserveConfig>;
+  ratioPresets: RatioOraclePreset[];
+  yieldPresets: YieldOraclePreset[];
+}
+
+const MAINNET_FEEDS: Record<string, OracleFeedConfig> = {
+  MON_USD: {
+    id: "MON_USD",
+    symbol: "MON/USD",
+    address: "0xBcD78f76005B7515837af6b50c7C52BCf73822fb",
+    decimals: 8,
+    description: "Chainlink MON / USD",
+  },
+  AUSD_USD: {
+    id: "AUSD_USD",
+    symbol: "AUSD/USD",
+    address: "0xE20751C7B5867bCBef815ffc1b284c3f412a9e13",
+    decimals: 8,
+    description: "Chainlink AUSD / USD",
+  },
+  EARNAUSD_AUSD: {
+    id: "EARNAUSD_AUSD",
+    symbol: "earnAUSD/AUSD",
+    address: "0x66608681545aaa50D9ebdBd9542fEeA4e49B85da",
+    decimals: 18,
+    description: "Chainlink earnAUSD / AUSD",
+  },
+  SMON_MON: {
+    id: "SMON_MON",
+    symbol: "sMON/MON",
+    address: "0x056d0eF95A4e046D028b00E6eC00bB4A8b1eBb96",
+    decimals: 18,
+    description: "Chainlink sMON / MON",
+  },
+  SHMON_MON: {
+    id: "SHMON_MON",
+    symbol: "shMON/MON",
+    address: "0x54a1020D118B9BeF3F3A4ec8E24AeEc9DFdBe4c3",
+    decimals: 18,
+    description: "Chainlink shMON / MON",
+  },
+  GMON_MON: {
+    id: "GMON_MON",
+    symbol: "gMON/MON",
+    address: "0xf97dfEd6Aa4cc387aBC5d47F0062A91CB4E4A755",
+    decimals: 18,
+    description: "Chainlink gMON / MON",
+  },
+  AZND_USD: {
+    id: "AZND_USD",
+    symbol: "AZND/USD",
+    address: "0x63Bb491346fCC8695244D811F0c3501E6C2e8d25",
+    decimals: 8,
+    description: "RedStone AZND / USD",
+  },
+};
+
+const MAINNET_RESERVES: Record<string, OracleReserveConfig> = {
+  WMON: {
+    symbol: "WMON",
+    reserveAddress: "0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A",
+    reserveDecimals: 18,
+  },
+  SMON: {
+    symbol: "sMON",
+    reserveAddress: "0xA3227C5969757783154C60bF0bC1944180ed81B9",
+    reserveDecimals: 18,
+  },
+  SHMON: {
+    symbol: "shMON",
+    reserveAddress: "0x1B68626dCa36c7fE922fD2d55E4f631d962dE19c",
+    reserveDecimals: 18,
+  },
+  GMON: {
+    symbol: "gMON",
+    reserveAddress: "0x8498312A6B3CbD158bf0c93AbdCF29E6e4F55081",
+    reserveDecimals: 18,
+  },
+  AUSD: {
+    symbol: "AUSD",
+    reserveAddress: "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a",
+    reserveDecimals: 6,
+  },
+  EARNAUSD: {
+    symbol: "earnAUSD",
+    reserveAddress: "0x103222f020e98Bba0AD9809A011FDF8e6F067496",
+    reserveDecimals: 6,
+  },
+  LOAZND: {
+    symbol: "loAZND",
+    reserveAddress: "0x9c82eB49B51F7Dc61e22Ff347931CA32aDc6cd90",
+    reserveDecimals: 18,
+  },
+};
+
+const MAINNET_ORACLE_CONFIG: OracleNetworkConfig = {
+  poolAddressesProvider: "0x49D75170F55C964dfdd6726c74fdEDEe75553A0f",
+  feeds: MAINNET_FEEDS,
+  reserves: MAINNET_RESERVES,
+  ratioPresets: [
+    {
+      id: "smon-usd",
+      label: "SMON/USD via SMON/MON * MON/USD",
+      reserveSymbol: "SMON",
+      ratioFeed: MAINNET_FEEDS.SMON_MON,
+      baseFeed: MAINNET_FEEDS.MON_USD,
+      source: "aave-v3-neverland",
+      maxDelay: ORACLE_MAX_DELAY,
+    },
+    {
+      id: "shmon-usd",
+      label: "SHMON/USD via SHMON/MON * MON/USD",
+      reserveSymbol: "SHMON",
+      ratioFeed: MAINNET_FEEDS.SHMON_MON,
+      baseFeed: MAINNET_FEEDS.MON_USD,
+      source: "aave-v3-neverland",
+      maxDelay: ORACLE_MAX_DELAY,
+    },
+    {
+      id: "gmon-usd",
+      label: "GMON/USD via GMON/MON * MON/USD",
+      reserveSymbol: "GMON",
+      ratioFeed: MAINNET_FEEDS.GMON_MON,
+      baseFeed: MAINNET_FEEDS.MON_USD,
+      source: "aave-v3-neverland",
+      maxDelay: ORACLE_MAX_DELAY,
+    },
+    {
+      id: "earnausd-usd",
+      label: "EARNAUSD/USD via EARNAUSD/AUSD * AUSD/USD",
+      reserveSymbol: "EARNAUSD",
+      ratioFeed: MAINNET_FEEDS.EARNAUSD_AUSD,
+      baseFeed: MAINNET_FEEDS.AUSD_USD,
+      source: "aave-v3-neverland",
+      maxDelay: ORACLE_MAX_DELAY,
+    },
+  ],
+  yieldPresets: [
+    {
+      id: "loaznd-usd",
+      label: "loAZND/USD via YieldBearingOracleAdapter",
+      reserveSymbol: "LOAZND",
+      baseFeed: MAINNET_FEEDS.AZND_USD,
+      sharesContract: "0x9c82eB49B51F7Dc61e22Ff347931CA32aDc6cd90",
+      sharesDecimals: 18,
+      assetDecimals: 18,
+      source: "aave-v3-neverland",
+      maxDelay: ORACLE_MAX_DELAY,
+      minimumSnapshotDelay: HOUR,
+      maximumSnapshotAge: 30 * DAY,
+      description: "loAZND / USD via vault shares",
+      initialGrowthCapBps: 2000,
+      initialRejectionGraceBps: 100,
+    },
+  ],
+};
+
+export const ORACLE_CONFIG_BY_NETWORK: Record<
+  NetworkName,
+  OracleNetworkConfig
+> = {
+  mainnet: MAINNET_ORACLE_CONFIG,
+  fork: MAINNET_ORACLE_CONFIG,
+};
+
+export const resolveOracleConfig = (
+  networkName: string
+): OracleNetworkConfig => {
+  const resolvedNetwork = resolveNetwork(networkName);
+  return ORACLE_CONFIG_BY_NETWORK[resolvedNetwork] ?? MAINNET_ORACLE_CONFIG;
+};
+
+export const getRatioPresetById = (
+  networkName: string,
+  id: string
+): RatioOraclePreset | undefined =>
+  resolveOracleConfig(networkName).ratioPresets.find(
+    (preset) => preset.id === id
+  );
+
+export const getYieldPresetById = (
+  networkName: string,
+  id: string
+): YieldOraclePreset | undefined =>
+  resolveOracleConfig(networkName).yieldPresets.find(
+    (preset) => preset.id === id
+  );

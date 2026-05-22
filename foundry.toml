@@ -1,0 +1,39 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+optimizer = true
+optimizer-runs = 200
+extra_output_files = ["abi", "metadata"]
+ignored_error_codes = ["license","code-size","init-code-size","transient-storage",8760,2519,3628]
+fs_permissions = [{ access = "read", path = "./deployments" }]
+
+[profile.oracle-coverage]
+src = "src/oracles"
+test = "test/oracles"
+
+[profile.legendary-ledger-coverage]
+src = "src/tokens"
+test = "test/legendary-ledger"
+
+[profile.governance-coverage]
+src = "src/governance"
+test = "test/governance"
+
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC}"
+
+[lint]
+exclude_lints = [
+  "mixed-case-function",
+  "mixed-case-variable",
+  "unwrapped-modifier-logic",
+  "named-struct-fields",
+  "divide-before-multiply",
+  "unaliased-plain-import",
+  "screaming-snake-case-immutable",
+  "screaming-snake-case-const",
+  "unsafe-typecast",
+  "erc20-unchecked-transfer",
+  "unsafe-cheatcode",
+]

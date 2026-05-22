@@ -1,0 +1,973 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.30;
+
+import {IERC4906} from "@openzeppelin/contracts/interfaces/IERC4906.sol";
+import {IERC6372} from "@openzeppelin/contracts/interfaces/IERC6372.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC721Metadata} from "@openzeppelin/contracts/token/ERC721/extensions/IERC721Metadata.sol";
+import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
+
+import {IRevenueReward} from "./IRevenueReward.sol";
+import {ICreatorToken} from "./ICreatorToken.sol";
+
+/**
+ * @title IDustLock Interface
+ * @author Neverland
+ * @notice Interface for the DustLock contract that manages voting escrow NFTs (veNFTs)
+ * @dev Combines ERC721 with vote-escrow functionality for governance and reward distribution
+ *      Implements ERC721-C (ICreatorToken) for enforced creator earnings on marketplace sales
+ *      Implements EIP-2981 for royalty info queries
+ */
+interface IDustLock is IERC4906, IERC6372, IERC721Metadata, ICreatorToken, IERC2981 {
+    /**
+     * @notice Structure representing a locked token position
+     * @dev Used to track the amount of tokens locked, when they unlock, and if they're permanently locked
+     * @param amount Amount of tokens locked in int256 format for consistency with precision calculations
+     * @param effectiveStart Effective start time for penalty calculations (weighted average on lock operations)
+     * @param end Timestamp when tokens unlock (0 for permanent locks)
+     * @param isPermanent Whether this is a permanent lock that cannot be withdrawn normally
+     */
+    struct LockedBalance {
+        int256 amount;
+        uint256 effectiveStart;
+        uint256 end;
+        bool isPermanent;
+    }
+
+    /**
+     * @notice Checkpoint for tracking user voting power at a specific point in time
+     * @dev Used in the vote-escrow system to track decay of voting power over time
+     * @param bias Voting power at time ts
+     * @param slope Rate of voting power decrease per second (-dweight/dt)
+     * @param ts Timestamp of the checkpoint
+     * @param blk Block number at which the checkpoint was created
+     * @param permanent Amount of permanent (non-decaying) voting power
+     */
+    struct UserPoint {
+        int256 bias; // WAD format (18 decimals) for precision
+        int256 slope; // WAD format (18 decimals) for precision # -dweight / dt
+        uint256 ts;
+        uint256 blk; // block
+        uint256 permanent;
+    }
+
+    /**
+     * @notice Global checkpoint for tracking total voting power at a specific point in time
+     * @dev Similar to UserPoint but tracks system-wide totals
+     * @param bias Total voting power at time ts
+     * @param slope Total rate of voting power decrease per second (-dweight/dt)
+     * @param ts Timestamp of the checkpoint
+     * @param blk Block number at which the checkpoint was created
+     * @param permanentLockBalance Total amount of permanently locked tokens
+     */
+    struct GlobalPoint {
+        int256 bias; // WAD format (18 decimals) for precision
+        int256 slope; // WAD format (18 decimals) for precision # -dweight / dt
+        uint256 ts;
+        uint256 blk; // block
+        uint256 permanentLockBalance;
+    }
+
+    /**
+     * @notice Types of deposit operations supported by the veNFT system
+     * @param DEPOSIT_FOR_TYPE Adding tokens to an existing lock owned by someone else
+     * @param CREATE_LOCK_TYPE Creating a new lock position
+     * @param INCREASE_LOCK_AMOUNT Adding more tokens to an existing lock
+     * @param INCREASE_UNLOCK_TIME Extending the lock duration of an existing lock
+     */
+    enum DepositType {
+        DEPOSIT_FOR_TYPE,
+        CREATE_LOCK_TYPE,
+        INCREASE_LOCK_AMOUNT,
+        INCREASE_UNLOCK_TIME
+    }
+
+    /// @notice Error thrown when the locked amount is less than minLockAmount
+    error AmountTooSmall();
+
+    /// @notice Error thrown when the requested amount exceeds available balance
+    error AmountTooBig();
+
+    /// @notice Error thrown when an ERC721 receiver contract rejects the tokens
+    error ERC721ReceiverRejectedTokens();
+
+    /// @notice Error thrown when transferring to an address that doesn't implement ERC721Receiver
+    error ERC721TransferToNonERC721ReceiverImplementer();
+
+    /// @notice Error thrown when an early withdraw penalty value is invalid (>=10000)
+    error InvalidWithdrawPenalty();
+
+    /// @notice Error thrown when the lock duration doesn't extend beyond the current time
+    error LockDurationNotInFuture();
+
+    /// @notice Error thrown when the lock duration exceeds the maximum allowed time
+    error LockDurationTooLong();
+
+    /// @notice Error thrown when the lock duration is less than the minimum required time
+    error LockDurationTooShort();
+
+    /// @notice Error thrown when trying to depositFor to a lock expiring within MINTIME
+    error DepositForLockDurationTooShort();
+
+    /// @notice Error thrown when trying to perform an operation on an expired lock
+    error LockExpired();
+
+    /// @notice Error thrown when trying to withdraw from a lock that hasn't expired yet
+    error LockNotExpired();
+
+    /// @notice Error thrown when no lock is found for the specified token ID
+    error NoLockFound();
+
+    /// @notice Error thrown when the caller is neither the owner nor approved for the token
+    error NotApprovedOrOwner();
+
+    /// @notice Error thrown when trying to unlock a non-permanent lock using unlockPermanent
+    error NotPermanentLock();
+
+    /// @notice Error thrown when the caller is not the owner of the token
+    error NotOwner();
+
+    /// @notice Error thrown when a team-only function is called by a non-team address
+    error NotTeam();
+
+    /// @notice Error thrown when a pending team function is called by a non-pending team address
+    error NotPendingTeam();
+
+    /// @notice Error thrown when trying to withdraw or modify a permanent lock
+    error PermanentLock();
+
+    /// @notice Error thrown when attempting to merge a veNFT with itself
+    error SameNFT();
+
+    /// @notice Error thrown when splitting is not allowed for the user
+    error SplitNotAllowed();
+
+    /// @notice Error thrown when trying to add a token that already has an owner
+    error AlreadyOwned();
+
+    /// @notice Error thrown when setting a revenue reward contract that is not a deployed contract
+    error InvalidRevenueRewardContract();
+
+    /// @notice Error thrown when transfer validator address is not a deployed contract
+    error InvalidTransferValidatorContract();
+
+    /// @notice Error thrown when transfer validation function is invalid
+    error InvalidTransferValidationFunction();
+
+    /// @notice Error thrown when transfer validation fails without a revert reason
+    error TransferValidationFailed();
+
+    /// @notice Error thrown when a transfer is relayed via the trusted forwarder while
+    ///         a transfer validator is active. Gasless NFT transfers are not supported
+    ///         when ERC721-C validation is enabled because the forwarder obscures the
+    ///         original operator identity, preventing the validator from distinguishing
+    ///         marketplace sales from peer-to-peer transfers.
+    error ForwarderTransferNotAllowed();
+
+    /// @notice Error thrown when royalty fee is invalid
+    error InvalidRoyaltyFee();
+
+    /**
+     * @notice Emitted when tokens are deposited into the veNFT system
+     * @param provider Address depositing the tokens
+     * @param tokenId ID of the veNFT being created or modified
+     * @param depositType Type of deposit operation (create, increase amount, etc.)
+     * @param value Amount of tokens deposited
+     * @param locktime Timestamp when the lock expires
+     * @param ts Timestamp when the deposit occurred
+     */
+    event Deposit(
+        address indexed provider,
+        uint256 indexed tokenId,
+        DepositType indexed depositType,
+        uint256 value,
+        uint256 locktime,
+        uint256 ts
+    );
+
+    /**
+     * @notice Emitted when tokens are withdrawn before the lock expiry with a penalty
+     * @param provider Address receiving the withdrawn tokens
+     * @param tokenId ID of the veNFT being withdrawn
+     * @param value Original locked amount
+     * @param amountReturned Amount returned to the user after penalty
+     * @param ts Timestamp when the early withdrawal occurred
+     */
+    event EarlyWithdraw(
+        address indexed provider, uint256 indexed tokenId, uint256 value, uint256 amountReturned, uint256 ts
+    );
+
+    /**
+     * @notice Emitted when tokens are withdrawn after the lock expiry
+     * @param provider Address receiving the withdrawn tokens
+     * @param tokenId ID of the veNFT being withdrawn
+     * @param value Amount of tokens withdrawn
+     * @param ts Timestamp when the withdrawal occurred
+     */
+    event Withdraw(address indexed provider, uint256 indexed tokenId, uint256 value, uint256 ts);
+
+    /**
+     * @notice Emitted when a lock is converted to a permanent lock
+     * @param _owner Address that owns the veNFT
+     * @param _tokenId ID of the veNFT being locked permanently
+     * @param amount Amount of tokens in the lock
+     * @param _ts Timestamp when the permanent lock was created
+     */
+    event LockPermanent(address indexed _owner, uint256 indexed _tokenId, uint256 amount, uint256 _ts);
+
+    /**
+     * @notice Emitted when a permanent lock is unlocked by governance
+     * @param _owner Address that owns the veNFT
+     * @param _tokenId ID of the veNFT being unlocked
+     * @param amount Amount of tokens in the lock
+     * @param _ts Timestamp when the permanent lock was unlocked
+     */
+    event UnlockPermanent(address indexed _owner, uint256 indexed _tokenId, uint256 amount, uint256 _ts);
+
+    /**
+     * @notice Emitted when the transfer validation function is updated
+     * @param oldSelector Previous validation function selector
+     * @param newSelector New validation function selector
+     * @param oldIsView Previous view flag
+     * @param newIsView New view flag
+     */
+    event TransferValidationFunctionUpdated(bytes4 oldSelector, bytes4 newSelector, bool oldIsView, bool newIsView);
+
+    /**
+     * @notice Emitted when a fee-enforced operator is updated
+     * @param operator The operator address
+     * @param enforced Whether fees are enforced for this operator
+     */
+    event FeeEnforcedOperatorUpdated(address operator, bool enforced);
+
+    /**
+     * @notice Emitted when royalty configuration is updated
+     * @param oldReceiver Previous royalty receiver address
+     * @param newReceiver New royalty receiver address
+     * @param oldFeeBps Previous royalty fee in basis points
+     * @param newFeeBps New royalty fee in basis points
+     */
+    event RoyaltyInfoUpdated(address oldReceiver, address newReceiver, uint96 oldFeeBps, uint96 newFeeBps);
+
+    /**
+     * @notice Emitted when the total supply of locked tokens changes
+     * @param prevSupply Previous total locked supply
+     * @param supply New total locked supply
+     */
+    event Supply(uint256 prevSupply, uint256 supply);
+
+    /**
+     * @notice Emitted when two veNFTs are merged
+     * @param _sender Address initiating the merge
+     * @param _from Source veNFT ID (burned in the process)
+     * @param _to Destination veNFT ID (receives combined balance)
+     * @param _amountFrom Amount of tokens in the source veNFT
+     * @param _amountTo Amount of tokens in the destination veNFT before merge
+     * @param _amountFinal Final amount of tokens in the destination veNFT after merge
+     * @param _locktime New lock expiry time for the merged veNFT
+     * @param _ts Timestamp when the merge occurred
+     */
+    event Merge(
+        address indexed _sender,
+        uint256 indexed _from,
+        uint256 indexed _to,
+        uint256 _amountFrom,
+        uint256 _amountTo,
+        uint256 _amountFinal,
+        uint256 _locktime,
+        uint256 _ts
+    );
+
+    /**
+     * @notice Emitted when a veNFT is split into two separate veNFTs
+     * @param _from Original veNFT ID being split (burned in the process)
+     * @param _tokenId1 First new veNFT ID created from the split
+     * @param _tokenId2 Second new veNFT ID created from the split
+     * @param _sender Address initiating the split
+     * @param _splitAmount1 Amount of tokens allocated to the first veNFT
+     * @param _splitAmount2 Amount of tokens allocated to the second veNFT
+     * @param _locktime Lock expiry time for both new veNFTs
+     * @param _ts Timestamp when the split occurred
+     */
+    event Split(
+        uint256 indexed _from,
+        uint256 indexed _tokenId1,
+        uint256 indexed _tokenId2,
+        address _sender,
+        uint256 _splitAmount1,
+        uint256 _splitAmount2,
+        uint256 _locktime,
+        uint256 _ts
+    );
+
+    /**
+     * @notice Emitted when a new team address is proposed
+     * @param currentTeam The current team address that proposed the change
+     * @param proposedTeam The newly proposed team address
+     */
+    event TeamProposed(address indexed currentTeam, address indexed proposedTeam);
+
+    /**
+     * @notice Emitted when a proposed team address accepts ownership
+     * @param oldTeam The previous team address
+     * @param newTeam The new team address that accepted ownership
+     */
+    event TeamAccepted(address indexed oldTeam, address indexed newTeam);
+
+    /**
+     * @notice Emitted when a team proposal is cancelled
+     * @param currentTeam The current team address that cancelled the proposal
+     * @param cancelledTeam The proposed team address that was cancelled
+     */
+    event TeamProposalCancelled(address indexed currentTeam, address indexed cancelledTeam);
+
+    /**
+     * @notice Emitted when the early withdraw penalty is updated
+     * @param oldPenalty Previous penalty in basis points
+     * @param newPenalty New penalty in basis points
+     */
+    event EarlyWithdrawPenaltyUpdated(uint256 oldPenalty, uint256 newPenalty);
+
+    /**
+     * @notice Emitted when the early withdraw treasury address is updated
+     * @param oldTreasury Previous treasury address
+     * @param newTreasury New treasury address
+     */
+    event EarlyWithdrawTreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+
+    /**
+     * @notice Emitted when the minimum lock amount is updated
+     * @param oldAmount Previous minimum lock amount
+     * @param newAmount New minimum lock amount
+     */
+    event MinLockAmountUpdated(uint256 oldAmount, uint256 newAmount);
+
+    /**
+     * @notice Emitted when the revenue reward contract is updated
+     * @param oldReward Previous revenue reward contract address
+     * @param newReward New revenue reward contract address
+     */
+    event RevenueRewardUpdated(address indexed oldReward, address indexed newReward);
+
+    /**
+     * @notice Emitted when the split permission is toggled for an account
+     * @param account Address whose permission is updated
+     * @param allowed Whether splitting is now allowed for the account
+     */
+    event SplitPermissionUpdated(address indexed account, bool allowed);
+
+    /**
+     * @notice Emitted when the base URI is updated
+     * @param oldBaseURI Previous base URI
+     * @param newBaseURI New base URI
+     */
+    event BaseURIUpdated(string oldBaseURI, string newBaseURI);
+
+    /*//////////////////////////////////////////////////////////////
+                                STATE VARIABLES
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Address of Meta-tx Forwarder
+     * @return The trusted forwarder address used for meta-transactions
+     */
+    function forwarder() external view returns (address);
+
+    /**
+     * @notice Address of token (DUST) used to create a veNFT
+     * @return The ERC20 token address used to lock and mint veNFTs
+     */
+    function token() external view returns (address);
+
+    /**
+     * @notice Address of Neverland Team multisig
+     * @return The address of the current team multisig with administrative privileges
+     */
+    function team() external view returns (address);
+
+    /**
+     * @notice Address of pending team for two-step ownership transfer
+     * @return The address of the pending team, or address(0) if no proposal exists
+     */
+    function pendingTeam() external view returns (address);
+
+    /*//////////////////////////////////////////////////////////////
+                                ADMIN
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Proposes a new team address for two-step ownership transfer
+     * @dev This is the first step of a two-step ownership transfer process.
+     *      Only the current team can propose a new team address.
+     *      The proposed address must accept ownership to complete the transfer.
+     *      This prevents accidental loss of admin control due to typos or wrong addresses.
+     * @param _newTeam The address of the proposed new team multisig
+     */
+    function proposeTeam(address _newTeam) external;
+
+    /**
+     * @notice Accepts the proposed team address to complete the ownership transfer
+     * @dev Only callable by the pending team address.
+     *      This is the second step in the two-step ownership transfer process.
+     *      Once called, the caller becomes the new team and the pending team is cleared.
+     *      This ensures that the new team controls the proposed address.
+     */
+    function acceptTeam() external;
+
+    /**
+     * @notice Returns the owner address for NFT marketplace compatibility
+     * @dev NFT marketplaces expect contracts to expose an owner() function for collection verification,
+     *      royalty setup, and metadata management. This function returns the team address to satisfy
+     *      marketplace requirements.
+     * @return The team address
+     */
+    function owner() external view returns (address);
+
+    /**
+     * @notice Cancels the pending team proposal
+     * @dev Allows the current team to cancel a pending ownership transfer.
+     *      Only the current team can call this function.
+     *      This is useful if the team made an error in the proposed address.
+     *      After cancellation, a new proposal can be made.
+     */
+    function cancelTeamProposal() external;
+
+    /*///////////////////////////////////////////////////////////////
+                             METADATA STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Returns the name of the token
+     * @return The name of the veNFT token
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @notice Returns the symbol of the token
+     * @return The symbol of the veNFT token
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @notice Returns the version of the contract
+     * @return The current version string of the contract
+     */
+    function version() external view returns (string memory);
+
+    /**
+     * @notice Updates the base URI for computing tokenURI
+     * @dev Can only be called by the team address
+     * @param newBaseURI The new base URI to set for all tokens
+     */
+    function setBaseURI(string calldata newBaseURI) external;
+
+    /**
+     * @notice Current total count of veNFT tokens
+     * @dev Used as a counter for minting new tokens and assigning IDs
+     * @return The current highest token ID value
+     */
+    function tokenId() external view returns (uint256);
+
+    /*//////////////////////////////////////////////////////////////
+                      ERC721 BALANCE/OWNER STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Returns the tokenId owned by `_owner` at position `_index`
+     * @param _owner Owner address to query
+     * @param _index Index of the token within the owner's list
+     * @return _tokenId The tokenId at the given index for the owner
+     */
+    function ownerToNFTokenIdList(address _owner, uint256 _index) external view returns (uint256 _tokenId);
+
+    /// @inheritdoc IERC721
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+
+    /// @inheritdoc IERC721
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    /*//////////////////////////////////////////////////////////////
+                         ERC721 APPROVAL STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IERC721
+    function getApproved(uint256 _tokenId) external view returns (address operator);
+
+    /// @inheritdoc IERC721
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+
+    /**
+     * @notice Check whether spender is owner or an approved user for a given veNFT
+     * @param _spender The address to approve for the tokenId
+     * @param _tokenId The ID of the veNFT to be approved
+     * @return True if `_spender` is owner or approved for `_tokenId`, false otherwise
+     */
+    function isApprovedOrOwner(address _spender, uint256 _tokenId) external view returns (bool);
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC721 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IERC721
+    function approve(address to, uint256 tokenId) external;
+
+    /// @inheritdoc IERC721
+    function setApprovalForAll(address operator, bool approved) external;
+
+    /// @inheritdoc IERC721
+    function transferFrom(address from, address to, uint256 tokenId) external;
+
+    /// @inheritdoc IERC721
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
+
+    /// @inheritdoc IERC721
+    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC165 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IERC165
+    function supportsInterface(bytes4 _interfaceID) external view returns (bool);
+
+    /*//////////////////////////////////////////////////////////////
+                             ESCROW STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Total count of epochs witnessed since contract creation
+     * @return The current epoch number
+     */
+    function epoch() external view returns (uint256);
+
+    /**
+     * @notice Total amount of tokens currently locked in the contract
+     * @return The total supply of locked tokens
+     */
+    function supply() external view returns (uint256);
+
+    /**
+     * @notice Aggregate balance of permanently locked tokens
+     * @dev These tokens cannot be withdrawn through normal means
+     * @return The total amount of permanently locked tokens
+     */
+    function permanentLockBalance() external view returns (uint256);
+
+    /**
+     * @notice Percentage of penalty applied to early withdrawals (in basis points)
+     * @dev Value is between 0 and 10000 (0% to 100%)
+     * @return The current penalty percentage in basis points
+     */
+    function earlyWithdrawPenalty() external view returns (uint256);
+
+    /**
+     * @notice Address that receives penalty fees from early withdrawals
+     * @return The address of the treasury that collects early withdrawal penalties
+     */
+    function earlyWithdrawTreasury() external view returns (address);
+
+    /**
+     * @notice Get the current epoch number for a specific veNFT
+     * @param _tokenId The ID of the veNFT to check
+     * @return _epoch The current epoch number for the specified veNFT
+     */
+    function userPointEpoch(uint256 _tokenId) external view returns (uint256 _epoch);
+
+    /**
+     * @notice Retrieve the scheduled slope change at a given timestamp
+     * @dev Used to calculate future voting power changes due to lock expirations
+     * @param _timestamp The timestamp to check for slope changes
+     * @return The net change in slope (negative value means decrease in voting power)
+     */
+    function slopeChanges(uint256 _timestamp) external view returns (int256);
+
+    /**
+     * @notice Check if an account has permission to split veNFTs
+     * @dev Used to control which addresses can perform veNFT splitting operations
+     * @param _account The address to check for split permission
+     * @return True if the account can split veNFTs, false otherwise
+     */
+    function canSplit(address _account) external view returns (bool);
+
+    /**
+     * @notice Retrieve a global checkpoint at a specific index
+     * @dev Used to track historical voting power across all tokens at different points in time
+     * @param _loc The index of the checkpoint to retrieve
+     * @return The GlobalPoint data at the specified index
+     */
+    function pointHistory(uint256 _loc) external view returns (GlobalPoint memory);
+
+    /**
+     * @notice Get the lock details for a specific veNFT
+     * @dev Returns information about lock amount, end time, and permanent status
+     * @param _tokenId The ID of the veNFT to query
+     * @return The LockedBalance struct containing lock information
+     */
+    function locked(uint256 _tokenId) external view returns (LockedBalance memory);
+
+    /**
+     * @notice Retrieve a user checkpoint for a specific veNFT at a given index
+     * @dev Used to track historical voting power for individual tokens
+     * @param _tokenId The ID of the veNFT to query
+     * @param _loc The index of the user checkpoint to retrieve
+     * @return The UserPoint data at the specified index for the given token
+     */
+    function userPointHistory(uint256 _tokenId, uint256 _loc) external view returns (UserPoint memory);
+
+    /*//////////////////////////////////////////////////////////////
+                              ESCROW LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Create a global checkpoint to record the current state of voting power
+     * @dev Updates the global point history with current voting power data
+     *      This is called automatically by most state-changing functions
+     *      but can be called manually to ensure up-to-date on-chain data
+     */
+    function checkpoint() external;
+
+    /**
+     * @notice Deposit additional tokens for an existing veNFT lock
+     * @dev Anyone (even a smart contract) can deposit tokens for someone else's lock
+     *      The deposit increases the lock amount but does not extend the lock time
+     *      Cannot be used for locks that have already expired
+     * @param _tokenId The ID of the veNFT to deposit for
+     * @param _value Amount of tokens to add to the existing lock
+     */
+    function depositFor(uint256 _tokenId, uint256 _value) external;
+
+    /**
+     * @notice Create a new lock by depositing tokens for the caller
+     * @dev Creates a new veNFT representing the locked tokens
+     *      Lock duration is rounded down to the nearest week
+     * @param _value Amount of tokens to deposit and lock
+     * @param _lockDuration Number of seconds to lock tokens for (rounded down to nearest week)
+     * @return The ID of the newly created veNFT
+     */
+    function createLock(uint256 _value, uint256 _lockDuration) external returns (uint256);
+
+    /**
+     * @notice Create a new lock by depositing tokens for another address
+     * @dev Creates a new veNFT representing the locked tokens and assigns it to the specified recipient
+     *      This is useful for protocols that want to create locks on behalf of their users
+     *      Lock duration is rounded down to the nearest week
+     * @param _value Amount of tokens to deposit and lock
+     * @param _lockDuration Number of seconds to lock tokens for (rounded down to nearest week)
+     * @param _to The address that will own the newly created veNFT
+     * @return The ID of the newly created veNFT
+     */
+    function createLockFor(uint256 _value, uint256 _lockDuration, address _to) external returns (uint256);
+
+    /**
+     * @notice Create a new lock for the caller and immediately make it permanent
+     * @dev UX convenience to perform "create lock" and "make permanent" in a single transaction
+     *      Follows the same validation as `createLock` (min amount, duration bounds, week rounding)
+     * @param _value Amount of tokens to deposit and lock
+     * @param _lockDuration Number of seconds to lock tokens for (rounded down to nearest week)
+     * @return tokenId The ID of the newly created veNFT
+     */
+    function createLockPermanent(uint256 _value, uint256 _lockDuration) external returns (uint256);
+
+    /**
+     * @notice Create a new lock for `to` and immediately make it permanent
+     * @dev UX convenience to mint the veNFT to `to` and set permanence in one transaction
+     *      Uses `to` as the owner for auth semantics; validation mirrors `createLock`
+     * @param _value Amount of tokens to deposit and lock
+     * @param _lockDuration Number of seconds to lock tokens for (rounded down to nearest week)
+     * @param _to The address that will own the newly created veNFT
+     * @return tokenId The ID of the newly created veNFT
+     */
+    function createLockPermanentFor(uint256 _value, uint256 _lockDuration, address _to) external returns (uint256);
+
+    /**
+     * @notice Deposit additional tokens for an existing veNFT without modifying the unlock time
+     * @dev Increases the amount of tokens in a lock while keeping the same unlock date
+     *      Can only be called by the owner of the veNFT or an approved address
+     * @param _tokenId The ID of the veNFT to increase the amount for
+     * @param _value Additional amount of tokens to add to the lock
+     */
+    function increaseAmount(uint256 _tokenId, uint256 _value) external;
+
+    /**
+     * @notice Extend the unlock time for an existing veNFT lock
+     * @dev Increases the lock duration without changing the token amount
+     *      Cannot extend lock time of permanent locks
+     *      New lock time is rounded down to the nearest week
+     *      Can only be called by the owner of the veNFT or an approved address
+     * @param _tokenId The ID of the veNFT to extend the lock duration for
+     * @param _lockDuration New number of seconds until tokens unlock (from current time)
+     */
+    function increaseUnlockTime(uint256 _tokenId, uint256 _lockDuration) external;
+
+    /**
+     * @notice Withdraw all tokens from an expired lock for `_tokenId`
+     * @dev Only possible if the lock has expired and is not a permanent lock
+     *      This function burns the veNFT and returns the locked tokens to the owner
+     *      IMPORTANT: Any unclaimed rebases or rewards will no longer be claimable after calling this
+     *      Users should claim all rebases and rewards prior to withdrawing
+     *      Can only be called by the owner of the veNFT or an approved address
+     * @param _tokenId The ID of the veNFT to withdraw tokens from
+     */
+    function withdraw(uint256 _tokenId) external;
+
+    /**
+     * @notice Withdraw tokens from a lock before it expires, with a time-proportional penalty
+     * @dev Allows users to exit a lock early but with a penalty fee applied
+     *      The penalty is proportional to both `earlyWithdrawPenalty` and remaining time until unlock
+     *      If the lock is permanent, it is internally converted back to a standard time-lock first and
+     *      the early withdraw penalty is computed using the restored lock window. Penalty fees are sent
+     *      to the `earlyWithdrawTreasury` address. Burns the veNFT and returns the non‑penalized portion
+     *      of tokens to the owner. Can only be called by the owner of the veNFT or an approved address
+     * @param _tokenId The ID of the veNFT to withdraw early from
+     */
+    function earlyWithdraw(uint256 _tokenId) external;
+
+    /**
+     * @notice Sets the early withdrawal penalty percentage
+     * @dev Can only be called by the team address
+     *      Value is in basis points (0-10000), where 10000 = 100%
+     * @param _earlyWithdrawPenalty The new penalty percentage in basis points
+     */
+    function setEarlyWithdrawPenalty(uint256 _earlyWithdrawPenalty) external;
+
+    /**
+     * @notice Sets the treasury address that will receive penalty fees from early withdrawals
+     * @dev Can only be called by the team address
+     *      The treasury address receives the penalty portion of tokens from early withdrawals
+     * @param _account The address of the new treasury that will receive penalty fees
+     */
+    function setEarlyWithdrawTreasury(address _account) external;
+
+    /**
+     * @notice Merges two veNFTs by combining their locked tokens into a single veNFT
+     * @dev The source veNFT is burned and its tokens are added to the destination veNFT
+     *      The lock duration/semantics of the destination veNFT are preserved
+     *      Rules:
+     *      - permanent + permanent: allowed (destination stays permanent)
+     *      - non‑permanent + permanent: allowed (permanent principal increases)
+     *      - permanent + non‑permanent: reverts
+     *      - expired source or destination: reverts
+     *      Can only be called by an address that owns or is approved for both veNFTs
+     * @param _from The ID of the source veNFT to merge from (will be burned)
+     * @param _to The ID of the destination veNFT to merge into (will receive the combined tokens)
+     */
+    function merge(uint256 _from, uint256 _to) external;
+
+    /**
+     * @notice Splits a veNFT into two new veNFTs with divided token balances
+     * @dev This operation burns the original veNFT and creates two new ones
+     *      Both new veNFTs maintain the same lock end time as the original
+     *      Requires that the token owner has split permission (canSplit[owner]) or
+     *      the global flag is enabled (canSplit[address(0)]), AND the caller is
+     *      the owner or approved for the veNFT
+     *      If called by an approved operator, that operator will NOT have approval
+     *      on the new veNFTs (approvals on the parent do not carry over to children)
+     *      Cannot split permanent locks
+     * @param _from The ID of the veNFT to split (will be burned)
+     * @param _amount The precise token amount to allocate to the second new veNFT
+     * @return _tokenId1 ID of the first new veNFT with (original amount - _amount) tokens
+     * @return _tokenId2 ID of the second new veNFT with exactly _amount tokens
+     */
+    function split(uint256 _from, uint256 _amount) external returns (uint256 _tokenId1, uint256 _tokenId2);
+
+    /**
+     * @notice Grant or revoke permission for an address to split veNFTs
+     * @dev Can only be called by the team address
+     *      Permission is checked against the token owner, not the caller.
+     *      Setting canSplit[address(0)] = true acts as a global enable: any owner's
+     *      veNFT can be split (by the owner or an approved operator).
+     *      Setting canSplit[address(0)] = false means only owners with individual
+     *      permission (canSplit[owner] = true) can have their veNFTs split.
+     *      Split is allowed when: canSplit[tokenOwner] || canSplit[address(0)]
+     * @param _account The address to modify split permissions for, or address(0) for global setting
+     * @param _bool True to grant permission, false to revoke permission
+     */
+    function toggleSplit(address _account, bool _bool) external;
+
+    /**
+     * @notice Permanently lock a veNFT to give it non-decaying voting power
+     * @dev Converts a standard time-locked veNFT to a permanent lock
+     *      Once permanent, the veNFT cannot be withdrawn normally (even after the original lock time)
+     *      Permanent locks have constant voting power equal to the locked token amount with no time decay
+     *      Note: time served prior to permanence is not preserved for penalty calculations — if the owner
+     *      later calls `earlyWithdraw`, the position is first unlocked and the penalty window resets to a
+     *      full MAXTIME from the current timestamp
+     *      Can only be called by the owner of the veNFT or an approved address
+     *      Cannot be called on a lock that is already permanent
+     * @param _tokenId The ID of the veNFT to permanently lock
+     */
+    function lockPermanent(uint256 _tokenId) external;
+
+    /**
+     * @notice Revert a veNFT from permanent lock status back to a standard time-lock
+     * @dev Converts a permanent lock back to a standard time-based lock
+     *      After unlocking, the veNFT's voting power will decay based on the remaining lock time
+     *      The lock time will be the original lock end time from before it was made permanent
+     *      If the original lock time has already passed, the lock will be immediately withdrawable
+     *      Can only be called by the owner or an approved operator
+     *      Only callable on veNFTs that are currently permanently locked
+     * @param _tokenId The ID of the veNFT to revert from permanent to standard lock
+     */
+    function unlockPermanent(uint256 _tokenId) external;
+
+    /*///////////////////////////////////////////////////////////////
+                           VOTING POWER STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Get the current voting power for a specific veNFT
+     * @dev Calculates voting power based on lock amount, remaining time, and permanent status
+     *      For standard locks: voting power = amount * (time_left / MAXTIME)
+     *      For permanent locks: voting power = amount (no time decay)
+     *      Returns 0 if called in the same block as a transfer due to checkpoint timing
+     *      This is the core function used for governance voting power determination
+     * @param _tokenId The ID of the veNFT to query voting power for
+     * @return The current voting power of the specified veNFT
+     */
+    function balanceOfNFT(uint256 _tokenId) external view returns (uint256);
+
+    /**
+     * @notice Get the historical voting power for a veNFT at a specific timestamp
+     * @dev Uses checkpoints to determine voting power at any point in the past
+     *      Crucial for governance systems that need to determine past voting power
+     *      For timestamps between checkpoints, calculates the interpolated value
+     *      Returns 0 for timestamps before the veNFT was created
+     * @param _tokenId The ID of the veNFT to query historical voting power for
+     * @param _t The timestamp at which to query the voting power
+     * @return The voting power of the specified veNFT at the requested timestamp
+     */
+    function balanceOfNFTAt(uint256 _tokenId, uint256 _t) external view returns (uint256);
+
+    /**
+     * @notice Calculate the total voting power across all veNFTs at the current timestamp
+     * @dev Sums up all individual veNFT voting powers including both time-based and permanent locks
+     *      This represents the total governance voting power in the system right now
+     * @return The aggregate voting power of all veNFTs at the current timestamp
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @notice Calculate the total historical voting power across all veNFTs at a specific timestamp
+     * @dev Uses global checkpoints to determine total voting power at any point in the past
+     *      Critical for governance votes that need to determine the total voting power at a past block
+     *      For timestamps between checkpoints, calculates the interpolated value
+     * @param _t The timestamp at which to query the total voting power
+     * @return The aggregate voting power of all veNFTs at the requested timestamp
+     */
+    function totalSupplyAt(uint256 _t) external view returns (uint256);
+
+    /*//////////////////////////////////////////////////////////////
+                              ERC6372 LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IERC6372
+    function clock() external view returns (uint48);
+
+    /// @inheritdoc IERC6372
+    function CLOCK_MODE() external view returns (string memory);
+
+    /*//////////////////////////////////////////////////////////////
+                          MIN LOCK AMOUNT
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Returns the minimum amount of tokens required to create a veNFT lock
+     * @dev This value is used to validate lock creation and prevent spam attacks
+     * @return The minimum lock amount in token units (with 18 decimals)
+     */
+    function minLockAmount() external view returns (uint256);
+
+    /**
+     * @notice Sets the minimum amount of tokens required to create a veNFT lock
+     * @dev Can only be called by the team address. This helps prevent spam and ensures meaningful lock amounts
+     * @param newMinLockAmount The new minimum lock amount in token units (with 18 decimals)
+     */
+    function setMinLockAmount(uint256 newMinLockAmount) external;
+
+    /*//////////////////////////////////////////////////////////////
+                      NOTIFY CONTRACTS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Returns the revenue reward contract
+     * @dev Returns address(0) if no revenue reward contract is set
+     * @return The revenue reward contract
+     */
+    function revenueReward() external view returns (IRevenueReward);
+
+    /**
+     * @notice Sets the revenue reward contract
+     * @dev Can only be called by the team address
+     * @param _revenueReward The new revenue reward contract
+     */
+    function setRevenueReward(IRevenueReward _revenueReward) external;
+
+    /*//////////////////////////////////////////////////////////////
+                      CREATOR EARNINGS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Returns the transfer validator address
+     * @return validator The address of the transfer validator contract
+     */
+    function transferValidator() external view returns (address validator);
+
+    /**
+     * @notice Returns the royalty receiver address
+     * @return receiver The address that receives royalties
+     */
+    function royaltyReceiver() external view returns (address receiver);
+
+    /**
+     * @notice Returns the royalty fee in basis points
+     * @return feeBps The royalty fee in basis points
+     */
+    function royaltyFeeBps() external view returns (uint96 feeBps);
+
+    /**
+     * @notice Set royalty configuration for protocol fee collection
+     * @dev Only callable by team. Receiver gets fees from marketplace sales for buyback & burn
+     * @param receiver Address to receive royalty payments (protocol treasury)
+     * @param feeBps Royalty fee in basis points (e.g., 250 = 2.5%)
+     */
+    function setRoyaltyInfo(address receiver, uint96 feeBps) external;
+
+    /**
+     * @notice Set the transfer validation function signature and mutability
+     * @dev Only callable by team. Used to support validators that require non-view calls.
+     *      Pass `bytes4(0)` to reset to the default ERC721-C selector
+     *      (`validateTransfer(address,address,address,uint256)`) as a view call.
+     * @param selector The function selector to call on the validator
+     * @param isViewFunction Whether the validation function is a view function
+     */
+    function setTransferValidationFunction(bytes4 selector, bool isViewFunction) external;
+
+    /**
+     * @notice Set whether an operator should enforce creator fees
+     * @dev Only callable by team. Operators are typically marketplace conduits.
+     * @param operator The operator address
+     * @param enforced Whether fees are enforced for this operator
+     */
+    function setFeeEnforcedOperator(address operator, bool enforced) external;
+
+    /**
+     * @notice Returns true if an operator enforces creator fees
+     * @param operator The operator address
+     * @return True if fees are enforced for this operator
+     */
+    function isFeeEnforcedOperator(address operator) external view returns (bool);
+
+    /**
+     * @notice Returns the number of fee-enforced operators
+     * @return The number of operators
+     */
+    function feeEnforcedOperatorCount() external view returns (uint256);
+
+    /**
+     * @notice Returns the fee-enforced operator at a given index
+     * @param index The operator index
+     * @return The operator address
+     */
+    function feeEnforcedOperatorAt(uint256 index) external view returns (address);
+}

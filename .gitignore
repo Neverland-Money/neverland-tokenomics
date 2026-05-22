@@ -1,0 +1,33 @@
+# Compiler files
+cache/
+out/
+artifacts/
+typechain-v5/
+typechain-v6/
+cache_hardhat/
+node_modules/
+.yarn/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Reports and generated files
+coverage/
+lcov.info
+slither.md
+solhint.txt
+aderyn.md
+.gas-snapshot
+
+# Private/operational artifacts that should not exist in the public mirror
+audits/
+ignition/
+script/
+docs/governance/
+governance-*/
+multisig-txs/
+simulation-exports/
+.tenderly-vnet.json
+.tenderly-vnet.env

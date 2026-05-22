@@ -1,0 +1,13 @@
+ds-test/=lib/ds-test/src/
+forge-std/=lib/forge-std/src/
+@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+@openzeppelin-v5/contracts/=lib/openzeppelin-contracts-v5/contracts/
+contracts/=./contracts/
+@aave/core-v3/contracts/=lib/aave-v3-core/contracts/
+@aave-v3-periphery/contracts/=lib/aave-v3-periphery/contracts/
+@chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/
+@prb/math/=lib/prb-math/
+@uniswap/v2-core/=lib/v2-core/
+@uniswap/v3-core/=lib/v3-core/
+@uniswap/v4-core/=lib/v4-core/
