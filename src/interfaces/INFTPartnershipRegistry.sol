@@ -125,12 +125,6 @@ interface INFTPartnershipRegistry {
      */
     error InvalidStaticBoost(uint256 staticBoostBps);
 
-    /**
-     * @notice Thrown when the partnership limit is reached
-     * @param maxPartnerships Maximum number of partnerships allowed
-     */
-    error TooManyPartnerships(uint256 maxPartnerships);
-
     /*//////////////////////////////////////////////////////////////
                                ACTIONS
     //////////////////////////////////////////////////////////////*/

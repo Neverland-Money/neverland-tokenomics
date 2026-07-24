@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import {IEpochManager} from "../../../src/interfaces/IEpochManager.sol";
+
 import "./LeaderboardBase.sol";
 
 contract EpochManagerTest is LeaderboardBase {
@@ -179,5 +181,59 @@ contract EpochManagerTest is LeaderboardBase {
         // Epoch 3 still active
         (,, uint256 e3End,) = epochManager.getEpoch(3);
         assertEq(e3End, 0, "Epoch 3 should still be active");
+    }
+
+    function testScheduledEpochGapAndFuturePreviousEpoch() public {
+        vm.warp(100);
+
+        vm.prank(admin);
+        epochManager.startNewEpoch(100);
+
+        vm.prank(admin);
+        epochManager.endCurrentEpoch(1000);
+
+        vm.prank(admin);
+        epochManager.startNewEpoch(2000);
+
+        assertEq(epochManager.currentEpoch(), 1, "Previous epoch remains active until scheduled end");
+
+        (uint256 activeEpoch, uint256 startTime, uint256 endTime, uint256 duration) = epochManager.getActiveEpoch();
+        assertEq(activeEpoch, 1, "Active epoch");
+        assertEq(startTime, 100, "Active start");
+        assertEq(endTime, 1000, "Scheduled end");
+        assertEq(duration, 900, "Scheduled duration");
+        assertFalse(epochManager.isEpochActive(1), "Scheduled end means isEpochActive reports false");
+
+        vm.warp(1500);
+        assertEq(epochManager.currentEpoch(), 0, "Gap before future epoch");
+        assertTrue(epochManager.isInGapPeriod(), "Gap period");
+
+        (activeEpoch, startTime, endTime, duration) = epochManager.getActiveEpoch();
+        assertEq(activeEpoch, 0, "No active epoch");
+        assertEq(startTime, 0, "No active start");
+        assertEq(endTime, 0, "No active end");
+        assertEq(duration, 0, "No active duration");
+    }
+
+    function testEpochRevertsAndRenounceGuard() public {
+        vm.prank(admin);
+        vm.expectRevert(IEpochManager.NoEpochToEnd.selector);
+        epochManager.endCurrentEpoch(0);
+
+        vm.prank(admin);
+        epochManager.startNewEpoch(0);
+
+        vm.prank(admin);
+        vm.expectRevert(IEpochManager.EpochStillActive.selector);
+        epochManager.startNewEpoch(0);
+
+        vm.prank(admin);
+        vm.expectRevert(IEpochManager.ScheduledEndBeforeStart.selector);
+        epochManager.endCurrentEpoch(block.timestamp);
+
+        // renounceOwnership is disabled via a BARE `revert()` (no named error).
+        vm.prank(admin);
+        vm.expectRevert(bytes(""));
+        epochManager.renounceOwnership();
     }
 }

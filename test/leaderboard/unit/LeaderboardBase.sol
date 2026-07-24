@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import "../../BaseTestLocal.sol";
+import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+
+import {IDustLock} from "../../../src/interfaces/IDustLock.sol";
+
 import {EpochManager} from "../../../src/leaderboard/EpochManager.sol";
 import {LeaderboardConfig} from "../../../src/leaderboard/LeaderboardConfig.sol";
 import {NFTPartnershipRegistry} from "../../../src/leaderboard/NFTPartnershipRegistry.sol";
 import {VotingPowerMultiplier} from "../../../src/leaderboard/VotingPowerMultiplier.sol";
-import {MockERC721} from "../../_utils/MockERC721.sol";
-import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import {Dust} from "../../../src/tokens/Dust.sol";
+import {DustLock} from "../../../src/tokens/DustLock.sol";
 
-abstract contract LeaderboardBase is BaseTestLocal {
+import {BaseTest} from "../../BaseTest.sol";
+import {MockERC721} from "../../_utils/MockERC721.sol";
+
+/**
+ * @title LeaderboardBase
+ * @author Neverland
+ * @notice Lean shared fixture for leaderboard tests without Aave or self-repay deployments
+ */
+abstract contract LeaderboardBase is BaseTest {
+    Dust internal DUST;
+    IDustLock internal dustLock;
+    ProxyAdmin public proxyAdmin;
+
     EpochManager internal epochManager;
     LeaderboardConfig internal leaderboardConfig;
     NFTPartnershipRegistry internal nftRegistry;
@@ -31,11 +47,38 @@ abstract contract LeaderboardBase is BaseTestLocal {
     uint256 constant FIRST_BONUS = 1000; // 0.1 (10%)
     uint256 constant DECAY_RATIO = 9000; // 0.9 (90%)
 
+    /**
+     * @notice Deploys the DUST, DustLock, and leaderboard fixtures used by leaderboard tests.
+     */
     function _testSetup() internal virtual override {
-        super._testSetup();
+        _testSetUpDust();
         _testSetupLeaderboard();
     }
 
+    /**
+     * @notice Deploys the minimal DUST and DustLock fixtures needed for voting-power tests.
+     */
+    function _testSetUpDust() internal {
+        // Seed setup with initial time.
+        skip(1 weeks);
+
+        Dust dustImpl = new Dust();
+        proxyAdmin = new ProxyAdmin();
+        DUST = Dust(_deployProxy(address(dustImpl)));
+        DUST.initialize(admin, 0);
+
+        string memory baseUrl = "https://neverland.money/nfts/";
+        DustLock dustLockImpl = new DustLock(FORWARDER);
+        dustLock = IDustLock(_deployProxy(address(dustLockImpl)));
+        DustLock(address(dustLock)).initialize(FORWARDER, address(DUST), baseUrl);
+
+        vm.label(address(DUST), "DUST");
+        vm.label(address(dustLock), "DustLock");
+    }
+
+    /**
+     * @notice Deploys the leaderboard contract fixtures and partner NFT mocks.
+     */
     function _testSetupLeaderboard() internal {
         // Deploy EpochManager (Upgradeable)
         EpochManager epochManagerImpl = new EpochManager();
@@ -82,12 +125,23 @@ abstract contract LeaderboardBase is BaseTestLocal {
         vm.label(address(nftCollection3), "NFTCollection3");
     }
 
-    // Helper to mint NFTs to users
+    /**
+     * @notice Mints a mock NFT to a test user.
+     * @param collection Mock NFT collection to mint from
+     * @param to Recipient address
+     * @param tokenId Token ID to mint
+     */
     function _mintNFT(MockERC721 collection, address to, uint256 tokenId) internal {
         collection.mint(to, tokenId);
     }
 
-    // Helper to lock DUST and get voting power
+    /**
+     * @notice Locks DUST for a user and returns the created veNFT token ID.
+     * @param user User creating the lock
+     * @param amount Amount of DUST to lock
+     * @param duration Lock duration
+     * @return tokenId Created DustLock veNFT token ID
+     */
     function _lockDust(address user, uint256 amount, uint256 duration) internal returns (uint256 tokenId) {
         deal(address(DUST), user, amount);
 
@@ -95,5 +149,15 @@ abstract contract LeaderboardBase is BaseTestLocal {
         DUST.approve(address(dustLock), amount);
         tokenId = dustLock.createLock(amount, duration);
         vm.stopPrank();
+    }
+
+    /**
+     * @notice Deploys a TransparentUpgradeableProxy for a test implementation.
+     * @param implementation Implementation contract address
+     * @return Proxy address
+     */
+    function _deployProxy(address implementation) internal returns (address) {
+        TransparentUpgradeableProxy proxy = new TransparentUpgradeableProxy(implementation, address(proxyAdmin), "");
+        return address(proxy);
     }
 }

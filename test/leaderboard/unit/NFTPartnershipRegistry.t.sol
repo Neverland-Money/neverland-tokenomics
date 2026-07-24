@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import "./LeaderboardBase.sol";
 import {INFTPartnershipRegistry} from "../../../src/interfaces/INFTPartnershipRegistry.sol";
+import {NFTPartnershipRegistry} from "../../../src/leaderboard/NFTPartnershipRegistry.sol";
+
+import "./LeaderboardBase.sol";
 
 contract NFTPartnershipRegistryTest is LeaderboardBase {
     function testInitialState() public view {
@@ -91,9 +93,13 @@ contract NFTPartnershipRegistryTest is LeaderboardBase {
         // Add partnership
         vm.startPrank(admin);
         nftRegistry.addPartnership(address(nftCollection1), "Collection1", block.timestamp, 0, 0);
-        assertEq(nftRegistry.getPartnershipCount(), 1, "Should have 1 partnership");
+        nftRegistry.addPartnership(address(nftCollection2), "Collection2", block.timestamp, 0, 0);
+        assertEq(nftRegistry.getPartnershipCount(), 2, "Should have 2 partnerships");
 
         // Remove partnership
+        nftRegistry.removePartnership(address(nftCollection2));
+        assertEq(nftRegistry.getPartnershipCount(), 1, "Should have 1 partnership");
+
         nftRegistry.removePartnership(address(nftCollection1));
         vm.stopPrank();
 
@@ -228,18 +234,17 @@ contract NFTPartnershipRegistryTest is LeaderboardBase {
         nftRegistry.addPartnership(address(nftCollection1), "Collection1", block.timestamp, 0, 5001); // > MAX_STATIC_BOOST
     }
 
-    function testAddPartnershipMaxLimit() public {
-        uint256 max = nftRegistry.MAX_PARTNERSHIPS();
+    function testAddPartnershipAllowsMoreThanLaterCandidateLimit() public {
+        uint256 laterCandidateLimit = 50;
 
         vm.startPrank(admin);
-        for (uint256 i = 0; i < max; ++i) {
+        for (uint256 i = 0; i <= laterCandidateLimit; ++i) {
             address collection = address(uint160(1000 + i));
             nftRegistry.addPartnership(collection, "Collection", block.timestamp, 0, 0);
         }
-
-        vm.expectRevert(abi.encodeWithSelector(INFTPartnershipRegistry.TooManyPartnerships.selector, max));
-        nftRegistry.addPartnership(address(uint160(1000 + max)), "Overflow", block.timestamp, 0, 0);
         vm.stopPrank();
+
+        assertEq(nftRegistry.getPartnershipCount(), laterCandidateLimit + 1);
     }
 
     function testPartnershipLifecycle() public {
@@ -267,5 +272,20 @@ contract NFTPartnershipRegistryTest is LeaderboardBase {
         assertEq(nftRegistry.getPartnershipCount(), 0, "Should have 0 partnerships");
 
         vm.stopPrank();
+    }
+
+    function testInitializeValidationAndRenounceGuard() public {
+        NFTPartnershipRegistry registry = NFTPartnershipRegistry(_deployProxy(address(new NFTPartnershipRegistry())));
+        vm.expectRevert(abi.encodeWithSelector(INFTPartnershipRegistry.InvalidFirstBonus.selector, 10_001));
+        registry.initialize(admin, 10_001, DECAY_RATIO);
+
+        registry = NFTPartnershipRegistry(_deployProxy(address(new NFTPartnershipRegistry())));
+        vm.expectRevert(abi.encodeWithSelector(INFTPartnershipRegistry.InvalidDecayRatio.selector, 10_000));
+        registry.initialize(admin, FIRST_BONUS, 10_000);
+
+        // renounceOwnership is disabled via a BARE `revert()` (no named error).
+        vm.prank(admin);
+        vm.expectRevert(bytes(""));
+        nftRegistry.renounceOwnership();
     }
 }

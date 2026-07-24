@@ -3,9 +3,10 @@ pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
-import {LeaderboardConfig} from "../../../src/leaderboard/LeaderboardConfig.sol";
 import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+
+import {LeaderboardConfig} from "../../../src/leaderboard/LeaderboardConfig.sol";
 
 contract LeaderboardGasTest is Test {
     LeaderboardConfig public leaderboard;
@@ -59,11 +60,12 @@ contract LeaderboardGasTest is Test {
             uint256 gasUsed = gasBefore - gasleft();
 
             uint256 gasPerUser = batchSize > 0 ? gasUsed / batchSize : 0;
+            uint256 estimatedMaxUsers = gasPerUser > 0 ? 30_000_000 / gasPerUser : 0;
 
             console.log("Batch size:", batchSize);
             console.log("  Total gas:", gasUsed);
             console.log("  Gas per user:", gasPerUser);
-            console.log("  Estimated max users @ 30M gas:", 30_000_000 / gasPerUser);
+            console.log("  Estimated max users @ 30M gas:", estimatedMaxUsers);
             console.log("");
         }
     }

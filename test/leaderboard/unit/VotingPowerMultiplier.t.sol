@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import "./LeaderboardBase.sol";
 import {IVotingPowerMultiplier} from "../../../src/interfaces/IVotingPowerMultiplier.sol";
+import {VotingPowerMultiplier} from "../../../src/leaderboard/VotingPowerMultiplier.sol";
+
+import "./LeaderboardBase.sol";
 
 contract VotingPowerMultiplierTest is LeaderboardBase {
     function testInitialState() public view {
@@ -81,6 +83,28 @@ contract VotingPowerMultiplierTest is LeaderboardBase {
         vpMultiplier.removeTier(1);
         assertEq(vpMultiplier.getTierCount(), 1, "Should have 1 tier");
         vm.stopPrank();
+    }
+
+    function testRemoveMiddleTierShiftsRemainingTiers() public {
+        vm.startPrank(admin);
+        vpMultiplier.addTier(1000e18, 11_000);
+        vpMultiplier.addTier(5000e18, 12_000);
+        vpMultiplier.addTier(10_000e18, 13_000);
+        vpMultiplier.removeTier(1);
+        vm.stopPrank();
+
+        assertEq(vpMultiplier.getTierCount(), 3, "Should have shifted middle tier away");
+        IVotingPowerMultiplier.VotingPowerTier memory tierOne = vpMultiplier.getTier(1);
+        IVotingPowerMultiplier.VotingPowerTier memory tierTwo = vpMultiplier.getTier(2);
+        assertEq(tierOne.minVotingPower, 5000e18, "First shifted min voting power");
+        assertEq(tierOne.multiplierBps, 12_000, "First shifted multiplier");
+        assertEq(tierTwo.minVotingPower, 10_000e18, "Second shifted min voting power");
+        assertEq(tierTwo.multiplierBps, 13_000, "Second shifted multiplier");
+    }
+
+    function testUninitializedImplementationFallsBackToMinimumMultiplier() public {
+        VotingPowerMultiplier implementation = new VotingPowerMultiplier(address(dustLock));
+        assertEq(implementation.getMultiplierForVotingPower(1e18), implementation.MIN_MULTIPLIER_BPS());
     }
 
     function testRemoveLastTierFails() public {
@@ -298,5 +322,37 @@ contract VotingPowerMultiplierTest is LeaderboardBase {
         assertEq(m3, 12_000, "User3: Tier 2 (1.2x)");
         assertEq(m4, 13_000, "User4: Tier 3 (1.3x)");
         assertEq(m5, 15_000, "User5: Tier 4 (1.5x)");
+    }
+
+    function testUpdateTierBoundaryReverts() public {
+        vm.startPrank(admin);
+        vpMultiplier.addTier(1000e18, 11_000);
+        vpMultiplier.addTier(2000e18, 12_000);
+
+        vm.expectRevert(abi.encodeWithSelector(IVotingPowerMultiplier.InvalidTierIndex.selector, 0));
+        vpMultiplier.updateTier(0, 1, 10_000);
+
+        vm.expectRevert(abi.encodeWithSelector(IVotingPowerMultiplier.MultiplierTooHigh.selector, 9_999));
+        vpMultiplier.updateTier(1, 1500e18, 9_999);
+
+        vm.expectRevert(abi.encodeWithSelector(IVotingPowerMultiplier.TiersNotAscending.selector));
+        vpMultiplier.updateTier(1, 0, 11_500);
+
+        vm.expectRevert(abi.encodeWithSelector(IVotingPowerMultiplier.TiersNotAscending.selector));
+        vpMultiplier.updateTier(1, 2500e18, 11_500);
+        vm.stopPrank();
+    }
+
+    function testRemoveGetTierAndRenounceReverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(IVotingPowerMultiplier.InvalidTierIndex.selector, 999));
+        vpMultiplier.removeTier(999);
+
+        vm.expectRevert(abi.encodeWithSelector(IVotingPowerMultiplier.InvalidTierIndex.selector, 999));
+        vpMultiplier.getTier(999);
+
+        vm.prank(admin);
+        vm.expectRevert();
+        vpMultiplier.renounceOwnership();
     }
 }
