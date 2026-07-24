@@ -34,10 +34,7 @@ contract UserVault is IUserVault, Initializable {
     /// @notice User address
     address public user;
 
-    /**
-     * @notice Disables initializers on the implementation contract
-     * @custom:oz-upgrades-unsafe-allow constructor
-     */
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
@@ -151,10 +148,10 @@ contract UserVault is IUserVault, Initializable {
     {
         address poolAddress = IPoolAddressesProvider(poolAddressesProvider).getPool();
         IERC20(debtToken).safeApprove(poolAddress, amount);
-        uint256 repaid = IPool(poolAddress).repay(debtToken, amount, 2, user);
+        IPool(poolAddress).repay(debtToken, amount, 2, user);
         IERC20(debtToken).safeApprove(poolAddress, 0);
 
-        emit LoanSelfRepaid(user, address(this), poolAddressesProvider, debtToken, repaid);
+        emit LoanSelfRepaid(user, address(this), poolAddressesProvider, debtToken, amount);
     }
 
     /// @inheritdoc IUserVault
@@ -222,19 +219,18 @@ contract UserVault is IUserVault, Initializable {
      * @notice Returns a list of prices from a list of assets addresses
      * @param token1 token1 address
      * @param token2 token2 address
-     * @param poolAddressesProvider Pool addresses provider used to resolve Aave oracle
-     * @return prices The prices of the given assets in USD (8 decimals)
+     * @return The prices of the given assets
      */
     function _getTokenPricesInUsd_8dec(address token1, address token2, IPoolAddressesProvider poolAddressesProvider)
         internal
         view
-        returns (uint256[] memory prices)
+        returns (uint256[] memory)
     {
         address[] memory tokens = new address[](2);
         tokens[0] = token1;
         tokens[1] = token2;
 
-        prices = IAaveOracle(poolAddressesProvider.getPriceOracle()).getAssetsPrices(tokens);
+        return IAaveOracle(poolAddressesProvider.getPriceOracle()).getAssetsPrices(tokens);
     }
 
     /**

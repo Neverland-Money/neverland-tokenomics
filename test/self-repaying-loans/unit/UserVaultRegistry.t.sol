@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import "../BaseTestLocal.sol";
-import {UserVaultRegistry} from "../../src/self-repaying-loans/UserVaultRegistry.sol";
+import "../../BaseTestLocal.sol";
+import {UserVaultRegistry} from "../../../src/self-repaying-loans/UserVaultRegistry.sol";
 
 contract UserVaultRegistryTest is BaseTestLocal {
     UserVaultRegistry registry;

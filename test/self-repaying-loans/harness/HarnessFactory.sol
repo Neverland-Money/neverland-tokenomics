@@ -6,9 +6,9 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 
 import {IPoolAddressesProviderRegistry} from "@aave/core-v3/contracts/interfaces/IPoolAddressesProviderRegistry.sol";
 
-import {IUserVaultRegistry} from "../../src/interfaces/IUserVaultRegistry.sol";
-import {IRevenueReward} from "../../src/interfaces/IRevenueReward.sol";
-import {UserVaultRegistry} from "../../src/self-repaying-loans/UserVaultRegistry.sol";
+import {IUserVaultRegistry} from "../../../src/interfaces/IUserVaultRegistry.sol";
+import {IRevenueReward} from "../../../src/interfaces/IRevenueReward.sol";
+import {UserVaultRegistry} from "../../../src/self-repaying-loans/UserVaultRegistry.sol";
 import {UserVaultHarness} from "./UserVaultHarness.sol";
 
 contract HarnessFactory {

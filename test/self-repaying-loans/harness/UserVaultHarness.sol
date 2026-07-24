@@ -3,7 +3,7 @@ pragma solidity 0.8.30;
 
 import {IPoolAddressesProvider} from "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
 
-import {UserVault} from "../../src/self-repaying-loans/UserVault.sol";
+import {UserVault} from "../../../src/self-repaying-loans/UserVault.sol";
 
 // Exposes the internal functions as an external ones
 contract UserVaultHarness is UserVault {

@@ -1,27 +1,26 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import "forge-std/Test.sol";
-import "../../src/utils/NeverlandUiProvider.sol";
-import "../../src/interfaces/INeverlandUiProvider.sol";
-import "../../src/interfaces/IRevenueReward.sol";
-import "../../src/interfaces/IDustLock.sol";
-import "../../src/interfaces/IDustRewardsController.sol";
-import "../../src/libraries/EpochTimeLibrary.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@aave-v3-periphery/contracts/misc/interfaces/IUiPoolDataProviderV3.sol";
-import "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
+import {IPoolAddressesProvider} from "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
 import {IPoolDataProvider} from "@aave/core-v3/contracts/interfaces/IPoolDataProvider.sol";
 import {IScaledBalanceToken} from "@aave/core-v3/contracts/interfaces/IScaledBalanceToken.sol";
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {DustRewardsController} from "../../src/emissions/DustRewardsController.sol";
-
-import {BaseTestLocal} from "../BaseTestLocal.sol";
-import {RewardsDataTypes} from "@aave-v3-periphery/contracts/rewards/libraries/RewardsDataTypes.sol";
-import {ITransferStrategyBase} from "@aave-v3-periphery/contracts/rewards/interfaces/ITransferStrategyBase.sol";
 import {IEACAggregatorProxy} from "@aave-v3-periphery/contracts/misc/interfaces/IEACAggregatorProxy.sol";
-import {IDustTransferStrategy} from "../../src/interfaces/IDustTransferStrategy.sol";
-import {MockERC20 as MockERC20Test} from "../_utils/MockERC20.sol";
+import {ITransferStrategyBase} from "@aave-v3-periphery/contracts/rewards/interfaces/ITransferStrategyBase.sol";
+import {RewardsDataTypes} from "@aave-v3-periphery/contracts/rewards/libraries/RewardsDataTypes.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import {IDustLock} from "../../../src/interfaces/IDustLock.sol";
+import {IDustRewardsController} from "../../../src/interfaces/IDustRewardsController.sol";
+import {IDustTransferStrategy} from "../../../src/interfaces/IDustTransferStrategy.sol";
+import {INeverlandUiProvider} from "../../../src/interfaces/INeverlandUiProvider.sol";
+
+import {EpochTimeLibrary} from "../../../src/libraries/EpochTimeLibrary.sol";
+
+import {DustRewardsController} from "../../../src/emissions/DustRewardsController.sol";
+import {NeverlandUiProvider} from "../../../src/utils/NeverlandUiProvider.sol";
+import {BaseTestLocal} from "../../BaseTestLocal.sol";
+import {MockERC20 as MockERC20Test} from "../../_utils/MockERC20.sol";
 
 // Minimal mocks for Aave providers
 contract MockUiPoolDataProvider {
@@ -48,6 +47,12 @@ contract MockPoolAddressesProvider {
 
     function getPriceOracle() external view returns (address) {
         return _priceOracle;
+    }
+}
+
+contract MockRevertingPoolAddressesProvider {
+    function getPriceOracle() external pure returns (address) {
+        revert("oracle unavailable");
     }
 }
 
@@ -89,6 +94,16 @@ contract MockPriceOracle {
     function getAssetPrice(address) external pure returns (uint256) {
         // Return 1 USD for any asset to keep tests simple
         return 1e8;
+    }
+}
+
+contract MockHugePriceOracle {
+    function BASE_CURRENCY_UNIT() external pure returns (uint256) {
+        return 1;
+    }
+
+    function getAssetPrice(address) external pure returns (uint256) {
+        return type(uint256).max;
     }
 }
 
@@ -145,6 +160,47 @@ contract MockScaledToken {
     }
 }
 
+contract MockEnumerableDustLock {
+    uint256 public tokenId;
+    mapping(address => uint256) public balanceOf;
+    mapping(uint256 => address) public ownerOf;
+    mapping(address => mapping(uint256 => uint256)) public ownerToNFTokenIdList;
+
+    function setTokenId(uint256 value) external {
+        tokenId = value;
+    }
+
+    function setBalance(address user, uint256 value) external {
+        balanceOf[user] = value;
+    }
+
+    function setOwner(uint256 id, address user) external {
+        ownerOf[id] = user;
+    }
+
+    function setOwnedSlot(address user, uint256 index, uint256 id) external {
+        ownerToNFTokenIdList[user][index] = id;
+    }
+}
+
+contract MockEnumerableDustLockWithoutTokenId {
+    mapping(address => uint256) public balanceOf;
+    mapping(uint256 => address) public ownerOf;
+    mapping(address => mapping(uint256 => uint256)) public ownerToNFTokenIdList;
+
+    function setBalance(address user, uint256 value) external {
+        balanceOf[user] = value;
+    }
+
+    function setOwner(uint256 id, address user) external {
+        ownerOf[id] = user;
+    }
+
+    function setOwnedSlot(address user, uint256 index, uint256 id) external {
+        ownerToNFTokenIdList[user][index] = id;
+    }
+}
+
 contract MockTransferStrategy is IDustTransferStrategy {
     address private immutable _admin;
     address private immutable _controller;
@@ -169,6 +225,40 @@ contract MockTransferStrategy is IDustTransferStrategy {
     function emergencyWithdrawal(address, address, uint256) external override {}
 }
 
+contract NeverlandUiProviderHarness is NeverlandUiProvider {
+    constructor(
+        address dustLock,
+        address revenueReward,
+        address dustRewardsController,
+        address dustOracle,
+        address aaveLendingPoolAddressProvider
+    ) NeverlandUiProvider(dustLock, revenueReward, dustRewardsController, dustOracle, aaveLendingPoolAddressProvider) {}
+
+    function exposedGetRewardSummary(uint256 tokenId, address[] memory rewardTokens)
+        external
+        view
+        returns (RewardSummary memory)
+    {
+        return _getRewardSummary(tokenId, rewardTokens);
+    }
+
+    function exposedGetValidatedOwnedTokenPage(address user, uint256 offset, uint256 limit)
+        external
+        view
+        returns (uint256[] memory ids, uint256 tokenCount, uint256 nextRawOffset, bool hasMore)
+    {
+        return _getValidatedOwnedTokenPage(user, offset, limit);
+    }
+
+    function exposedGetValidatedOwnedTokenIds(address user) external view returns (uint256[] memory ids) {
+        return _getValidatedOwnedTokenIds(user);
+    }
+
+    function exposedRawTokenScanEnd(uint256 start, uint256 upperBound, uint256 limit) external pure returns (uint256) {
+        return _rawTokenScanEnd(start, upperBound, limit);
+    }
+}
+
 contract NeverlandUiProviderTest is BaseTestLocal {
     // Test contracts
     NeverlandUiProvider freshUiProvider;
@@ -189,10 +279,15 @@ contract NeverlandUiProviderTest is BaseTestLocal {
     address private UNDERLYING_ADDR;
     address private ATOKEN_ADDR;
     address private VDEBT_TOKEN_ADDR;
+    address[] private TEST_EMISSION_ASSETS;
 
     // Test constants
     uint256 private constant SECONDS_PER_YEAR = 365 * 24 * 3600;
     uint256 private constant EPOCH_DURATION = 7 days;
+    /// @dev Mirrors NeverlandUiProvider.MIN_RAW_TOKEN_SCAN_PER_CALL (private in source, cannot be imported).
+    uint256 private constant MIN_RAW_SCAN_BUDGET = 32;
+    /// @dev Mirrors NeverlandUiProvider.MAX_RAW_TOKEN_SCAN_PER_CALL (private in source, cannot be imported).
+    uint256 private constant MAX_RAW_SCAN_BUDGET = 1024;
 
     // ---------- Helpers to seed test users ----------
     function _durations2(uint256 a, uint256 b) internal pure returns (uint256[] memory d) {
@@ -237,6 +332,18 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         DUST_LOCK_ADDR = address(dustLock);
         USDC_TOKEN_ADDR = address(mockUSDC);
         DUST_HELPER_ADDR = address(0xF00371);
+        TEST_EMISSION_ASSETS = new address[](11);
+        TEST_EMISSION_ASSETS[0] = DUST_LOCK_ADDR; // veNFT contract (should NOT have emissions)
+        TEST_EMISSION_ASSETS[1] = 0xc7fE001DD712beFb2de20abD34597CeF0250a6Ba;
+        TEST_EMISSION_ASSETS[2] = 0x6D918BFD4b978574b00cfe0f1872931203357d1E;
+        TEST_EMISSION_ASSETS[3] = 0xDD1124Cc06B2fEB6B03B94C0feD40b7352C07C24;
+        TEST_EMISSION_ASSETS[4] = 0x20838Ac96e96049C844f714B58aaa0cb84414d60;
+        TEST_EMISSION_ASSETS[5] = 0x18d5fb20B2D252EaE3C13B51Cb53745F5b7D01dc;
+        TEST_EMISSION_ASSETS[6] = 0xFcb0C1De6159E6CED54CBf1222BB0187EB81e59f;
+        TEST_EMISSION_ASSETS[7] = 0x5e59DEBC244c947Cbc37763AB92E77A1acF24aF0;
+        TEST_EMISSION_ASSETS[8] = 0x0eEa99C3691348E937d33AebBF6aa0537fD0d500;
+        TEST_EMISSION_ASSETS[9] = 0xFDC8BC830Fef4BD6885043A279A768720Ec091be;
+        TEST_EMISSION_ASSETS[10] = 0xB61fe1aF61D75F44450e3Fa84F2f2dd75059897C;
 
         // Create an example reserve with aToken & variable debt token
         MockERC20Test underlying = new MockERC20Test("UNDER", "UNDER", 18);
@@ -281,7 +388,12 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         vm.mockCall(NEVERLAND_DUST_HELPER, abi.encodeWithSignature("latestTimestamp()"), abi.encode(block.timestamp));
         vm.mockCall(NEVERLAND_DUST_HELPER, abi.encodeWithSignature("isPriceCacheStale()"), abi.encode(false));
 
-        // Seed: add a reward token to RevenueReward and create a minimal lock
+        // Create a lock FIRST so the notified rewards land in a live epoch with non-zero voting supply.
+        mintErc20Token(address(DUST), address(this), TOKEN_10K);
+        DUST.approve(DUST_LOCK_ADDR, TOKEN_10K);
+        IDustLock(address(dustLock)).createLock(TOKEN_10K, 26 weeks);
+
+        // Seed: add and notify mockUSDC as a reward token
         vm.startPrank(admin);
         // fund and notify mockUSDC as reward token
         mintErc20Token(address(mockUSDC), admin, USDC_10K);
@@ -289,12 +401,6 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         revenueReward.setRewardDistributor(admin);
         revenueReward.notifyRewardAmount(USDC_TOKEN_ADDR, USDC_10K);
         vm.stopPrank();
-
-        // create a lock to have non-zero supply
-        // fund user with DUST
-        mintErc20Token(address(DUST), address(this), TOKEN_10K);
-        DUST.approve(DUST_LOCK_ADDR, TOKEN_10K);
-        IDustLock(address(dustLock)).createLock(TOKEN_10K, 26 weeks);
 
         // Seed two users with locks and aToken balances for richer tests
         _seedUserWithLocksAndATokens(user1, 500 ether, _durations2(8 weeks, 16 weeks));
@@ -429,6 +535,41 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log("Market data retrieval test passed");
     }
 
+    function test_MarketDataFollowingEpochRewardsMirrorScheduledBucket() public {
+        emit log("=== Testing following-epoch (N+2) reward bucket exposure ===");
+
+        // Fund the epoch after next with a known allocation through the distributor.
+        MockERC20Test fundingToken = new MockERC20Test("NGV05FUND", "NGV05FUND", 18);
+        uint256 fundedAmount = 777 ether;
+        address distributor = revenueReward.rewardDistributor();
+        mintErc20Token(address(fundingToken), distributor, fundedAmount);
+        vm.startPrank(distributor);
+        fundingToken.approve(address(revenueReward), fundedAmount);
+        revenueReward.notifyRewardAmountForFollowingEpoch(address(fundingToken), fundedAmount);
+        vm.stopPrank();
+
+        INeverlandUiProvider.MarketData memory marketData = freshUiProvider.getMarketData();
+        uint256 followingEpoch = EpochTimeLibrary.epochNext(block.timestamp) + EPOCH_DURATION;
+
+        // The N+2 bucket must be exposed one-to-one so a following-epoch-only funding
+        // (notifyRewardAmountForFollowingEpoch) can never appear as zero future rewards.
+        assertEq(marketData.followingEpochRewards.length, marketData.rewardTokens.length);
+        bool fundingTokenSeen;
+        for (uint256 i = 0; i < marketData.rewardTokens.length; i++) {
+            assertEq(
+                marketData.followingEpochRewards[i],
+                revenueReward.tokenRewardsPerEpoch(marketData.rewardTokens[i], followingEpoch)
+            );
+            if (marketData.rewardTokens[i] == address(fundingToken)) {
+                fundingTokenSeen = true;
+                assertEq(marketData.followingEpochRewards[i], fundedAmount, "funded N+2 visible in market feed");
+            }
+        }
+        assertTrue(fundingTokenSeen, "funded reward token is listed");
+
+        emit log("Following-epoch bucket mirrors tokenRewardsPerEpoch for every reward token");
+    }
+
     function test_ProtocolMetadata() public {
         emit log("=== Testing Protocol Metadata ===");
 
@@ -543,7 +684,6 @@ contract NeverlandUiProviderTest is BaseTestLocal {
 
         // Validation
         require(globalStats.totalSupply > 0, "Protocol should have supply");
-        require(dashboard.tokenIds.length >= 0, "User data should be valid");
         emit log("SUCCESS: Complete dashboard functionality verified!");
     }
 
@@ -580,6 +720,18 @@ contract NeverlandUiProviderTest is BaseTestLocal {
             abi.encode(false) // Price is not stale
         );
 
+        /*
+         * The recovered production RevenueReward does not expose the
+         * pendingRewards(address,address) selector used by this PR52 provider.
+         * Mock only this success-path preview; the production-shape regression
+         * in NeverlandUiProviderCoverage keeps the real incompatibility pinned.
+         */
+        vm.mockCall(
+            REVENUE_REWARD_ADDR,
+            abi.encodeWithSignature("pendingRewards(address,address)", USDC_TOKEN_ADDR, user),
+            abi.encode(0)
+        );
+
         emit log_named_address("Testing bundled views for user", user);
 
         // 1. TEST ESSENTIAL USER VIEW
@@ -593,8 +745,6 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log_named_uint("User total locked amount (DUST)", essential.user.totalLockedAmount / 1e18);
         emit log_named_uint("User active lock count", essential.user.tokenIds.length);
         // User may have zero tokens - that's valid for bundled functions
-        require(essential.user.totalVotingPower >= 0, "Voting power should be valid");
-        require(essential.user.tokenIds.length >= 0, "Token count should be valid");
 
         // Validate global stats
         emit log_named_uint("Protocol total supply (DUST)", essential.globalStats.totalSupply / 1e18);
@@ -615,7 +765,6 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log_named_uint("Market TVL USD", essential.marketData.totalValueLockedUSD);
         emit log_named_uint("Current epoch", essential.marketData.currentEpoch);
         require(essential.marketData.rewardTokens.length > 0, "Should have reward tokens");
-        require(essential.marketData.totalValueLockedUSD >= 0, "TVL should be valid");
 
         // 2. TEST EXTENDED USER VIEW
         emit log("");
@@ -695,22 +844,8 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log("");
         emit log("--- CROSS-VALIDATION ---");
 
-        // User data should be valid (can be zero for users with no tokens)
-        require(essential.user.totalVotingPower >= 0, "Essential view should show valid user voting power");
-
         // Global stats should be consistent
         require(essential.globalStats.totalSupply > 0, "Global stats should show protocol supply");
-
-        // Emissions should be present or empty (both valid)
-        require(essential.emissions.rewardTokens.length >= 0, "Should have valid emission reward tokens array");
-
-        // Extended view should have additional data
-        require(
-            extended.unlockSchedule.unlockTimes.length >= 0, "Extended view should have unlock schedule (can be empty)"
-        );
-
-        // Rewards are fetched separately via getUserRewardsSummary
-        require(rewardsSummary.totalRevenue.length >= 0, "Should have rewards summary (can be empty)");
 
         // 4. DATA COMPLETENESS CHECK
         emit log("");
@@ -743,6 +878,32 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log("[PASS] Both views provide comprehensive user data");
         emit log("[SUCCESS] Frontend can now use 2 calls instead of 8+ calls!");
         emit log("=========================================");
+    }
+
+    function testGetUserRewardsSummaryChunksOversizedRewardTokenInput() public {
+        mintErc20Token(address(DUST), user, TOKEN_1);
+        vm.startPrank(user);
+        DUST.approve(address(dustLock), TOKEN_1);
+        uint256 tokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+        vm.stopPrank();
+
+        uint256 len = revenueReward.MAX_TOKENS() + 2;
+        address[] memory rewardTokens = new address[](len);
+        for (uint256 i; i < len; ++i) {
+            rewardTokens[i] = address(uint160(0xA11CE + i));
+        }
+
+        NeverlandUiProviderHarness harness = new NeverlandUiProviderHarness(
+            DUST_LOCK_ADDR,
+            REVENUE_REWARD_ADDR,
+            DUST_REWARDS_CONTROLLER_ADDR,
+            NEVERLAND_DUST_HELPER,
+            LENDING_POOL_ADDRESS_PROVIDER
+        );
+        INeverlandUiProvider.RewardSummary memory summary = harness.exposedGetRewardSummary(tokenId, rewardTokens);
+
+        assertEq(summary.rewardTokens.length, len);
+        assertEq(summary.revenueRewards.length, len);
     }
 
     function test_PriceDataRetrieval() public {
@@ -829,6 +990,91 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log("UI Bootstrap bundle test passed");
     }
 
+    function test_GetAllPricesDefaultsRewardPricesToZeroWhenAaveOracleUnavailable() public {
+        MockPoolAddressesProvider addrProvider = new MockPoolAddressesProvider();
+        addrProvider.setPoolDataProvider(UI_POOL_DATA_PROVIDER);
+
+        NeverlandUiProvider provider = new NeverlandUiProvider(
+            DUST_LOCK_ADDR,
+            REVENUE_REWARD_ADDR,
+            DUST_REWARDS_CONTROLLER_ADDR,
+            NEVERLAND_DUST_HELPER,
+            address(addrProvider)
+        );
+
+        INeverlandUiProvider.PriceData memory priceData = provider.getAllPrices();
+
+        assertGt(priceData.tokens.length, 1, "reward token should be present");
+        assertEq(priceData.prices[1], 0, "missing Aave oracle should not revert");
+        assertEq(priceData.lastUpdated[1], 0, "missing Aave oracle should clear reward timestamp");
+    }
+
+    function test_GetAllPricesDefaultsRewardPricesToZeroWhenAaveProviderReverts() public {
+        NeverlandUiProvider provider = new NeverlandUiProvider(
+            DUST_LOCK_ADDR,
+            REVENUE_REWARD_ADDR,
+            DUST_REWARDS_CONTROLLER_ADDR,
+            NEVERLAND_DUST_HELPER,
+            address(new MockRevertingPoolAddressesProvider())
+        );
+
+        INeverlandUiProvider.PriceData memory priceData = provider.getAllPrices();
+
+        assertGt(priceData.tokens.length, 1, "reward token should be present");
+        assertEq(priceData.prices[1], 0, "reverting Aave provider should not revert");
+        assertEq(priceData.lastUpdated[1], 0, "reverting Aave provider should clear reward timestamp");
+    }
+
+    function test_GetAllPricesDefaultsRewardPricesToZeroWhenAaveOracleNormalizationWouldOverflow() public {
+        MockPoolAddressesProvider addrProvider = new MockPoolAddressesProvider();
+        addrProvider.setPoolDataProvider(UI_POOL_DATA_PROVIDER);
+        addrProvider.setPriceOracle(address(new MockHugePriceOracle()));
+
+        NeverlandUiProvider provider = new NeverlandUiProvider(
+            DUST_LOCK_ADDR,
+            REVENUE_REWARD_ADDR,
+            DUST_REWARDS_CONTROLLER_ADDR,
+            NEVERLAND_DUST_HELPER,
+            address(addrProvider)
+        );
+
+        INeverlandUiProvider.PriceData memory priceData = provider.getAllPrices();
+
+        assertGt(priceData.tokens.length, 1, "reward token should be present");
+        assertEq(priceData.prices[1], 0, "overflowing Aave price normalization should default to zero");
+        assertEq(priceData.lastUpdated[1], 0, "overflowing Aave price should clear reward timestamp");
+    }
+
+    function test_GetAllPricesDefaultsDustFieldsToZeroWhenDustHelperReverts() public {
+        vm.mockCallRevert(
+            NEVERLAND_DUST_HELPER,
+            abi.encodeWithSignature("getPrice()"),
+            abi.encodeWithSignature("Error(string)", "dust helper down")
+        );
+        vm.mockCallRevert(
+            NEVERLAND_DUST_HELPER,
+            abi.encodeWithSignature("latestTimestamp()"),
+            abi.encodeWithSignature("Error(string)", "dust helper down")
+        );
+
+        INeverlandUiProvider.PriceData memory priceData = freshUiProvider.getAllPrices();
+
+        assertEq(priceData.prices[0], 0, "reverting DUST price helper should default price to zero");
+        assertEq(priceData.lastUpdated[0], 0, "reverting DUST timestamp helper should default timestamp to zero");
+    }
+
+    function test_UiBootstrapDefaultsMarketTvlToZeroWhenDustHelperValueReverts() public {
+        vm.mockCallRevert(
+            NEVERLAND_DUST_HELPER,
+            abi.encodeWithSignature("getDustValueInUSD(uint256)", dustLock.supply()),
+            abi.encodeWithSignature("Error(string)", "dust helper down")
+        );
+
+        INeverlandUiProvider.UiBootstrap memory bootstrap = freshUiProvider.getUiBootstrap();
+
+        assertEq(bootstrap.marketData.totalValueLockedUSD, 0, "reverting DUST value helper should not revert bundle");
+    }
+
     // ============= GLOBAL STATS TESTS =============
 
     function test_GlobalStats() public {
@@ -870,6 +1116,202 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         require(dashboard.totalLockedAmount > 0, "Expected non-zero locked amount");
         require(dashboard.totalVotingPower > 0, "Expected non-zero voting power");
         emit log("User dashboard test completed with seeded positions");
+    }
+
+    function test_ValidatedOwnedTokenPaginationSkipsStaleRawSlots() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLock enumerableDustLock = new MockEnumerableDustLock();
+        enumerableDustLock.setTokenId(6);
+        enumerableDustLock.setBalance(user, 2);
+        enumerableDustLock.setOwnedSlot(user, 0, 11);
+        enumerableDustLock.setOwner(11, address(0xB0B));
+        enumerableDustLock.setOwnedSlot(user, 1, 0);
+        enumerableDustLock.setOwnedSlot(user, 2, 21);
+        enumerableDustLock.setOwner(21, user);
+        enumerableDustLock.setOwnedSlot(user, 3, 22);
+        enumerableDustLock.setOwner(22, user);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page, uint256 tokenCount, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 0, 2);
+
+        assertEq(tokenCount, 2, "live balance should be preserved");
+        assertEq(page.length, 2, "page should fill past stale slots");
+        assertEq(page[0], 21, "first valid token");
+        assertEq(page[1], 22, "second valid token");
+        assertEq(nextRawOffset, 4, "cursor should advance by raw scanned slots");
+        assertFalse(hasMore, "all live owned tokens were returned");
+
+        uint256[] memory allIds = provider.exposedGetValidatedOwnedTokenIds(user);
+        assertEq(allIds.length, 2, "all-token scan should also skip stale slots");
+        assertEq(allIds[0], 21, "first all-token id");
+        assertEq(allIds[1], 22, "second all-token id");
+    }
+
+    function test_ValidatedOwnedTokenPaginationDoesNotAdvertiseGlobalMintTail() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLock enumerableDustLock = new MockEnumerableDustLock();
+        enumerableDustLock.setTokenId(100);
+        enumerableDustLock.setBalance(user, 2);
+        enumerableDustLock.setOwnedSlot(user, 0, 71);
+        enumerableDustLock.setOwner(71, user);
+        enumerableDustLock.setOwnedSlot(user, 1, 72);
+        enumerableDustLock.setOwner(72, user);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page, uint256 tokenCount, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 0, 2);
+
+        assertEq(tokenCount, 2, "live balance should be preserved");
+        assertEq(page.length, 2, "full compact page should return both tokens");
+        assertEq(page[0], 71, "first owned token id");
+        assertEq(page[1], 72, "second owned token id");
+        assertEq(nextRawOffset, 2, "cursor should stop after compact owned range");
+        assertFalse(hasMore, "global tokenId tail should not create an empty next page");
+    }
+
+    function test_ValidatedOwnedTokenPaginationZeroLimitDoesNotLoopCursor() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLock enumerableDustLock = new MockEnumerableDustLock();
+        enumerableDustLock.setTokenId(10);
+        enumerableDustLock.setBalance(user, 1);
+        enumerableDustLock.setOwnedSlot(user, 0, 51);
+        enumerableDustLock.setOwner(51, user);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page, uint256 tokenCount, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 0, 0);
+
+        assertEq(tokenCount, 1, "live balance should be preserved");
+        assertEq(page.length, 0, "zero limit returns no tokens");
+        assertEq(nextRawOffset, 0, "zero limit keeps bounded cursor");
+        assertFalse(hasMore, "zero limit must not advertise an infinite next page");
+    }
+
+    function test_ValidatedOwnedTokenPaginationStopsAtRawScanBudget() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLock enumerableDustLock = new MockEnumerableDustLock();
+        enumerableDustLock.setTokenId(2000);
+        enumerableDustLock.setBalance(user, 1);
+        enumerableDustLock.setOwnedSlot(user, 1500, 61);
+        enumerableDustLock.setOwner(61, user);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page,, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 0, 1);
+
+        assertEq(page.length, 0, "sparse page should not scan the global token id range in one call");
+        assertEq(nextRawOffset, MIN_RAW_SCAN_BUDGET, "limit-one page should stop at the minimum raw scan budget");
+        assertTrue(hasMore, "caller can keep paginating through sparse ranges");
+    }
+
+    function test_RawTokenScanEndClampsToMinimumBudget() public {
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(1), address(2), address(3), address(4), address(5));
+
+        assertEq(provider.exposedRawTokenScanEnd(0, 1_000, 1), MIN_RAW_SCAN_BUDGET, "min budget");
+        assertEq(provider.exposedRawTokenScanEnd(0, 10_000, type(uint256).max), MAX_RAW_SCAN_BUDGET, "max budget");
+        assertEq(provider.exposedRawTokenScanEnd(40, 41, 1), 41, "remaining bound wins");
+        assertEq(provider.exposedRawTokenScanEnd(5, 5, 1), 5, "empty range");
+        assertEq(provider.exposedRawTokenScanEnd(0, 1_000, 0), 0, "zero limit");
+    }
+
+    function test_ValidatedOwnedTokenPaginationClampsAllocationToMaxRawScanBudget() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLock enumerableDustLock = new MockEnumerableDustLock();
+        enumerableDustLock.setTokenId(2_000);
+        enumerableDustLock.setBalance(user, 2_000);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page, uint256 tokenCount, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 0, type(uint256).max);
+
+        assertEq(tokenCount, 2_000, "live token count");
+        assertEq(page.length, 0, "empty mock slots produce no valid ids");
+        assertEq(nextRawOffset, MAX_RAW_SCAN_BUDGET, "scan stops at max raw budget");
+        assertTrue(hasMore, "remaining raw slots stay reachable");
+    }
+
+    function test_ValidatedOwnedTokenPaginationKeepsSparseTailOpenAfterFullPage() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLock enumerableDustLock = new MockEnumerableDustLock();
+        enumerableDustLock.setTokenId(200);
+        enumerableDustLock.setBalance(user, 2);
+        enumerableDustLock.setOwnedSlot(user, 100, 81);
+        enumerableDustLock.setOwner(81, user);
+        enumerableDustLock.setOwnedSlot(user, 101, 82);
+        enumerableDustLock.setOwner(82, user);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page,, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 96, 1);
+
+        assertEq(page.length, 1, "sparse page should find first live token");
+        assertEq(page[0], 81, "first sparse token id");
+        assertEq(nextRawOffset, 101, "cursor should continue after first sparse token");
+        assertTrue(hasMore, "full sparse page should keep later raw slots reachable");
+
+        (page,, nextRawOffset, hasMore) = provider.exposedGetValidatedOwnedTokenPage(user, nextRawOffset, 1);
+        assertEq(page.length, 1, "next sparse page should find second live token");
+        assertEq(page[0], 82, "second sparse token id");
+        assertEq(nextRawOffset, 102, "cursor should continue after second sparse token");
+        assertTrue(hasMore, "sparse raw tail remains conservatively pageable");
+    }
+
+    function test_ValidatedOwnedTokenPaginationFallsBackWhenTokenIdUnavailable() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLockWithoutTokenId enumerableDustLock = new MockEnumerableDustLockWithoutTokenId();
+        enumerableDustLock.setBalance(user, 1);
+        enumerableDustLock.setOwnedSlot(user, 0, 31);
+        enumerableDustLock.setOwner(31, user);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page, uint256 tokenCount, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 0, 1);
+
+        assertEq(tokenCount, 1, "live balance should be preserved");
+        assertEq(page.length, 1, "page should fill through fallback bound");
+        assertEq(page[0], 31, "owned token id");
+        assertEq(nextRawOffset, 1, "cursor should advance to fallback bound");
+        assertFalse(hasMore, "fallback bound exhausted");
+    }
+
+    function test_ValidatedOwnedTokenPaginationClampsLowTokenIdBoundToBalance() public {
+        address user = address(0xA11CE);
+        MockEnumerableDustLock enumerableDustLock = new MockEnumerableDustLock();
+        enumerableDustLock.setTokenId(1);
+        enumerableDustLock.setBalance(user, 2);
+        enumerableDustLock.setOwnedSlot(user, 0, 41);
+        enumerableDustLock.setOwner(41, user);
+        enumerableDustLock.setOwnedSlot(user, 1, 42);
+        enumerableDustLock.setOwner(42, user);
+
+        NeverlandUiProviderHarness provider =
+            new NeverlandUiProviderHarness(address(enumerableDustLock), address(1), address(2), address(3), address(4));
+
+        (uint256[] memory page, uint256 tokenCount, uint256 nextRawOffset, bool hasMore) =
+            provider.exposedGetValidatedOwnedTokenPage(user, 0, 2);
+
+        assertEq(tokenCount, 2, "live balance should be preserved");
+        assertEq(page.length, 2, "page should fill through clamped balance bound");
+        assertEq(page[0], 41, "first owned token id");
+        assertEq(page[1], 42, "second owned token id");
+        assertEq(nextRawOffset, 2, "cursor should advance to clamped bound");
+        assertFalse(hasMore, "clamped bound exhausted");
     }
 
     function test_SpecificUserWith4Positions() public {
@@ -1228,18 +1670,7 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log_named_uint("Number of emission reward tokens", rewardTokens.length);
 
         // Real assets that might have emissions
-        address[] memory knownAssets = new address[](11);
-        knownAssets[0] = DUST_LOCK_ADDR; // veNFT contract (should NOT have emissions)
-        knownAssets[1] = 0xc7fE001DD712beFb2de20abD34597CeF0250a6Ba;
-        knownAssets[2] = 0x6D918BFD4b978574b00cfe0f1872931203357d1E;
-        knownAssets[3] = 0xDD1124Cc06B2fEB6B03B94C0feD40b7352C07C24;
-        knownAssets[4] = 0x20838Ac96e96049C844f714B58aaa0cb84414d60;
-        knownAssets[5] = 0x18d5fb20B2D252EaE3C13B51Cb53745F5b7D01dc;
-        knownAssets[6] = 0xFcb0C1De6159E6CED54CBf1222BB0187EB81e59f;
-        knownAssets[7] = 0x5e59DEBC244c947Cbc37763AB92E77A1acF24aF0;
-        knownAssets[8] = 0x0eEa99C3691348E937d33AebBF6aa0537fD0d500;
-        knownAssets[9] = 0xFDC8BC830Fef4BD6885043A279A768720Ec091be;
-        knownAssets[10] = 0xB61fe1aF61D75F44450e3Fa84F2f2dd75059897C;
+        address[] storage knownAssets = TEST_EMISSION_ASSETS;
 
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             address rewardToken = rewardTokens[i];
@@ -1267,15 +1698,15 @@ contract NeverlandUiProviderTest is BaseTestLocal {
     }
 
     function test_UserEmissionsRewards() public {
+        address testUser = 0x532D4c80b14C7f50095E8E8FD69d9658b5F00371;
         if (block.chainid == 31337) {
-            emit log("Skipping detailed emissions test on localhost");
-            return;
+            emit log("Using local mock emissions data on localhost");
+            _seedLocalEmissionsData(testUser);
         }
         emit log("========================================");
         emit log("=== DETAILED USER EMISSIONS ANALYSIS ===");
         emit log("========================================");
 
-        address testUser = 0x532D4c80b14C7f50095E8E8FD69d9658b5F00371;
         emit log_named_address("Analyzing emissions for user", testUser);
 
         // Get emission reward tokens from rewards controller
@@ -1284,18 +1715,7 @@ contract NeverlandUiProviderTest is BaseTestLocal {
 
         emit log("");
         emit log("--- EMISSION TOKENS BREAKDOWN ---");
-        address[] memory testAssets = new address[](11);
-        testAssets[0] = DUST_LOCK_ADDR; // veNFT contract (should NOT have emissions)
-        testAssets[1] = 0xc7fE001DD712beFb2de20abD34597CeF0250a6Ba;
-        testAssets[2] = 0x6D918BFD4b978574b00cfe0f1872931203357d1E;
-        testAssets[3] = 0xDD1124Cc06B2fEB6B03B94C0feD40b7352C07C24;
-        testAssets[4] = 0x20838Ac96e96049C844f714B58aaa0cb84414d60;
-        testAssets[5] = 0x18d5fb20B2D252EaE3C13B51Cb53745F5b7D01dc;
-        testAssets[6] = 0xFcb0C1De6159E6CED54CBf1222BB0187EB81e59f;
-        testAssets[7] = 0x5e59DEBC244c947Cbc37763AB92E77A1acF24aF0;
-        testAssets[8] = 0x0eEa99C3691348E937d33AebBF6aa0537fD0d500;
-        testAssets[9] = 0xFDC8BC830Fef4BD6885043A279A768720Ec091be;
-        testAssets[10] = 0xB61fe1aF61D75F44450e3Fa84F2f2dd75059897C;
+        address[] memory testAssets = _emissionAssetsForDetailedAnalysis();
 
         emit log("");
         emit log("--- EMISSION TOKENS BREAKDOWN ---");
@@ -1350,9 +1770,8 @@ contract NeverlandUiProviderTest is BaseTestLocal {
                 emit log("  [ISSUE] Reward queries failing despite user participation");
             }
 
-            // Try getting all user rewards at once with ALL assets (use empty set on localhost)
+            // Try getting all user rewards at once with all populated assets.
             emit log("  Trying getAllUserRewards with all assets:");
-            testAssets = new address[](0);
             try dustRewardsController.getAllUserRewards(testAssets, testUser) returns (
                 address[] memory allTokens, uint256[] memory allAmounts
             ) {
@@ -1391,8 +1810,7 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         emit log("=== COMPREHENSIVE CLAIMABLE BREAKDOWN ===");
         emit log("========================================");
 
-        // Get all claimable rewards using the rewards controller (empty assets on localhost)
-        testAssets = new address[](0);
+        // Get all claimable rewards using the rewards controller.
         try dustRewardsController.getAllUserRewards(testAssets, testUser) returns (
             address[] memory claimableTokens, uint256[] memory claimableAmounts
         ) {
@@ -1413,7 +1831,7 @@ contract NeverlandUiProviderTest is BaseTestLocal {
                     if (claimableTokens[i] == USDC_TOKEN_ADDR) {
                         emit log("Token type: USDC (6 decimals)");
                         emit log_named_uint("Amount in USDC units", claimableAmounts[i] / 1e6);
-                    } else if (claimableTokens[i] == 0x532D4c80b14C7f50095E8E8FD69d9658b5F00371) {
+                    } else if (claimableTokens[i] == address(DUST)) {
                         emit log("Token type: DUST (18 decimals)");
                         emit log_named_uint("Amount in DUST units", claimableAmounts[i] / 1e18);
                     } else {
@@ -1460,6 +1878,26 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         }
 
         emit log("========================================");
+    }
+
+    function _seedLocalEmissionsData(address testUser) internal {
+        mintErc20Token(ATOKEN_ADDR, testUser, 1000 ether);
+        mintErc20Token(ATOKEN_ADDR, address(0xB0B), 2000 ether);
+
+        skip(1 hours);
+        vm.prank(ATOKEN_ADDR);
+        dustRewardsController.handleAction(
+            testUser, IERC20(ATOKEN_ADDR).totalSupply(), IERC20(ATOKEN_ADDR).balanceOf(testUser)
+        );
+    }
+
+    function _emissionAssetsForDetailedAnalysis() internal view returns (address[] memory assets) {
+        if (block.chainid == 31337) {
+            assets = new address[](1);
+            assets[0] = ATOKEN_ADDR;
+        } else {
+            assets = TEST_EMISSION_ASSETS;
+        }
     }
 
     function test_EnhancedUserEmissions() public {
@@ -1589,18 +2027,7 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         address[] memory emissionTokens = dustRewardsController.getRewardsList();
 
         // Real assets for emissions checking
-        address[] memory emissionAssets = new address[](11);
-        emissionAssets[0] = DUST_LOCK_ADDR; // Should NOT have emissions
-        emissionAssets[1] = 0xc7fE001DD712beFb2de20abD34597CeF0250a6Ba;
-        emissionAssets[2] = 0x6D918BFD4b978574b00cfe0f1872931203357d1E;
-        emissionAssets[3] = 0xDD1124Cc06B2fEB6B03B94C0feD40b7352C07C24;
-        emissionAssets[4] = 0x20838Ac96e96049C844f714B58aaa0cb84414d60;
-        emissionAssets[5] = 0x18d5fb20B2D252EaE3C13B51Cb53745F5b7D01dc;
-        emissionAssets[6] = 0xFcb0C1De6159E6CED54CBf1222BB0187EB81e59f;
-        emissionAssets[7] = 0x5e59DEBC244c947Cbc37763AB92E77A1acF24aF0;
-        emissionAssets[8] = 0x0eEa99C3691348E937d33AebBF6aa0537fD0d500;
-        emissionAssets[9] = 0xFDC8BC830Fef4BD6885043A279A768720Ec091be;
-        emissionAssets[10] = 0xB61fe1aF61D75F44450e3Fa84F2f2dd75059897C;
+        address[] storage emissionAssets = TEST_EMISSION_ASSETS;
 
         for (uint256 i = 0; i < emissionTokens.length; i++) {
             address token = emissionTokens[i];
@@ -1669,7 +2096,6 @@ contract NeverlandUiProviderTest is BaseTestLocal {
         // Step 4: Get Market Data (includes TVL and distribution rates)
         INeverlandUiProvider.MarketData memory marketData = freshUiProvider.getMarketData();
         require(marketData.rewardTokens.length > 0, "Should have market data");
-        require(marketData.totalValueLockedUSD >= 0, "TVL should be valid");
         emit log_named_uint("Step completed", step++);
 
         // Step 5: Verify distribution rates global stats

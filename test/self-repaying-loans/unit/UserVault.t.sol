@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import "../BaseTestLocal.sol";
+import "../../BaseTestLocal.sol";
 import {HarnessFactory} from "../harness/HarnessFactory.sol";
 import {UserVaultHarness} from "../harness/UserVaultHarness.sol";
-import {IUserVault} from "../../src/interfaces/IUserVault.sol";
-import {MockERC20} from "../_utils/MockERC20.sol";
+import {IUserVault} from "../../../src/interfaces/IUserVault.sol";
+import {MockERC20} from "../../_utils/MockERC20.sol";
 import {IPoolAddressesProvider} from "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
 import {IPool} from "@aave/core-v3/contracts/interfaces/IPool.sol";
 

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 
-import {NeverlandDustHelper} from "../../src/utils/NeverlandDustHelper.sol";
-import {MockERC20} from "../_utils/MockERC20.sol";
+import {NeverlandDustHelper} from "../../../src/utils/NeverlandDustHelper.sol";
+import {MockERC20} from "../../_utils/MockERC20.sol";
 
 contract MockOracle {
     int256 private _answer;
@@ -142,7 +142,7 @@ contract NeverlandDustHelperTest is Test {
 
         assertTrue(fromOracle);
         // USD/DUST = (USD/MON=1.0) / (DUST/MON=0.69) = 1.449275 USD per DUST
-        assertEq(price, 144_927_536, "Price should be scaled from 6 to 8 decimals");
+        assertEq(price, 144_927_536, "USD/DUST should be 1.44927536");
     }
 
     function test_OraclePrice_8Decimals() public {
@@ -162,7 +162,7 @@ contract NeverlandDustHelperTest is Test {
 
         assertTrue(fromOracle);
         // USD/DUST = (USD/MON=1.0) / (DUST/MON=0.69) = 1.449275 USD per DUST
-        assertEq(price, 144_927_536, "Price should be 69e6 (8 decimals)");
+        assertEq(price, 144_927_536, "USD/DUST should be 1.44927536");
     }
 
     function test_OraclePrice_18Decimals() public {
@@ -182,7 +182,7 @@ contract NeverlandDustHelperTest is Test {
 
         assertTrue(fromOracle);
         // USD/DUST = (USD/MON=1.0) / (DUST/MON=0.69) = 1.449275 USD per DUST
-        assertEq(price, 144_927_536, "Price should be scaled from 18 to 8 decimals");
+        assertEq(price, 144_927_536, "USD/DUST should be 1.44927536");
     }
 
     /// @notice Comprehensive test with 6-decimal USDC pair at various prices
@@ -204,7 +204,7 @@ contract NeverlandDustHelperTest is Test {
 
             assertTrue(fromOracle, "Price should come from oracle");
             // USD/DUST = (USD/USDC=1.0) / (DUST/USDC=0.5) = 2.0 USD per DUST
-            assertEq(price, 200_000_000, "DUST/USD should be 0.50");
+            assertEq(price, 200_000_000, "USD/DUST should be 2.00");
         }
 
         // Test Case 2: DUST/USDC = 0.25, USDC/USD = 0.9999 => USD/DUST = 3.9996
@@ -222,7 +222,7 @@ contract NeverlandDustHelperTest is Test {
 
             assertTrue(fromOracle, "Price should come from oracle");
             // USD/DUST = (USD/USDC=0.9999) / (DUST/USDC=0.25) = 3.9996 USD per DUST
-            assertEq(price, 399_960_000, "DUST/USD should be 0.249975");
+            assertEq(price, 399_960_000, "USD/DUST should be 3.9996");
         }
 
         // Test Case 3: DUST/USDC = 1.50, USDC/USD = 1.0001 => USD/DUST = 0.66673
@@ -240,7 +240,7 @@ contract NeverlandDustHelperTest is Test {
 
             assertTrue(fromOracle, "Price should come from oracle");
             // USD/DUST = (USD/USDC=1.0001) / (DUST/USDC=1.50) = 0.66673 USD per DUST
-            assertEq(price, 66_673_333, "DUST/USD should be 1.50015");
+            assertEq(price, 66_673_333, "USD/DUST should be 0.66673333");
         }
     }
 
@@ -263,7 +263,7 @@ contract NeverlandDustHelperTest is Test {
 
             assertTrue(fromOracle, "Price should come from oracle");
             // USD/DUST = (USD/MON=4.0) / (DUST/MON=0.06) = 66.666... USD per DUST
-            assertEq(price, 6_666_666_666, "DUST/USD should be 0.24");
+            assertEq(price, 6_666_666_666, "USD/DUST should be 66.66666666");
         }
 
         // Test Case 2: DUST/MON = 0.125, MON/USD = 8.00 => USD/DUST = 64.0
@@ -281,7 +281,7 @@ contract NeverlandDustHelperTest is Test {
 
             assertTrue(fromOracle, "Price should come from oracle");
             // USD/DUST = (USD/MON=8.0) / (DUST/MON=0.125) = 64.0 USD per DUST
-            assertEq(price, 6_400_000_000, "DUST/USD should be 1.00");
+            assertEq(price, 6_400_000_000, "USD/DUST should be 64.00");
         }
 
         // Test Case 3: DUST/MON = 0.20, MON/USD = 5.00 => USD/DUST = 25.0
@@ -299,7 +299,7 @@ contract NeverlandDustHelperTest is Test {
 
             assertTrue(fromOracle, "Price should come from oracle");
             // USD/DUST = (USD/MON=5.0) / (DUST/MON=0.20) = 25.0 USD per DUST
-            assertEq(price, 2_500_000_000, "DUST/USD should be 0.30");
+            assertEq(price, 2_500_000_000, "USD/DUST should be 25.00");
         }
 
         // Test Case 4: DUST/MON = 1.00, MON/USD = 2.00 => USD/DUST = 2.00
@@ -317,7 +317,7 @@ contract NeverlandDustHelperTest is Test {
 
             assertTrue(fromOracle, "Price should come from oracle");
             // USD/DUST = (USD/MON=2.0) / (DUST/MON=1.0) = 2.0 USD per DUST
-            assertEq(price, 200_000_000, "DUST/USD should be 1.00");
+            assertEq(price, 200_000_000, "USD/DUST should be 2.00");
         }
     }
 
@@ -337,7 +337,7 @@ contract NeverlandDustHelperTest is Test {
         assertTrue(fromOracle, "Price should come from oracle");
         // USD/DUST = (USD/MON=4.0) / (DUST/MON=0.06) = 66.666... USD per DUST
         // 66.666... in 8 decimals = 6,666,666,666
-        assertEq(price, 6_666_666_666, "DUST/USD should be 0.24 (24e6 in 8 decimals)");
+        assertEq(price, 6_666_666_666, "USD/DUST should be 66.66666666");
     }
 
     function test_DustUsdConversion_WithTokenInversion() public {
@@ -357,7 +357,7 @@ contract NeverlandDustHelperTest is Test {
         // Oracle returns MON/DUST = 0.1, inverted to DUST/MON = 10.0
         // USD/DUST = (USD/MON=2.0) / (DUST/MON=10.0) = 0.2 USD per DUST
         // 0.2 in 8 decimals = 20,000,000
-        assertEq(price, 20_000_000, "DUST/USD should be 20.0 with inversion");
+        assertEq(price, 20_000_000, "USD/DUST should be 0.20 with inversion");
     }
 
     function test_FallbackToHardcoded_WhenOracleFails() public {
@@ -551,7 +551,7 @@ contract NeverlandDustHelperTest is Test {
 
         assertTrue(fromOracle, "Price should come from pool");
         // Pool gives DUST/MON = 0.25, USD/DUST = (USD/MON=2.0) / (DUST/MON=0.25) = 8.0
-        assertEq(price, 800_000_000, "DUST/USD should be 0.50 from V3 pool");
+        assertEq(price, 800_000_000, "USD/DUST should be 8.00 from V3 pool");
     }
 
     function test_UniswapV3Pool_DustToken1() public {
@@ -575,15 +575,14 @@ contract NeverlandDustHelperTest is Test {
 
         assertTrue(fromOracle, "Price should come from pool");
         // Pool gives DUST/MON = 4, USD/DUST = (USD/MON=2.0) / (DUST/MON=4.0) = 0.5
-        assertEq(price, 50_000_000, "DUST/USD should be 8.0 from V3 pool");
+        assertEq(price, 50_000_000, "USD/DUST should be 0.50 from V3 pool");
     }
 
     // ========== NEW: Uniswap V2 Pool Tests ==========
 
     function test_UniswapV2Pool_DustToken0() public {
         // Create DUST/MON V2 pool where DUST is token0
-        // Reserves: 1000 DUST, 4000 MON => price = 4000/1000 = 4 MON per DUST
-        // We want DUST/MON = 1/4 = 0.25
+        // Reserves: 1000 DUST, 4000 MON => DUST/MON = reserve1/reserve0 = 4.0 MON per DUST
         MockERC20 mon = new MockERC20("MON", "MON", 18);
         MockUniswapV2Pool pool = new MockUniswapV2Pool(
             1000e18, // reserve0 (DUST)
@@ -601,8 +600,8 @@ contract NeverlandDustHelperTest is Test {
         (uint256 price, bool fromOracle) = helper.getPrice();
 
         assertTrue(fromOracle, "Price should come from pool");
-        // Pool gives DUST/MON = 0.25, USD/DUST = (USD/MON=2.0) / (DUST/MON=0.25) = 8.0
-        assertEq(price, 800_000_000, "DUST/USD should be 0.50 from V2 pool");
+        // USD/DUST = USD/MON (2.0) * MON/DUST (4.0) = 8.0
+        assertEq(price, 800_000_000, "USD/DUST should be 8.00 from V2 pool");
     }
 
     function test_UniswapV2Pool_DustToken1() public {
@@ -626,7 +625,7 @@ contract NeverlandDustHelperTest is Test {
 
         assertTrue(fromOracle, "Price should come from pool");
         // Pool gives DUST/MON = 4, USD/DUST = (USD/MON=2.0) / (DUST/MON=4.0) = 0.5
-        assertEq(price, 50_000_000, "DUST/USD should be 8.0 from V2 pool");
+        assertEq(price, 50_000_000, "USD/DUST should be 0.50 from V2 pool");
     }
 
     /// @notice Test V2 pool with mismatched decimals (18-decimal DUST with 6-decimal USDC)
@@ -686,9 +685,19 @@ contract NeverlandDustHelperTest is Test {
     // ========== NEW: Fallback Cascade Tests ==========
 
     function test_FallbackFromV3ToV2ToOracle() public {
-        // This test would require a more complex setup
-        // For now, we've tested each individually
-        // The contract tries V3 -> V2 -> Oracle in that order
+        address monAddr = makeAddr("MON");
+        address usdAddr = makeAddr("USD");
+
+        MockOracle dustMonOracle = new MockOracle(50_000_000, 8, address(dust), monAddr); // 0.50 DUST/MON
+        MockOracle monUsdOracle = new MockOracle(200_000_000, 8, usdAddr, address(0)); // 2.00 MON/USD
+
+        helper.setPair(address(dustMonOracle));
+        helper.setPairOracle(address(monUsdOracle));
+
+        (uint256 price, bool fromOracle) = helper.getPrice();
+
+        assertTrue(fromOracle, "Price should come from oracle fallback");
+        assertEq(price, 400_000_000, "USD/DUST should be 4.00 after V3/V2 fallback");
     }
 
     function test_TokenOrdering_OracleWithToken0Token1() public {
@@ -706,7 +715,7 @@ contract NeverlandDustHelperTest is Test {
 
             (uint256 price,) = helper.getPrice();
             // DUST/MON = 0.50, USD/DUST = (USD/MON=2.0) / (DUST/MON=0.5) = 4.0
-            assertEq(price, 400_000_000, "DUST/USD should be 1.0 when DUST is token0");
+            assertEq(price, 400_000_000, "USD/DUST should be 4.00 when DUST is token0");
         }
 
         // Case 2: DUST is token1, oracle returns MON/DUST, needs inversion
@@ -716,7 +725,7 @@ contract NeverlandDustHelperTest is Test {
 
             (uint256 price,) = helper.getPrice();
             // MON/DUST = 0.50, so DUST/MON = 2.0, USD/DUST = (USD/MON=2.0) / (DUST/MON=2.0) = 1.0
-            assertEq(price, 100_000_000, "DUST/USD should be 4.0 when DUST is token1 (inverted)");
+            assertEq(price, 100_000_000, "USD/DUST should be 1.00 when DUST is token1 (inverted)");
         }
     }
 }
