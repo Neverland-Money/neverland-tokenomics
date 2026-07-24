@@ -1,19 +1,11 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
 import {LendingGovernanceReader} from "./_utils/LendingGovernanceReader.sol";
 
 contract LendingTimelockBoundariesForkTest is LendingGovernanceReader {
-    bool internal runLendingForkGovernanceTests;
-
     function setUp() public {
-        runLendingForkGovernanceTests =
-            vm.envOr("RUN_LENDING_FORK_GOVERNANCE_TESTS", vm.envOr("RUN_AAVE_FORK_GOVERNANCE_TESTS", false));
-        if (!runLendingForkGovernanceTests) {
-            vm.skip(true);
-        }
-
-        string memory forkRpcUrl = vm.envOr("FORK_RPC_URL", string("https://rpc-mainnet.monadinfra.com"));
+        string memory forkRpcUrl = vm.envOr("MAINNET_RPC", string("https://rpc.monad.xyz"));
         uint256 forkId = vm.createFork(forkRpcUrl);
         vm.selectFork(forkId);
     }

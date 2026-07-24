@@ -18,10 +18,15 @@ abstract contract GovernanceAddressBookReader is Test {
         address lendingWrappedTokenGateway;
         address coreProxyAdmin;
         address leaderboardProxyAdmin;
+        address hardcodedPriceOracleLoAznd;
+        address pendlePtDiscountOracleAdapter;
+        address specialEditionRegistry;
+        address specialEditionRegistryImplementation;
         address userVaultBeacon;
         address dustLockTransferStrategy;
         address tokenomicsDustHelper;
         address tokenomicsUiProvider;
+        address tokenomicsUiEmissionLibrary;
     }
 
     function _loadGovernanceAddressBook(string memory network)
@@ -69,6 +74,12 @@ abstract contract GovernanceAddressBookReader is Test {
             book.leaderboardProxyAdmin =
                 _readOptionalAddress(json, ".governance.neverland.upgradeability.leaderboardProxyAdmin");
         }
+        book.hardcodedPriceOracleLoAznd = _readOptionalAddress(json, ".addresses.HardcodedPriceOracle-loAZND-103500000");
+        book.pendlePtDiscountOracleAdapter =
+            _readOptionalAddress(json, ".addresses.PendlePtDiscountOracleAdapter-AUSD-1791417600");
+        book.specialEditionRegistry = _readOptionalAddress(json, ".addresses.SpecialEditionRegistry");
+        book.specialEditionRegistryImplementation =
+            _readOptionalAddress(json, ".implementations.SpecialEditionRegistry");
         book.userVaultBeacon = _readOptionalAddress(json, ".governance.tokenomics.upgradeability.userVaultBeacon");
         if (book.userVaultBeacon == address(0)) {
             book.userVaultBeacon = _readOptionalAddress(json, ".governance.neverland.upgradeability.userVaultBeacon");
@@ -79,6 +90,7 @@ abstract contract GovernanceAddressBookReader is Test {
         book.dustLockTransferStrategy = _readOptionalAddress(json, ".addresses.DustLockTransferStrategy");
         book.tokenomicsDustHelper = _readOptionalAddress(json, ".addresses.NeverlandDustHelper");
         book.tokenomicsUiProvider = _readOptionalAddress(json, ".addresses.NeverlandUiProvider");
+        book.tokenomicsUiEmissionLibrary = _readOptionalAddress(json, ".addresses.NeverlandUiEmissionLibrary");
     }
 
     function readOptionalAddress(string memory json, string memory path) external pure returns (address) {

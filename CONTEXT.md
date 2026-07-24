@@ -65,9 +65,9 @@ The vault system routes eligible rewards through owner-specific vaults, bounded 
 
 ### Oracles, UI, and leaderboard
 
-- `src/oracles/*`
-- `src/utils/*`
-- `src/leaderboard/*`
+- `src/oracles/*`, including `HardcodedPriceOracle.sol` and `PendlePtDiscountOracleAdapter.sol`
+- `src/utils/*`, including `NeverlandProfileItemsSeller.sol` and `libraries/NeverlandUiEmissionLibrary.sol`
+- `src/leaderboard/*`, including `SpecialEditionRegistry.sol`
 
 Oracle adapters are security-sensitive integration surfaces. UI helpers are read-only surfaces and should not be treated as liquidation or collateral sources unless a consuming system explicitly uses them that way.
 

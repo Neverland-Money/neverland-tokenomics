@@ -1,8 +1,12 @@
 {
   "name": "neverland-contracts",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Neverland Protocol public smart-contract mirror",
   "license": "BUSL-1.1",
+  "packageManager": "yarn@4.14.1",
+  "engines": {
+    "node": "24.15.0"
+  },
   "scripts": {
     "solhint": "solhint 'src/**/*.sol'",
     "solhint:report": "solhint 'src/**/*.sol' > solhint.txt 2>&1 || true",
@@ -10,17 +14,21 @@
     "clean": "yarn run clean:foundry && yarn run clean:hardhat",
     "clean:foundry": "forge clean",
     "clean:hardhat": "hardhat clean",
-    "coverage:oracles": "FOUNDRY_PROFILE=oracle-coverage forge coverage --exclude-tests --no-match-coverage '^(script|test)/'",
-    "coverage:legendary-ledger": "FOUNDRY_PROFILE=legendary-ledger-coverage forge coverage --match-path test/legendary-ledger/DustLockLegendaryLedgerCoverage.t.sol --exclude-tests --no-match-coverage '^(script|test)/'",
-    "coverage:governance": "FOUNDRY_PROFILE=governance-coverage forge coverage --exclude-tests --no-match-coverage '^(script|test)/'",
+    "coverage": "forge coverage --exclude-tests --no-match-coverage '^(script|test)/|^src/leaderboard/ProxyImports\\.sol$' --no-match-test '(GasCosts|UnderTightGas|ProviderArtifactFitsEip170WithLinkedLibraries)' --no-match-path 'test/{audit,journey}/**'",
     "build": "yarn run clean && yarn run build:foundry && yarn run build:hardhat && yarn run build:wagmi",
     "build:foundry": "forge build",
     "build:hardhat": "hardhat compile",
     "build:wagmi": "wagmi generate",
-    "tests": "yarn run tests:foundry && yarn run tests:hardhat",
-    "tests:foundry": "forge test -v",
-    "tests:hardhat": "hardhat test",
-    "format": "forge fmt && yarn prettier --write ."
+    "governance:test:foundry": "forge test --match-path 'test/governance/*.t.sol' --no-match-contract '.*Fork.*'",
+    "governance:test:lending-fork": "RUN_LENDING_FORK_GOVERNANCE_TESTS=true forge test --match-path 'test/governance/LendingTimelockBoundariesFork.t.sol' -vv",
+    "test:claim-reform:workbook-contract": "RUN_CLAIM_REFORM_CONTRACT_WORKBOOK=true forge test --match-contract '^ClaimReformContractWorkbookTest$' -v",
+    "test:claim-reform:predeploy": "FOUNDRY_PROFILE=claim-reform-predeploy forge test --match-contract '^(ClaimReformStatefulInvariantTest|RevenueRewardEpochLedgerInvariantTest)$' -v && yarn test:claim-reform:workbook-contract",
+    "test:claim-reform:fork": "RUN_CLAIM_REFORM_FORK_TESTS=true forge test --match-path test/claim-reform/fork/ClaimReformMainnetFork.t.sol -v",
+    "test:invariants:deep": "FOUNDRY_PROFILE=deep-invariants forge test --match-path 'test/oracles/invariant/**' -v",
+    "tests": "yarn run tests:foundry",
+    "tests:foundry": "forge test -v --no-match-contract '.*Fork.*'",
+    "format": "forge fmt && yarn prettier --write .",
+    "format:check": "forge fmt --check && yarn prettier --check ."
   },
   "devDependencies": {
     "@cyfrin/aderyn": "^0.6.1",

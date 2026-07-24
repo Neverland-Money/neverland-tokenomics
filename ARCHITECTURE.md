@@ -30,8 +30,13 @@ This public mirror gives auditors, integrators, and reviewers the architecture c
 ### Oracle, UI, and leaderboard layer
 
 - `RatioOracleAggregator` and `YieldBearingOracleAdapter` are Chainlink-compatible oracle adapter surfaces.
+- `HardcodedPriceOracle` is a non-upgradeable, ungoverned fixed-price feed adapter.
+- `PendlePtDiscountOracleAdapter` prices Pendle Principal Tokens used as money-market collateral.
 - `NeverlandDustHelper` and `NeverlandUiProvider` are read-only helper surfaces for UI, analytics, and visibility.
+- `NeverlandUiEmissionLibrary` is the read-only emission-helper library linked into the current `NeverlandUiProvider`.
+- `NeverlandProfileItemsSeller` is the DUST seller surface for profile shop items in `src/utils/`.
 - `EpochManager`, `LeaderboardConfig`, `NFTPartnershipRegistry`, `VotingPowerMultiplier`, and `LeaderboardKeeper` provide the leaderboard and partner multiplier system.
+- `SpecialEditionRegistry` is the token-bound special-edition multiplier registry alongside `NFTPartnershipRegistry`.
 
 ## External integration boundary
 
