@@ -2,8 +2,8 @@
 pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
-import {CommonChecksLibrary} from "../../src/libraries/CommonChecksLibrary.sol";
-import {OracleLib} from "../../src/libraries/OracleLib.sol";
+import {CommonChecksLibrary} from "../../../src/libraries/CommonChecksLibrary.sol";
+import {OracleLib} from "../../../src/libraries/OracleLib.sol";
 
 contract CommonChecksHarness {
     function checkZeroAddress(address value) external pure {
@@ -40,6 +40,10 @@ contract CommonChecksHarness {
 
     function checkInvalidUserAddress(address user) external pure {
         CommonChecksLibrary.revertIfInvalidUserAddress(user);
+    }
+
+    function checkEpochFinalizationPending(uint256 epochDuration) external view {
+        CommonChecksLibrary.revertIfEpochFinalizationPending(epochDuration);
     }
 }
 
@@ -118,6 +122,17 @@ contract LibraryCoverageTest is Test {
         checks.checkInvalidUserAddress(address(1));
         vm.expectRevert(CommonChecksLibrary.InvalidUserAddress.selector);
         checks.checkInvalidUserAddress(address(0));
+    }
+
+    function testRevertIfEpochFinalizationPending() public {
+        checks.checkEpochFinalizationPending(1 weeks);
+
+        vm.warp(1 weeks);
+        vm.expectRevert(CommonChecksLibrary.EpochFinalizationPending.selector);
+        checks.checkEpochFinalizationPending(1 weeks);
+
+        vm.warp(1 weeks + 1);
+        checks.checkEpochFinalizationPending(1 weeks);
     }
 
     function testOracleLibScaling() public view {

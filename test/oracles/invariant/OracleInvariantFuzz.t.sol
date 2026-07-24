@@ -6,10 +6,10 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-import {OracleLib} from "../../src/libraries/OracleLib.sol";
-import {IYieldBearingOracleAdapter} from "../../src/interfaces/IYieldBearingOracleAdapter.sol";
-import {YieldBearingOracleAdapter} from "../../src/oracles/YieldBearingOracleAdapter.sol";
-import {RatioOracleAggregator} from "../../src/oracles/RatioOracleAggregator.sol";
+import {OracleLib} from "../../../src/libraries/OracleLib.sol";
+import {IYieldBearingOracleAdapter} from "../../../src/interfaces/IYieldBearingOracleAdapter.sol";
+import {YieldBearingOracleAdapter} from "../../../src/oracles/YieldBearingOracleAdapter.sol";
+import {RatioOracleAggregator} from "../../../src/oracles/RatioOracleAggregator.sol";
 
 contract PropMockERC20 {
     string public name;

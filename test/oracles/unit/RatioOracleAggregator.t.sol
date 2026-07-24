@@ -2,8 +2,8 @@
 pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
-import {RatioOracleAggregator} from "../../src/oracles/RatioOracleAggregator.sol";
-import {CommonChecksLibrary} from "../../src/libraries/CommonChecksLibrary.sol";
+import {RatioOracleAggregator} from "../../../src/oracles/RatioOracleAggregator.sol";
+import {CommonChecksLibrary} from "../../../src/libraries/CommonChecksLibrary.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 contract MockAggregator is AggregatorV3Interface {
@@ -561,6 +561,40 @@ contract RatioOracleAggregatorTest is Test {
 
     function testLatestRoundDataIgnoresBaseAnsweredInRound() public {
         baseAgg.setAnsweredInRound(0);
+        (, int256 answer,,,) = oracle.latestRoundData();
+        assertEq(answer, 2100e8);
+    }
+
+    /// @dev The strict `latestRoundData` path treats `answeredInRound` as informational (reports the min across feeds) and never enforces it against `roundId`; a stale value does not block the price.
+    function testLatestRoundDataIgnoresRatioAnsweredInRoundLessThanRoundId() public {
+        ratioAgg.setAnswer(1.05e18);
+        ratioAgg.setAnsweredInRound(1);
+
+        (, int256 answer,,,) = oracle.latestRoundData();
+        assertEq(answer, 2100e8);
+    }
+
+    /// @dev Base-side counterpart: the strict path also ignores a stale base `answeredInRound`.
+    function testLatestRoundDataIgnoresBaseAnsweredInRoundLessThanRoundId() public {
+        baseAgg.setAnswer(2000e8);
+        baseAgg.setAnsweredInRound(1);
+
+        (, int256 answer,,,) = oracle.latestRoundData();
+        assertEq(answer, 2100e8);
+    }
+
+    /// @dev The strict `latestRoundData` path does not enforce `startedAt <= updatedAt` (only the lenient `latestAnswer` path returns zero on that inconsistency); `updatedAt` is still staleness-checked via `_ensureComplete`.
+    function testLatestRoundDataIgnoresRatioStartedAtAfterUpdatedAt() public {
+        ratioAgg.setStartedAt(block.timestamp + 1);
+
+        (, int256 answer,,,) = oracle.latestRoundData();
+        assertEq(answer, 2100e8);
+    }
+
+    /// @dev Base-side counterpart: the strict path also ignores a base `startedAt > updatedAt` inconsistency.
+    function testLatestRoundDataIgnoresBaseStartedAtAfterUpdatedAt() public {
+        baseAgg.setStartedAt(block.timestamp + 1);
+
         (, int256 answer,,,) = oracle.latestRoundData();
         assertEq(answer, 2100e8);
     }

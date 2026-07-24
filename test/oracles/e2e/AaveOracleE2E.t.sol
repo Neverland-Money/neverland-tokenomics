@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
@@ -9,9 +9,9 @@ import {PoolAddressesProvider} from "@aave/core-v3/contracts/protocol/configurat
 import {ACLManager} from "@aave/core-v3/contracts/protocol/configuration/ACLManager.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-import {MockERC20} from "../_utils/MockERC20.sol";
-import {RatioOracleAggregator} from "../../src/oracles/RatioOracleAggregator.sol";
-import {YieldBearingOracleAdapter} from "../../src/oracles/YieldBearingOracleAdapter.sol";
+import {MockERC20} from "../../_utils/MockERC20.sol";
+import {RatioOracleAggregator} from "../../../src/oracles/RatioOracleAggregator.sol";
+import {YieldBearingOracleAdapter} from "../../../src/oracles/YieldBearingOracleAdapter.sol";
 
 contract MockAggregator is AggregatorV3Interface {
     int256 private _answer;
@@ -148,6 +148,7 @@ contract MockERC4626 is IERC4626 {
     }
 
     function convertToShares(uint256 assets) external view returns (uint256) {
+        if (_ratio == 0) return 0;
         return (assets * 1e18) / _ratio;
     }
 
@@ -349,6 +350,22 @@ contract AaveOracleE2ETest is Test {
 
         assertEq(ratioOracle.latestAnswer(), 0);
         assertEq(price, fallbackPrice);
+    }
+
+    function testAaveOracleReturnsZeroWhenSourceAndFallbackZero() public {
+        ratioAgg.setAnswer(0);
+        fallbackOracle.setAssetPrice(address(ratioAsset), 0);
+
+        uint256 price = aaveOracle.getAssetPrice(address(ratioAsset));
+
+        emit log_named_string("scenario", "source and fallback both return 0");
+        emit log_named_string("expect", "AaveOracle returns the fallback value as-is");
+        emit log_named_decimal_int("ratio source latestAnswer", ratioOracle.latestAnswer(), PRICE_DECIMALS);
+        emit log_named_decimal_uint("aave price", price, PRICE_DECIMALS);
+        emit log_named_decimal_uint("fallback price", fallbackOracle.getAssetPrice(address(ratioAsset)), PRICE_DECIMALS);
+
+        assertEq(ratioOracle.latestAnswer(), 0);
+        assertEq(price, 0);
     }
 
     function testAaveOracleFallsBackWhenRatioBaseInvalid() public {

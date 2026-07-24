@@ -2,13 +2,19 @@
 pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
-import {YieldBearingOracleAdapter} from "../../src/oracles/YieldBearingOracleAdapter.sol";
-import {IYieldBearingOracleAdapter} from "../../src/interfaces/IYieldBearingOracleAdapter.sol";
+import {YieldBearingOracleAdapter} from "../../../src/oracles/YieldBearingOracleAdapter.sol";
+import {IYieldBearingOracleAdapter} from "../../../src/interfaces/IYieldBearingOracleAdapter.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 contract MockAggregator is AggregatorV3Interface {
+    struct Round {
+        int256 answer;
+        uint256 timestamp;
+        bool exists;
+    }
+
     int256 private _answer;
     uint8 private _decimals;
     uint256 private _timestamp;
@@ -17,31 +23,37 @@ contract MockAggregator is AggregatorV3Interface {
     bool private _useAnsweredInRoundOverride;
     uint256 private _startedAtOverride;
     bool private _useStartedAtOverride;
+    mapping(uint80 => Round) private _rounds;
 
     constructor(int256 answer_, uint8 decimals_) {
         _answer = answer_;
         _decimals = decimals_;
         _timestamp = block.timestamp;
         _roundId = 1;
+        _rounds[_roundId] = Round({answer: answer_, timestamp: _timestamp, exists: true});
     }
 
     function setAnswer(int256 answer_) external {
         _answer = answer_;
         _roundId++;
         _timestamp = block.timestamp;
+        _rounds[_roundId] = Round({answer: answer_, timestamp: _timestamp, exists: true});
     }
 
     function setStale() external {
         _timestamp = block.timestamp - 2 hours;
+        _rounds[_roundId].timestamp = _timestamp;
     }
 
     function setIncompleteRound() external {
         uint80 currentRound = _roundId;
         _roundId = currentRound + 5;
+        _rounds[_roundId] = Round({answer: _answer, timestamp: _timestamp, exists: true});
     }
 
     function setTimestamp(uint256 timestamp_) external {
         _timestamp = timestamp_;
+        _rounds[_roundId].timestamp = timestamp_;
     }
 
     function setAnsweredInRound(uint80 answeredInRound_) external {
@@ -79,11 +91,11 @@ contract MockAggregator is AggregatorV3Interface {
         view
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
-        uint80 answeredIn = _useAnsweredInRoundOverride
-            ? _answeredInRoundOverride
-            : (requestedRoundId < _roundId ? requestedRoundId : _roundId);
-        uint256 startedAtValue = _useStartedAtOverride ? _startedAtOverride : _timestamp;
-        return (_roundId, _answer, startedAtValue, _timestamp, answeredIn);
+        Round memory requestedRound = _rounds[requestedRoundId];
+        require(requestedRound.exists, "No data present");
+        uint80 answeredIn = _useAnsweredInRoundOverride ? _answeredInRoundOverride : requestedRoundId;
+        uint256 startedAtValue = _useStartedAtOverride ? _startedAtOverride : requestedRound.timestamp;
+        return (requestedRoundId, requestedRound.answer, startedAtValue, requestedRound.timestamp, answeredIn);
     }
 
     function latestRoundData()
@@ -91,9 +103,10 @@ contract MockAggregator is AggregatorV3Interface {
         view
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
+        Round memory currentRound = _rounds[_roundId];
         uint80 answeredIn = _useAnsweredInRoundOverride ? _answeredInRoundOverride : _roundId;
-        uint256 startedAtValue = _useStartedAtOverride ? _startedAtOverride : _timestamp;
-        return (_roundId, _answer, startedAtValue, _timestamp, answeredIn);
+        uint256 startedAtValue = _useStartedAtOverride ? _startedAtOverride : currentRound.timestamp;
+        return (_roundId, currentRound.answer, startedAtValue, currentRound.timestamp, answeredIn);
     }
 
     function latestAnswer() external view returns (int256) {
