@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import {IDustLock} from "../../src/interfaces/IDustLock.sol";
-import {ICreatorToken} from "../../src/interfaces/ICreatorToken.sol";
-import {ITransferValidator} from "../../src/interfaces/ITransferValidator.sol";
-import {DustLock} from "../../src/tokens/DustLock.sol";
+import {IDustLock} from "../../../src/interfaces/IDustLock.sol";
+import {ICreatorToken} from "../../../src/interfaces/ICreatorToken.sol";
+import {ITransferValidator} from "../../../src/interfaces/ITransferValidator.sol";
+import {DustLock} from "../../../src/tokens/DustLock.sol";
 import {Vm} from "forge-std/Vm.sol";
-import {CommonChecksLibrary} from "../../src/libraries/CommonChecksLibrary.sol";
-import "../BaseTestLocal.sol";
+import {CommonChecksLibrary} from "../../../src/libraries/CommonChecksLibrary.sol";
+import "../../BaseTestLocal.sol";
 
 contract MockTransferValidator is ITransferValidator {
     bool public shouldRevert;
@@ -63,11 +63,18 @@ contract MockTransferValidatorCapture {
     }
 }
 
+contract MockTransferValidatorBareRevert is ITransferValidator {
+    function validateTransfer(address, address, address, uint256) external pure override {
+        revert();
+    }
+}
+
 contract DustLockCreatorEarningsTests is BaseTestLocal {
     MockTransferValidator public validator;
     MockTransferValidatorRecording public validatorRecording;
     MockTransferValidatorNonView public validatorNonView;
     MockTransferValidatorCapture public validatorCapture;
+    MockTransferValidatorBareRevert public validatorBareRevert;
 
     address public protocolTreasury;
     uint96 public constant FEE_250_BPS = 250; // 2.5%
@@ -86,6 +93,7 @@ contract DustLockCreatorEarningsTests is BaseTestLocal {
         validatorRecording = new MockTransferValidatorRecording();
         validatorNonView = new MockTransferValidatorNonView();
         validatorCapture = new MockTransferValidatorCapture();
+        validatorBareRevert = new MockTransferValidatorBareRevert();
         protocolTreasury = makeAddr("protocolTreasury");
     }
 
@@ -299,6 +307,21 @@ contract DustLockCreatorEarningsTests is BaseTestLocal {
         dustLock.setFeeEnforcedOperator(user2, true);
 
         vm.expectRevert("MockValidator: Transfer not authorized");
+        vm.prank(user2);
+        dustLock.transferFrom(user, user3, tokenId);
+
+        assertEq(dustLock.ownerOf(tokenId), user, "Transfer should fail, owner unchanged");
+    }
+
+    function testTransferRevertsWithGenericFailureWhenValidatorReturnsNoData() public {
+        DUST.approve(address(dustLock), TOKEN_1);
+        uint256 tokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+
+        dustLock.setTransferValidator(address(validatorBareRevert));
+        dustLock.approve(user2, tokenId);
+        dustLock.setFeeEnforcedOperator(user2, true);
+
+        vm.expectRevert(IDustLock.TransferValidationFailed.selector);
         vm.prank(user2);
         dustLock.transferFrom(user, user3, tokenId);
 

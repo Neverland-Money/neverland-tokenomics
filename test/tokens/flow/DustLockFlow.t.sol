@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import "../BaseTestLocal.sol";
+import "../../BaseTestLocal.sol";
+import {CommonChecksLibrary} from "../../../src/libraries/CommonChecksLibrary.sol";
 import "forge-std/console2.sol";
 
 /**
@@ -133,12 +134,9 @@ contract DustLockFlow is BaseTestLocal {
     }
 
     /**
-     * @notice Breaking a permanent lock starts linear decay from near-maximum.
-     *         If we break at an exact week boundary, the initial voting power is:
-     *         amount * (MAXTIME - (MAXTIME % WEEK)) / MAXTIME = amount * (364/365)
-     *         For 1 DUST this equals 997260273972602739 (hardcoded below).
+     * @notice Breaking a permanent lock defers at the exact epoch and starts decay at T + 1
      */
-    function testUnlockPermanentWeekBoundaryStartsDecayHardcoded() public {
+    function testUnlockPermanentWeekBoundaryDefersThenStartsDecay() public {
         uint256 amount = TOKEN_1; // 1 DUST
 
         DUST.approve(address(dustLock), amount);
@@ -148,25 +146,23 @@ contract DustLockFlow is BaseTestLocal {
         // Align timestamp to exact week boundary to make end-now = MAXTIME - 1 day
         skipToNextEpoch(0);
 
-        // Break permanent lock -> decay starts
+        IDustLock.LockedBalance memory permanentBefore = dustLock.locked(tokenId);
+        vm.expectRevert(CommonChecksLibrary.EpochFinalizationPending.selector);
+        dustLock.unlockPermanent(tokenId);
+        assertEq(keccak256(abi.encode(dustLock.locked(tokenId))), keccak256(abi.encode(permanentBefore)));
+
+        skipToAndLog(block.timestamp + 1, "Exact boundary + 1 second");
         dustLock.unlockPermanent(tokenId);
 
-        // Immediately after unlock at week boundary, voting power is 364/365 of 1e18
+        IDustLock.LockedBalance memory li = dustLock.locked(tokenId);
+        uint256 expectedInitial = amount * (li.end - block.timestamp) / MAXTIME;
         uint256 vpInitial = dustLock.balanceOfNFT(tokenId);
-        /*
-         Calculations (immediately after unlock at a week boundary):
-         - Amount: 1 DUST   = 1e18 wei
-         - Remaining time   = MAXTIME - (MAXTIME % WEEK) = 365d - 1d = 364 days
-         - Voting power     = floor(1e18 * 364 / 365)
-                            = 997,260,273,972,602,739 wei
-         */
-        emit log_named_uint("Expected post-unlock voting power", 997260273972602739);
+        emit log_named_uint("Expected post-unlock voting power", expectedInitial);
         emit log_named_uint("Actual post-unlock voting power", vpInitial);
-        assertEq(vpInitial, 997260273972602739, "Post-unlock initial should be 364/365 of 1e18");
+        assertEq(vpInitial, expectedInitial, "Post-unlock power must use the exact T+1 remaining duration");
         logWithTs("Post-unlock - passed");
 
         // Read new end and validate linearity at half remaining -> 0.5e18
-        IDustLock.LockedBalance memory li = dustLock.locked(tokenId);
         uint256 end = li.end;
         skipToAndLog(end - (MAXTIME / 2), "Half remaining after unlock");
         uint256 vpHalf = dustLock.balanceOfNFT(tokenId);

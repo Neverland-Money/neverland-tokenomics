@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import {IDustLockLegendaryLedger} from "../../src/interfaces/IDustLockLegendaryLedger.sol";
-import {IDustLock} from "../../src/interfaces/IDustLock.sol";
-import {DustLockLegendaryLedger} from "../../src/tokens/DustLockLegendaryLedger.sol";
-import {Dust} from "../../src/tokens/Dust.sol";
-import {DustLock} from "../../src/tokens/DustLock.sol";
+import {IDustLockLegendaryLedger} from "../../../src/interfaces/IDustLockLegendaryLedger.sol";
+import {IDustLock} from "../../../src/interfaces/IDustLock.sol";
+import {DustLockLegendaryLedger} from "../../../src/tokens/DustLockLegendaryLedger.sol";
+import {Dust} from "../../../src/tokens/Dust.sol";
+import {DustLock} from "../../../src/tokens/DustLock.sol";
 import {Vm} from "forge-std/Vm.sol";
 
-import "../BaseTest.sol";
+import "../../BaseTest.sol";
 
 contract TestDelegateProxy {
     address private immutable implementation;

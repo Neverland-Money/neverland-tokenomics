@@ -12,14 +12,8 @@ import {IUserVaultFactory} from "./IUserVaultFactory.sol";
  * @dev Handles reward epochs, claiming rewards, and self-repaying loan functionality
  */
 interface IRevenueReward {
-    /// @notice Error thrown when a non-distributor address attempts to notify rewards
-    error NotRewardDistributor();
-
-    /// @notice Error thrown when a non-owner address attempts a restricted operation
-    error NotOwner();
-
-    /// @notice Error thrown when a non-DustLock address attempts a restricted operation
-    error NotDustLock();
+    /// @notice Error thrown when an array contains duplicate values or is not sorted in ascending order
+    error ArrayNotSortedOrContainsDuplicates();
 
     /// @notice Error thrown when end timestamp used for calculating rewards is greater than the current time
     error EndTimestampMoreThanCurrent();
@@ -27,11 +21,17 @@ interface IRevenueReward {
     /// @notice Error thrown when provided arrays are empty or exceed soft size limits
     error InvalidArrayLengths();
 
+    /// @notice Error thrown when a non-DustLock address attempts a restricted operation
+    error NotDustLock();
+
+    /// @notice Error thrown when a non-owner address attempts a restricted operation
+    error NotOwner();
+
+    /// @notice Error thrown when a non-distributor address attempts to notify rewards
+    error NotRewardDistributor();
+
     /// @notice Error thrown when a provided reward token is not registered
     error UnknownRewardToken();
-
-    /// @notice Error thrown when an array contains duplicate values or is not sorted in ascending order
-    error ArrayNotSortedOrContainsDuplicates();
 
     /**
      * @notice Emitted when rewards are claimed
@@ -59,19 +59,19 @@ interface IRevenueReward {
     event RecoverTokens(address indexed token, uint256 amount);
 
     /**
+     * @notice Emitted when the reward distributor address is updated
+     * @param oldDistributor The previous reward distributor
+     * @param newDistributor The new reward distributor
+     */
+    event RewardDistributorUpdated(address indexed oldDistributor, address indexed newDistributor);
+
+    /**
      * @notice Emitted when self-repaying loan status is updated for a token
      * @param token ID of the veNFT whose reward redirection is being configured
      * @param rewardReceiver Address that will receive the rewards (or zero address if disabled)
      * @param isEnabled Whether self-repaying loan is being enabled (true) or disabled (false)
      */
     event SelfRepayingLoanUpdate(uint256 indexed token, address rewardReceiver, bool isEnabled);
-
-    /**
-     * @notice Emitted when the reward distributor address is updated
-     * @param oldDistributor The previous reward distributor
-     * @param newDistributor The new reward distributor
-     */
-    event RewardDistributorUpdated(address indexed oldDistributor, address indexed newDistributor);
 
     /*//////////////////////////////////////////////////////////////
                                 CONSTANTS
@@ -107,6 +107,12 @@ interface IRevenueReward {
      * @return The maximum number of reward tokens accepted in batch calls
      */
     function MAX_TOKENS() external view returns (uint256);
+
+    /**
+     * @notice Returns the implementation version of the contract
+     * @return The current integer implementation version of the contract
+     */
+    function version() external view returns (uint256);
 
     /*//////////////////////////////////////////////////////////////
                             STORAGE GETTERS
@@ -220,6 +226,16 @@ interface IRevenueReward {
     function notifyRewardAmount(address token, uint256 amount) external;
 
     /**
+     * @notice Adds new rewards to the distribution pool for the epoch after next
+     * @dev Can only be called by the authorized reward distributor address.
+     *      Useful when the next epoch is already funded and a later epoch should be pre-funded.
+     *      Uses the same token registration, accounting, transfer, and NotifyReward event as notifyRewardAmount.
+     * @param token The address of the reward token to distribute
+     * @param amount The amount of rewards to add to the distribution pool
+     */
+    function notifyRewardAmountForFollowingEpoch(address token, uint256 amount) external;
+
+    /**
      * @notice Recovers unnotified balances of registered reward tokens
      * @dev Can only be called by the reward distributor
      *      For each registered reward token, if the contract's token balance exceeds the credited amount
@@ -320,8 +336,7 @@ interface IRevenueReward {
      *      Calculates earned rewards for each specified token using epoch-based accounting and transfers them to the
      *      appropriate recipient. Emits a ClaimRewards event per token. If a reward receiver is configured via
      *      enableSelfRepayLoan, rewards go to that address; otherwise, rewards are sent to the veNFT owner.
-     *      At an exact current epoch boundary, the boundary epoch is deferred until the next second. Updates lastEarnTime
-     *      to the effective processed timestamp to track future accruals (only if there were epochs to process).
+     *      Updates lastEarnTime to rewardPeriodEndTs to track future accruals (only if there were epochs to process).
      *      Access: callable by the veNFT owner or an approved operator. The DustLock contract may also call.
      *      Reverts: NotOwner, EndTimestampMoreThanCurrent, UnknownRewardToken, InvalidArrayLengths.
      * @param tokenId The ID of the veNFT to claim rewards for
@@ -458,10 +473,42 @@ interface IRevenueReward {
     function getUsersWithSelfRepayingLoan(uint256 from, uint256 to) external view returns (address[] memory);
 
     /**
+     * @notice Returns the number of users with at least one active self-repaying loan.
+     * @return count Number of users currently indexed for self-repay
+     */
+    function usersWithSelfRepayingLoanLength() external view returns (uint256 count);
+
+    /**
+     * @notice Returns every user who currently has a self-repaying loan enabled.
+     * @dev Unbounded enumerable-set view for off-chain use; page via the bounded getter for very large sets.
+     * @return users Every user with a self-repaying loan enabled.
+     */
+    function getAllUsersWithSelfRepayingLoan() external view returns (address[] memory users);
+
+    /**
      * @notice Returns the list of token IDs for which the given user has enabled a self-repaying loan.
      * @dev Checks the user's internal set of token IDs with self-repaying loans and returns them as an array.
      * @param user The address of the user to query.
      * @return tokenIds An array of token IDs currently associated with self-repaying loans for the user.
      */
     function getUserTokensWithSelfRepayingLoan(address user) external view returns (uint256[] memory tokenIds);
+
+    /**
+     * @notice Returns a bounded slice of self-repay token IDs for a user.
+     * @param user The address of the user to query
+     * @param from Starting index (inclusive)
+     * @param to Ending index (exclusive)
+     * @return tokenIds Slice of self-repay token IDs for the user
+     */
+    function getUserTokensWithSelfRepayingLoanRange(address user, uint256 from, uint256 to)
+        external
+        view
+        returns (uint256[] memory tokenIds);
+
+    /**
+     * @notice Returns the number of self-repay token IDs indexed for a user.
+     * @param user The address of the user to query
+     * @return count Number of self-repay token IDs for the user
+     */
+    function userTokensWithSelfRepayingLoanLength(address user) external view returns (uint256 count);
 }

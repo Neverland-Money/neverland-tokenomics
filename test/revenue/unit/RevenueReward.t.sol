@@ -3,9 +3,9 @@ pragma solidity 0.8.30;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {IRevenueReward} from "../../src/interfaces/IRevenueReward.sol";
+import {IRevenueReward} from "../../../src/interfaces/IRevenueReward.sol";
 
-import "../BaseTestLocal.sol";
+import "../../BaseTestLocal.sol";
 
 contract RevenueRewardsTest is BaseTestLocal {
     MockERC20 mockDAI = new MockERC20("DAI", "DAI", 18);
@@ -646,6 +646,7 @@ contract RevenueRewardsTest is BaseTestLocal {
 
         // epoch2
         goToEpoch(2);
+        skipAndRoll(1);
 
         _addReward(admin, mockUSDC, USDC_1);
         _addReward(admin, mockERC20, TOKEN_1);
@@ -670,6 +671,7 @@ contract RevenueRewardsTest is BaseTestLocal {
 
         // epoch2
         goToEpoch(2);
+        skipAndRoll(1);
 
         _addReward(admin, mockUSDC, USDC_1);
 
@@ -723,6 +725,7 @@ contract RevenueRewardsTest is BaseTestLocal {
 
         // epoch2
         goToEpoch(2);
+        skipAndRoll(1);
 
         _addReward(admin, mockUSDC, USDC_1);
 
@@ -774,6 +777,7 @@ contract RevenueRewardsTest is BaseTestLocal {
 
         // epoch2
         goToEpoch(2);
+        skipAndRoll(1);
 
         _addReward(admin, mockUSDC, USDC_1);
 
@@ -810,6 +814,55 @@ contract RevenueRewardsTest is BaseTestLocal {
         revenueReward.getReward(userTokenId1, tokens);
         assertEq(mockUSDC.balanceOf(user), 7 + 10 + 14 + 2);
         assertEq(revenueReward.tokenRewardsRemainingAccScaled(address(mockUSDC), userTokenId1), 90820752613171229);
+    }
+
+    function testRemainderCarryCannotOverDistributeAcrossAllClaimants() public {
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(mockUSDC);
+
+        uint256 tokenId1 = _createPermanentLock(user, 2 * TOKEN_1, MAXTIME);
+        uint256 tokenId2 = _createPermanentLock(user1, 3 * TOKEN_1, MAXTIME);
+        uint256 tokenId3 = _createPermanentLock(user2, 7 * TOKEN_1, MAXTIME);
+
+        uint256 totalNotified;
+        for (uint256 i = 0; i < 6; ++i) {
+            _addReward(admin, mockUSDC, USDC_1);
+            totalNotified += USDC_1;
+            skipToNextEpoch(1);
+        }
+
+        uint256 before1 = mockUSDC.balanceOf(user);
+        uint256 before2 = mockUSDC.balanceOf(user1);
+        uint256 before3 = mockUSDC.balanceOf(user2);
+
+        vm.prank(user);
+        revenueReward.getReward(tokenId1, tokens);
+        vm.prank(user1);
+        revenueReward.getReward(tokenId2, tokens);
+        vm.prank(user2);
+        revenueReward.getReward(tokenId3, tokens);
+
+        uint256 claimed1 = mockUSDC.balanceOf(user) - before1;
+        uint256 claimed2 = mockUSDC.balanceOf(user1) - before2;
+        uint256 claimed3 = mockUSDC.balanceOf(user2) - before3;
+        uint256 totalClaimed = claimed1 + claimed2 + claimed3;
+
+        assertEq(totalNotified, revenueReward.totalRewardsPerToken(address(mockUSDC)));
+        assertLe(totalClaimed, totalNotified, "claims cannot exceed notified rewards");
+        assertEq(totalClaimed + mockUSDC.balanceOf(address(revenueReward)), totalNotified, "reward conservation");
+        assertLt(revenueReward.tokenRewardsRemainingAccScaled(address(mockUSDC), tokenId1), 1e18);
+        assertLt(revenueReward.tokenRewardsRemainingAccScaled(address(mockUSDC), tokenId2), 1e18);
+        assertLt(revenueReward.tokenRewardsRemainingAccScaled(address(mockUSDC), tokenId3), 1e18);
+
+        vm.prank(user);
+        revenueReward.getReward(tokenId1, tokens);
+        vm.prank(user1);
+        revenueReward.getReward(tokenId2, tokens);
+        vm.prank(user2);
+        revenueReward.getReward(tokenId3, tokens);
+        assertEq(claimed1, mockUSDC.balanceOf(user) - before1);
+        assertEq(claimed2, mockUSDC.balanceOf(user1) - before2);
+        assertEq(claimed3, mockUSDC.balanceOf(user2) - before3);
     }
 
     /* ========== TEST DUST LOCK INTERACTIONS ========== */
@@ -904,6 +957,7 @@ contract RevenueRewardsTest is BaseTestLocal {
         _registerStressRewardTokens(6);
 
         skipNumberOfEpochs(45);
+        skipAndRoll(1);
 
         vm.prank(user);
         (bool lowGasOk,) = address(dustLock).call{gas: 8_000_000}(
@@ -921,10 +975,11 @@ contract RevenueRewardsTest is BaseTestLocal {
         _registerStressRewardTokens(6);
 
         skipNumberOfEpochs(45);
+        skipAndRoll(1);
 
         vm.prank(user);
         (bool lowGasOk,) =
-            address(dustLock).call{gas: 8_000_000}(abi.encodeWithSelector(dustLock.earlyWithdraw.selector, tokenId));
+            address(dustLock).call{gas: 8_000_000}(abi.encodeWithSignature("earlyWithdraw(uint256)", tokenId));
         assertFalse(lowGasOk, "Expected tight-gas burn to fail under stressed hooks");
 
         vm.prank(user);
@@ -940,6 +995,7 @@ contract RevenueRewardsTest is BaseTestLocal {
         _registerStressRewardTokens(6);
 
         skipNumberOfEpochs(45);
+        skipAndRoll(1);
 
         vm.prank(user);
         (bool lowGasOk,) = address(dustLock).call{gas: 8_000_000}(
@@ -958,6 +1014,7 @@ contract RevenueRewardsTest is BaseTestLocal {
         _registerStressRewardTokens(6);
 
         skipNumberOfEpochs(45);
+        skipAndRoll(1);
         dustLock.toggleSplit(user, true);
 
         vm.prank(user);
@@ -1340,11 +1397,13 @@ contract RevenueRewardsTest is BaseTestLocal {
     function testInitialGetRewardGasCosts() public {
         ///*** create a token on epoch 300, get reward on epoch 301 ***//
         goToEpoch(300);
+        skipAndRoll(1);
 
         _addReward(admin, mockUSDC, USDC_10K);
         uint256 tokenId2 = _createLock(user, TOKEN_1, MAXTIME);
 
         skipNumberOfEpochs(1); // week 301
+        skipAndRoll(1);
 
         address[] memory tokens = new address[](1);
         tokens[0] = address(mockUSDC);
@@ -1359,6 +1418,7 @@ contract RevenueRewardsTest is BaseTestLocal {
     function testGetRewardGasCostsForLongUnclaimedDuration() public {
         ///*** getting 300 epochs unclaimed rewards (epoch300 - epoch600) in one tx  ***//
         goToEpoch(300);
+        skipAndRoll(1);
 
         uint256 tokenId1 = _createLock(user, TOKEN_1, MAXTIME);
         dustLock.lockPermanent(tokenId1);
@@ -1369,8 +1429,8 @@ contract RevenueRewardsTest is BaseTestLocal {
         }
         assertEq(block.timestamp, 600 weeks);
 
-        dustLock.checkpoint();
-        skip(1);
+        skipAndRoll(1);
+        _catchUpDustLockCheckpoints(4);
 
         address[] memory tokens = new address[](1);
         tokens[0] = address(mockUSDC);
@@ -1388,6 +1448,7 @@ contract RevenueRewardsTest is BaseTestLocal {
     function testGetRewardUntilTsGasCostsForLongUnclaimedDuration() public {
         ///*** getting 300 epochs (epoch300 - epoch 600) unclaimed rewards in multiple txs ***//
         goToEpoch(300);
+        skipAndRoll(1);
 
         uint256 tokenId2 = _createLock(user, TOKEN_1, MAXTIME);
         dustLock.lockPermanent(tokenId2);
@@ -1395,10 +1456,9 @@ contract RevenueRewardsTest is BaseTestLocal {
         for (uint256 i = 0; i < 300; i++) {
             _addReward(admin, mockUSDC, USDC_1);
             skipNumberOfEpochs(1);
+            skipAndRoll(1);
             if (i % 5 == 0) dustLock.checkpoint(); // simulate user activity every 5 epochs
         }
-        assertEq(block.timestamp, 600 weeks);
-        skip(1);
 
         uint256 gasStart;
         uint256[] memory gasPerGetRewardUntilTs = new uint256[](10);
@@ -1488,9 +1548,35 @@ contract RevenueRewardsTest is BaseTestLocal {
         emit log_named_uint("[merge/vault] Vault balance after", vaultBalanceAfter);
         emit log_named_uint("[merge/vault] Rewards to vault", vaultBalanceAfter - vaultBalanceBefore);
 
-        // Assert rewards from userTokenId1 went to vault (because self-repay was enabled), not owner
+        // Assert rewards from userTokenId1 went to vault (because self-repay was enabled), not owner.
         assertEq(userBalanceAfter, userBalanceBefore, "User balance should not change");
         assertGt(vaultBalanceAfter, vaultBalanceBefore, "Vault should receive rewards from merged token");
+
+        // Destination's self-repay state is preserved as-is: source's receiver does NOT carry over.
+        assertEq(
+            revenueReward.tokenRewardReceiver(userTokenId2),
+            address(0),
+            "destination self-repay receiver must remain unset; merge does not auto-enable"
+        );
+        uint256[] memory selfRepayTokenIds = revenueReward.getUserTokensWithSelfRepayingLoan(user);
+        assertEq(selfRepayTokenIds.length, 0, "destination must not be added to user's self-repay set");
+
+        _addReward(admin, mockUSDC, USDC_10K);
+        skipToNextEpoch(1);
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(mockUSDC);
+
+        userBalanceBefore = mockUSDC.balanceOf(user);
+        vaultBalanceBefore = mockUSDC.balanceOf(userVault);
+
+        vm.prank(user);
+        revenueReward.getReward(userTokenId2, tokens);
+
+        userBalanceAfter = mockUSDC.balanceOf(user);
+        vaultBalanceAfter = mockUSDC.balanceOf(userVault);
+        assertGt(userBalanceAfter, userBalanceBefore, "destination rewards must flow to owner, not the source's vault");
+        assertEq(vaultBalanceAfter, vaultBalanceBefore, "vault must not receive destination rewards after merge");
     }
 
     function testSplitAutoClaimsToOwnerWithoutSelfRepay() public {
@@ -1567,7 +1653,7 @@ contract RevenueRewardsTest is BaseTestLocal {
         emit log_named_uint("[split/vault] Vault balance after", vaultBalanceAfter);
         emit log_named_uint("[split/vault] Rewards to vault", vaultBalanceAfter - vaultBalanceBefore);
 
-        // Assert rewards from original token went to vault (because self-repay was enabled), not owner
+        // Assert rewards from original token went to vault (because self-repay was enabled), not owner.
         assertEq(userBalanceAfter, userBalanceBefore, "User balance should not change");
         assertGt(vaultBalanceAfter, vaultBalanceBefore, "Vault should receive rewards from split token");
     }
@@ -1701,20 +1787,19 @@ contract RevenueRewardsTest is BaseTestLocal {
         _addReward(admin, mockUSDC, USDC_10K);
         skipToNextEpoch(1);
 
-        // enable batch to user2 receiver
+        // enable batch to the caller's user vault receiver
         uint256[] memory ids = new uint256[](2);
         ids[0] = tokenId1;
         ids[1] = tokenId2;
+        address user_userVault = userVaultFactory.getOrCreateUserVault(user);
 
         vm.startPrank(user);
         vm.expectEmit(true, true, true, false, address(revenueReward));
-        emit SelfRepayingLoanUpdate(tokenId1, user2, true);
+        emit SelfRepayingLoanUpdate(tokenId1, user_userVault, true);
         vm.expectEmit(true, true, true, false, address(revenueReward));
-        emit SelfRepayingLoanUpdate(tokenId2, user2, true);
+        emit SelfRepayingLoanUpdate(tokenId2, user_userVault, true);
         revenueReward.enableSelfRepayLoanBatch(ids);
         vm.stopPrank();
-
-        address user_userVault = userVaultFactory.getUserVault(user);
 
         // claim to ensure routing works for both
         address[] memory tokens = new address[](1);
@@ -2009,6 +2094,13 @@ contract RevenueRewardsTest is BaseTestLocal {
         _token.approve(address(revenueReward), _amount);
         revenueReward.notifyRewardAmount(address(_token), _amount);
         vm.stopPrank();
+    }
+
+    function _catchUpDustLockCheckpoints(uint256 maxCalls) private {
+        for (uint256 i = 0; dustLock.pointHistory(dustLock.epoch()).ts < block.timestamp; ++i) {
+            assertLt(i, maxCalls, "DustLock checkpoint catch-up did not converge");
+            dustLock.checkpoint();
+        }
     }
 
     function _registerStressRewardTokens(uint256 count) private {

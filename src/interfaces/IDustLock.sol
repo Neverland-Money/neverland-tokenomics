@@ -24,7 +24,8 @@ interface IDustLock is IERC4906, IERC6372, IERC721Metadata, ICreatorToken, IERC2
      * @notice Structure representing a locked token position
      * @dev Used to track the amount of tokens locked, when they unlock, and if they're permanently locked
      * @param amount Amount of tokens locked in int256 format for consistency with precision calculations
-     * @param effectiveStart Effective start time for penalty calculations (weighted average on lock operations)
+     * @param effectiveStart Legacy field retained for storage-layout compatibility; still written
+     *        as a weighted average on lock operations, but not used by the 2.1.0 penalty pricing
      * @param end Timestamp when tokens unlock (0 for permanent locks)
      * @param isPermanent Whether this is a permanent lock that cannot be withdrawn normally
      */
@@ -124,6 +125,13 @@ interface IDustLock is IERC4906, IERC6372, IERC721Metadata, ICreatorToken, IERC2
 
     /// @notice Error thrown when trying to unlock a non-permanent lock using unlockPermanent
     error NotPermanentLock();
+
+    /**
+     * @notice Error thrown when the execution-time early-withdraw penalty exceeds the caller-provided bound
+     * @param penalty The penalty that would be charged
+     * @param maxPenalty The caller-provided maximum acceptable penalty
+     */
+    error EarlyWithdrawPenaltyAboveMax(uint256 penalty, uint256 maxPenalty);
 
     /// @notice Error thrown when the caller is not the owner of the token
     error NotOwner();
@@ -555,9 +563,10 @@ interface IDustLock is IERC4906, IERC6372, IERC721Metadata, ICreatorToken, IERC2
     function permanentLockBalance() external view returns (uint256);
 
     /**
-     * @notice Percentage of penalty applied to early withdrawals (in basis points)
-     * @dev Value is between 0 and 10000 (0% to 100%)
-     * @return The current penalty percentage in basis points
+     * @notice Maximum of the early-withdrawal penalty curve, in basis points
+     * @dev Constrained to [2500, 9999]; sets the penalty at maximum remaining duration and for permanent locks,
+     *      while the timed curve floors at 25% as remaining duration approaches zero.
+     * @return The current penalty curve maximum in basis points
      */
     function earlyWithdrawPenalty() external view returns (uint256);
 
@@ -712,22 +721,48 @@ interface IDustLock is IERC4906, IERC6372, IERC721Metadata, ICreatorToken, IERC2
     function withdraw(uint256 _tokenId) external;
 
     /**
-     * @notice Withdraw tokens from a lock before it expires, with a time-proportional penalty
-     * @dev Allows users to exit a lock early but with a penalty fee applied
-     *      The penalty is proportional to both `earlyWithdrawPenalty` and remaining time until unlock
-     *      If the lock is permanent, it is internally converted back to a standard time-lock first and
-     *      the early withdraw penalty is computed using the restored lock window. Penalty fees are sent
-     *      to the `earlyWithdrawTreasury` address. Burns the veNFT and returns the non‑penalized portion
-     *      of tokens to the owner. Can only be called by the owner of the veNFT or an approved address
+     * @notice Withdraw tokens from a lock before it expires, with a commitment-based penalty
+     * @dev Prices timed exits from the actual remaining duration; `earlyWithdrawPenalty` sets the curve
+     *      maximum and `effectiveStart` is not a pricing input. Penalty fees are sent to
+     *      `earlyWithdrawTreasury`; the veNFT is burned and the remainder is returned to its owner.
+     *      Can only be called by the owner of the veNFT or approved address.
+     *      For permanent locks the call first converts the position to a timed lock with a fresh
+     *      weekly-rounded ~MAXTIME end (exactly like calling `unlockPermanent` yourself) and prices
+     *      the exit at that fresh end, so the one-step and two-step paths always cost the same.
      * @param _tokenId The ID of the veNFT to withdraw early from
      */
     function earlyWithdraw(uint256 _tokenId) external;
 
     /**
-     * @notice Sets the early withdrawal penalty percentage
+     * @notice Withdraw tokens from a lock before it expires, reverting when the charged penalty exceeds your bound
+     * @dev Same flow as `earlyWithdraw(uint256)`: the penalty is computed at execution time and the call
+     *      reverts with `EarlyWithdrawPenaltyAboveMax` when it exceeds `_maxPenalty`, before any state change.
+     *      Use it to bind a previewed quote, for example a permanent-exit quote against the weekly-rounded
+     *      sawtooth step at the 6-day mark of each week (up to about 0.96 percentage points at the
+     *      default scalar, about 1.44 at 9999 bps).
+     * @param _tokenId The ID of the veNFT to withdraw early from
+     * @param _maxPenalty The maximum DUST penalty the caller accepts for this exit
+     */
+    function earlyWithdraw(uint256 _tokenId, uint256 _maxPenalty) external;
+
+    /**
+     * @notice Quotes the exact DUST penalty routed by an early exit at the current timestamp
+     * @dev For timed locks, prices the locked amount against the actual remaining time on the
+     *      `earlyWithdrawPenalty` curve. For permanent locks, quotes the executable two-step path
+     *      (unlockPermanent, then earlyWithdraw): the fresh weekly-rounded end priced on the same
+     *      curve. Token id zero and empty nonzero token ids return zero so transfer strategies can
+     *      probe this capability safely.
+     * @param _tokenId The veNFT whose current early-exit penalty is being quoted
+     * @return penaltyAmount Exact DUST amount routed to the configured early-exit burn wallet
+     */
+    function earlyWithdrawPenaltyAmount(uint256 _tokenId) external view returns (uint256 penaltyAmount);
+
+    /**
+     * @notice Sets the early-withdrawal penalty curve maximum
      * @dev Can only be called by the team address
-     *      Value is in basis points (0-10000), where 10000 = 100%
-     * @param _earlyWithdrawPenalty The new penalty percentage in basis points
+     *      Value is in basis points, constrained to [2500, 9999]; values below the 25% floor or at/above 100%
+     *      revert with `InvalidWithdrawPenalty`
+     * @param _earlyWithdrawPenalty The new penalty curve maximum in basis points
      */
     function setEarlyWithdrawPenalty(uint256 _earlyWithdrawPenalty) external;
 
@@ -790,9 +825,9 @@ interface IDustLock is IERC4906, IERC6372, IERC721Metadata, ICreatorToken, IERC2
      * @dev Converts a standard time-locked veNFT to a permanent lock
      *      Once permanent, the veNFT cannot be withdrawn normally (even after the original lock time)
      *      Permanent locks have constant voting power equal to the locked token amount with no time decay
-     *      Note: time served prior to permanence is not preserved for penalty calculations — if the owner
-     *      later calls `earlyWithdraw`, the position is first unlocked and the penalty window resets to a
-     *      full MAXTIME from the current timestamp
+     *      Note: time served prior to permanence is not preserved for penalty calculations. Exiting a
+     *      permanent position through `earlyWithdraw` converts it to a timed lock with a fresh
+     *      weekly-rounded ~MAXTIME end first, and prices the exit at that fresh end
      *      Can only be called by the owner of the veNFT or an approved address
      *      Cannot be called on a lock that is already permanent
      * @param _tokenId The ID of the veNFT to permanently lock
@@ -802,9 +837,8 @@ interface IDustLock is IERC4906, IERC6372, IERC721Metadata, ICreatorToken, IERC2
     /**
      * @notice Revert a veNFT from permanent lock status back to a standard time-lock
      * @dev Converts a permanent lock back to a standard time-based lock
-     *      After unlocking, the veNFT's voting power will decay based on the remaining lock time
-     *      The lock time will be the original lock end time from before it was made permanent
-     *      If the original lock time has already passed, the lock will be immediately withdrawable
+     *      After unlocking, the veNFT receives a fresh MAXTIME lock rounded down to the weekly epoch grid
+     *      Its voting power then decays from that new lock end; the pre-permanent end time is not restored
      *      Can only be called by the owner or an approved operator
      *      Only callable on veNFTs that are currently permanently locked
      * @param _tokenId The ID of the veNFT to revert from permanent to standard lock

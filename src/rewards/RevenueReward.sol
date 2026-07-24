@@ -74,8 +74,10 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
     uint256 public constant MAX_TOKENS = 32;
     /// @inheritdoc IRevenueReward
     uint256 public constant MAX_TOKENIDS = 64;
+    /// @inheritdoc IRevenueReward
+    uint256 public constant version = 2;
 
-    /// @notice Scale factor for rewards remaining
+    /// @dev Scale factor for rewards remaining
     uint256 private constant REWARDS_REMAINING_SCALE = 1e18;
 
     /*//////////////////////////////////////////////////////////////
@@ -142,6 +144,22 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
 
     /// @inheritdoc IRevenueReward
     function notifyRewardAmount(address token, uint256 amount) external override nonReentrant {
+        _notifyRewardAmount(token, amount, EpochTimeLibrary.epochNext(block.timestamp));
+    }
+
+    /// @inheritdoc IRevenueReward
+    function notifyRewardAmountForFollowingEpoch(address token, uint256 amount) external override nonReentrant {
+        _notifyRewardAmount(token, amount, EpochTimeLibrary.epochNext(block.timestamp) + DURATION);
+    }
+
+    /**
+     * @notice Registers and transfers rewards into the selected future epoch
+     * @dev Shared notification path; callers select only the future epoch bucket.
+     * @param token The reward token to register and transfer
+     * @param amount The reward amount to credit
+     * @param epoch The future epoch bucket receiving the reward
+     */
+    function _notifyRewardAmount(address token, uint256 amount, uint256 epoch) private {
         CommonChecksLibrary.revertIfZeroAmount(amount);
         CommonChecksLibrary.revertIfZeroAddress(token);
         address sender = _msgSender();
@@ -155,10 +173,9 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
         totalRewardsPerToken[token] += amount;
         IERC20(token).safeTransferFrom(sender, address(this), amount);
 
-        uint256 epochNext = EpochTimeLibrary.epochNext(block.timestamp);
-        tokenRewardsPerEpoch[token][epochNext] += amount;
+        tokenRewardsPerEpoch[token][epoch] += amount;
 
-        emit NotifyReward(sender, token, epochNext, amount);
+        emit NotifyReward(sender, token, epoch, amount);
     }
 
     /// @inheritdoc IRevenueReward
@@ -213,8 +230,10 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
         nonReentrant
         onlyDustLock
     {
-        /// @dev Use the `owner` parameter directly
-        address rewardsReceiver = tokenRewardReceiver[fromToken] == address(0) ? owner : tokenRewardReceiver[fromToken];
+        if (block.timestamp % DURATION == 0) _claimRewardsTo(toToken, _resolveRewardsReceiver(toToken));
+
+        /// @dev Honor the stored receiver only when it is the owner's canonical vault, otherwise pay the owner
+        address rewardsReceiver = _receiverForOwner(fromToken, owner);
         _claimRewardsTo(fromToken, rewardsReceiver);
 
         uint256 len = rewardTokens.length;
@@ -237,8 +256,8 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
         uint256 token2Amount,
         address owner
     ) external override nonReentrant onlyDustLock {
-        // Cannot use _resolveRewardsReceiver as fromToken doesn't exist anymore
-        address rewardsReceiver = tokenRewardReceiver[fromToken] == address(0) ? owner : tokenRewardReceiver[fromToken];
+        /// @dev fromToken is burned, so honor the stored receiver only when it is the owner's canonical vault
+        address rewardsReceiver = _receiverForOwner(fromToken, owner);
         _claimRewardsTo(fromToken, rewardsReceiver);
 
         tokenMintTime[tokenId1] = block.timestamp;
@@ -260,13 +279,17 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
         }
 
         address receiverFromToken = tokenRewardReceiver[fromToken];
-        // If the original token had a reward receiver (self-repaying loan enabled),
-        // update both new tokens reward receivers and add both tokens to the tracking set
-        if (receiverFromToken != address(0)) {
+        /*
+         * Propagate self-repay routing to both children only when the source receiver is the
+         * owner's current vault; a receiver left stale by a transfer during a hooks-disabled
+         * window does not match and is not carried over.
+         */
+        if (receiverFromToken != address(0) && receiverFromToken == userVaultFactory.getUserVault(owner)) {
             tokenRewardReceiver[tokenId1] = receiverFromToken;
             tokenRewardReceiver[tokenId2] = receiverFromToken;
             userTokensWithSelfRepayingLoan[owner].add(tokenId1);
             userTokensWithSelfRepayingLoan[owner].add(tokenId2);
+            usersWithSelfRepayingLoan.add(owner);
         }
 
         _removeToken(fromToken, owner);
@@ -347,10 +370,9 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
     /**
      * @notice Claims accumulated rewards for a specific veNFT across multiple reward tokens up to a specified timestamp
      * @dev Calculates earned rewards for each specified token using epoch-based accounting and transfers them to the provided receiver.
-     *      Emits a ClaimRewards event only for tokens with non-zero rewards. At an exact current epoch boundary,
-     *      the active boundary epoch is deferred until the next second because DustLock checkpoints at that timestamp
-     *      can still be mutated. Updates lastEarnTime to the effective processed timestamp for all successfully
-     *      processed tokens. Reverts if rewardPeriodEndTs is in the future.
+     *      Emits a ClaimRewards event only for tokens with non-zero rewards. Updates lastEarnTime to rewardPeriodEndTs for all
+     *      successfully processed tokens. Reverts throughout the exact nonzero epoch-boundary second before any claim
+     *      processing, including for a historical rewardPeriodEndTs. Reverts if rewardPeriodEndTs is in the future.
      * @param tokenId The ID of the veNFT to claim rewards for
      * @param receiver The address to receive the rewards
      * @param tokens Array of reward token addresses to claim (must be registered reward tokens)
@@ -359,12 +381,13 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
     function _claimRewardsUntilTs(uint256 tokenId, address receiver, address[] memory tokens, uint256 rewardPeriodEndTs)
         internal
     {
+        CommonChecksLibrary.revertIfEpochFinalizationPending(DURATION);
         rewardPeriodEndTs = _finalizedRewardPeriodEndTs(rewardPeriodEndTs);
 
         uint256 len = tokens.length;
         for (uint256 i = 0; i < len; ++i) {
             address token = tokens[i];
-            if (!isRewardToken[token]) revert UnknownRewardToken();
+            _revertIfUnknownRewardToken(token);
 
             EarnedResult memory _earnedResult = _earned(token, tokenId, rewardPeriodEndTs);
 
@@ -373,6 +396,7 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
                 tokenRewardsRemainingAccScaled[token][tokenId] = _earnedResult.rewardRemainders;
                 if (_earnedResult.unclaimedRewards > 0) {
                     IERC20(token).safeTransfer(receiver, _earnedResult.unclaimedRewards);
+
                     emit ClaimRewards(tokenId, receiver, token, _earnedResult.unclaimedRewards);
                 }
             }
@@ -473,11 +497,19 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
     }
 
     /**
-     * @notice Validates tokenIds array is not empty
+     * @notice Reverts when `token` is not a registered reward token
+     * @param token Reward token address to validate
+     */
+    function _revertIfUnknownRewardToken(address token) private view {
+        if (!isRewardToken[token]) revert UnknownRewardToken();
+    }
+
+    /**
+     * @notice Validates tokenIds array length is within bounds
      * @param tokenIdsLength Length of tokenIds array
      */
     function _validateTokenIdsArray(uint256 tokenIdsLength) private pure {
-        if (tokenIdsLength == 0) revert InvalidArrayLengths();
+        if (tokenIdsLength == 0 || tokenIdsLength > MAX_TOKENIDS) revert InvalidArrayLengths();
     }
 
     /**
@@ -559,9 +591,10 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
 
     /// @inheritdoc IRevenueReward
     function earnedRewards(address token, uint256 tokenId, uint256 endTs) public view override returns (uint256) {
-        if (!isRewardToken[token]) revert UnknownRewardToken();
+        _revertIfUnknownRewardToken(token);
 
         EarnedResult memory earnedResult = _earned(token, tokenId, endTs);
+
         return earnedResult.unclaimedRewards;
     }
 
@@ -588,7 +621,18 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
         for (uint256 i = 0; i < resLen; ++i) {
             users[i] = usersWithSelfRepayingLoan.at(from + i);
         }
+
         return users;
+    }
+
+    /// @inheritdoc IRevenueReward
+    function usersWithSelfRepayingLoanLength() external view override returns (uint256 count) {
+        return usersWithSelfRepayingLoan.length();
+    }
+
+    /// @inheritdoc IRevenueReward
+    function getAllUsersWithSelfRepayingLoan() external view override returns (address[] memory users) {
+        return usersWithSelfRepayingLoan.values();
     }
 
     /// @inheritdoc IRevenueReward
@@ -603,6 +647,31 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
         for (uint256 i = 0; i < len; ++i) {
             tokenIds[i] = userTokensWithSelfRepayingLoan[user].at(i);
         }
+    }
+
+    /// @inheritdoc IRevenueReward
+    function getUserTokensWithSelfRepayingLoanRange(address user, uint256 from, uint256 to)
+        external
+        view
+        override
+        returns (uint256[] memory tokenIds)
+    {
+        CommonChecksLibrary.revertIfInvalidRange(from, to);
+
+        uint256 len = userTokensWithSelfRepayingLoan[user].length();
+        if (from >= len) return new uint256[](0);
+        if (to > len) to = len;
+
+        uint256 resLen = to - from;
+        tokenIds = new uint256[](resLen);
+        for (uint256 i = 0; i < resLen; ++i) {
+            tokenIds[i] = userTokensWithSelfRepayingLoan[user].at(from + i);
+        }
+    }
+
+    /// @inheritdoc IRevenueReward
+    function userTokensWithSelfRepayingLoanLength(address user) external view override returns (uint256 count) {
+        return userTokensWithSelfRepayingLoan[user].length();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -622,24 +691,22 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
     }
 
     /**
-     * @notice Finalizes a reward-period end timestamp, deferring an exact-epoch-boundary value by one second
-     * @dev Reverts if `endTs` is in the future. At an exact current epoch boundary (`endTs == block.timestamp`
-     *      and `endTs % DURATION == 0`), DustLock checkpoints for that timestamp can still be mutated within the
-     *      same block, so the boundary epoch is deferred until the next second by returning `endTs - 1`. All other
-     *      values pass through unchanged. A zero `endTs` is passed through (the `endTs != 0` guard skips deferral).
-     * @param endTs The requested reward-period end timestamp (must not be in the future)
-     * @return The finalized timestamp safe to settle against
+     * @notice Finalizes a reward-period end timestamp against the current epoch boundary
+     * @dev Reverts for future timestamps. An exact current boundary is previewed as `T - 1`;
+     *      state-changing claims are rejected before reaching this helper and retry at `T + 1`.
+     * @param endTs Requested reward-period end timestamp
+     * @return finalizedEndTs Timestamp safe to use for reward settlement
      */
-    function _finalizedRewardPeriodEndTs(uint256 endTs) internal view returns (uint256) {
+    function _finalizedRewardPeriodEndTs(uint256 endTs) internal view returns (uint256 finalizedEndTs) {
         if (endTs > block.timestamp) revert EndTimestampMoreThanCurrent();
-
         if (endTs != 0 && endTs == block.timestamp && endTs % DURATION == 0) return endTs - 1;
+
         return endTs;
     }
 
     /**
      * @notice Calculates and accrues rewards from the last claim (or mint) up to `endTs`
-     * @dev Finalizes `endTs`, then uses epoch-based accounting to prevent reward manipulation:
+     * @dev Uses epoch-based accounting to prevent reward manipulation:
      *      1. Iterates all epochs between the last processed time and `endTs`
      *      2. For each epoch, computes whole-token rewards and fractional remainders
      *      3. Accumulates whole rewards immediately and carries fractional remainders
@@ -708,13 +775,33 @@ contract RevenueReward is IRevenueReward, Initializable, ERC2771ContextUpgradeab
     }
 
     /**
+     * @notice Resolves the rewards receiver for a tokenId given its owner
+     * @dev Honors the configured self-repay vault only when it is the owner's canonical vault, otherwise pays the
+     *      owner. Shared by the direct-claim resolver and the merge/split closeout, which pass the source token's
+     *      owner directly because that token is already burned.
+     * @param tokenId The veNFT token id to resolve the receiver for
+     * @param owner The owner to resolve the canonical vault against
+     * @return receiver The address that should receive rewards
+     */
+    function _receiverForOwner(uint256 tokenId, address owner) internal view returns (address receiver) {
+        receiver = tokenRewardReceiver[tokenId];
+        if (receiver == address(0) || receiver != userVaultFactory.getUserVault(owner)) receiver = owner;
+    }
+
+    /**
      * @notice Resolves the rewards receiver for a given tokenId
-     * @dev Prefers the configured tokenRewardReceiver; falls back to current owner (ownerOf reverts if token doesn't exist)
+     * @dev Honors the configured self-repay vault only when it is the current owner's canonical vault, so a claim
+     *      cannot misroute rewards. If the token was burned during a hooks-disabled window its accrued rewards stay
+     *      claimable to the stored receiver; a token that never had a receiver reverts `InvalidTokenId`.
      * @param tokenId The veNFT token id to resolve the receiver for
      * @return receiver The address that should receive rewards
      */
     function _resolveRewardsReceiver(uint256 tokenId) internal view returns (address receiver) {
-        receiver = tokenRewardReceiver[tokenId];
-        if (receiver == address(0)) receiver = dustLock.ownerOf(tokenId);
+        try dustLock.ownerOf(tokenId) returns (address owner) {
+            return _receiverForOwner(tokenId, owner);
+        } catch {
+            receiver = tokenRewardReceiver[tokenId];
+            CommonChecksLibrary.revertIfInvalidTokenId(receiver);
+        }
     }
 }

@@ -16,60 +16,28 @@ import {UD60x18, convert} from "@prb/math/src/UD60x18.sol";
 import {IDustLock} from "../interfaces/IDustLock.sol";
 import {IRevenueReward} from "../interfaces/IRevenueReward.sol";
 import {ICreatorToken} from "../interfaces/ICreatorToken.sol";
-import {ITransferValidator} from "../interfaces/ITransferValidator.sol";
 
 import {BalanceLogicLibrary} from "../libraries/BalanceLogicLibrary.sol";
 import {CommonChecksLibrary} from "../libraries/CommonChecksLibrary.sol";
+import {CreatorTokenLibrary} from "../libraries/CreatorTokenLibrary.sol";
 import {SafeCastLibrary} from "../libraries/SafeCastLibrary.sol";
 import {CommonLibrary} from "../libraries/CommonLibrary.sol";
 
 /**
  * @title DustLock
  * @author Neverland
- * @notice Vote-escrow (veNFT) contract for DUST; tracks locks and voting power
+ * @notice Upgradeable vote-escrow contract that tokenizes timed and permanent DUST locks
+ *         as transferable veNFTs with historical voting-power checkpoints.
+ *         Supports lock creation and extension, deposits, splits, merges, withdrawals,
+ *         revenue-reward hooks, and ERC2771 meta-transactions.
+ *         Enforces early-withdrawal penalties and ERC721-C transfer validation,
+ *         with ERC2981 creator royalties.
  */
 contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, ReentrancyGuardUpgradeable {
     using SafeERC20 for IERC20;
     using SafeCastLibrary for uint256;
     using SafeCastLibrary for int256;
     using Strings for uint256;
-
-    /*//////////////////////////////////////////////////////////////
-                              CONSTRUCTOR
-    //////////////////////////////////////////////////////////////*/
-
-    /// @inheritdoc IDustLock
-    address public override forwarder;
-
-    /*//////////////////////////////////////////////////////////////
-                           STORAGE VARIABLES
-    //////////////////////////////////////////////////////////////*/
-
-    /// @inheritdoc IDustLock
-    address public override token;
-    /// @inheritdoc IDustLock
-    address public override team;
-    /// @notice Pending team address for two-step ownership transfer
-    address public pendingTeam;
-
-    mapping(uint256 => GlobalPoint) internal _pointHistory; // epoch -> unsigned global point
-
-    /// @dev Mapping of interface id to bool about whether or not it's supported
-    mapping(bytes4 => bool) internal supportedInterfaces;
-
-    /// @dev ERC165 interface ID of ERC165
-    bytes4 internal constant ERC165_INTERFACE_ID = 0x01ffc9a7;
-    /// @dev ERC165 interface ID of ERC721
-    bytes4 internal constant ERC721_INTERFACE_ID = 0x80ac58cd;
-    /// @dev ERC165 interface ID of ERC4906
-    bytes4 internal constant ERC4906_INTERFACE_ID = 0x49064906;
-    /// @dev ERC165 interface ID of ERC6372
-    bytes4 internal constant ERC6372_INTERFACE_ID = 0xda287a1d;
-    /// @dev ERC165 interface ID of ERC721Metadata
-    bytes4 internal constant ERC721_METADATA_INTERFACE_ID = 0x5b5e139f;
-
-    /// @inheritdoc IDustLock
-    uint256 public override tokenId;
 
     /**
      * @notice Sets ERC2771 forwarder for the implementation and disables initializers
@@ -120,6 +88,154 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         emit Transfer(address(this), address(0), tokenId);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                         INTERFACE CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    bytes4 internal constant ERC165_INTERFACE_ID = 0x01ffc9a7;
+    bytes4 internal constant ERC721_INTERFACE_ID = 0x80ac58cd;
+    bytes4 internal constant ERC4906_INTERFACE_ID = 0x49064906;
+    bytes4 internal constant ERC6372_INTERFACE_ID = 0xda287a1d;
+    bytes4 internal constant ERC721_METADATA_INTERFACE_ID = 0x5b5e139f;
+    bytes4 internal constant PREDECESSOR_INTERFACE_ID = 0x03448477;
+
+    /*//////////////////////////////////////////////////////////////
+                          METADATA CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    string public constant name = "Voting Escrow DUST";
+    string public constant symbol = "veDUST";
+    string public constant version = "2.1.0";
+
+    /*//////////////////////////////////////////////////////////////
+                           ESCROW CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal constant WEEK = 1 weeks;
+    uint256 internal constant MINTIME = 28 days;
+    uint256 internal constant MAXTIME = 365 days;
+    uint256 internal constant MULTIPLIER = 1 ether;
+    uint256 internal constant BASIS_POINTS = 10_000;
+
+    /// @dev Floor of the early-withdrawal penalty curve in basis points (25%)
+    uint256 internal constant MIN_EARLY_WITHDRAW_PENALTY_BPS = 2_500;
+    /// @dev Maximum number of user points that can be stored for a single veNFT
+    uint256 internal constant MAX_USER_POINTS = 1_000_000_000;
+    /// @dev Maximum number of iterations to perform when calculating checkpoints
+    uint256 internal constant MAX_CHECKPOINT_ITERATIONS = 255;
+    /// @dev Default early-withdrawal penalty (curve maximum) in basis points (75%)
+    uint256 internal constant DEFAULT_EARLY_WITHDRAW_PENALTY_BP = 7_500;
+
+    /*//////////////////////////////////////////////////////////////
+                             CORE STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IDustLock
+    address public override forwarder;
+    /// @inheritdoc IDustLock
+    address public override token;
+    /// @inheritdoc IDustLock
+    address public override team;
+    /// @inheritdoc IDustLock
+    address public override pendingTeam;
+
+    /// @dev Mapping of epoch number to its unsigned global point
+    mapping(uint256 => GlobalPoint) internal _pointHistory;
+    /// @dev Mapping of interface id to bool about whether or not it's supported
+    mapping(bytes4 => bool) internal supportedInterfaces;
+    /// @inheritdoc IDustLock
+    uint256 public override tokenId;
+
+    /*//////////////////////////////////////////////////////////////
+                            ERC721 STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Base URI for token metadata
+    string internal baseURI;
+    /// @dev Mapping from NFT ID to the address that owns it.
+    mapping(uint256 => address) internal idToOwner;
+    /// @dev Mapping from owner address to count of his tokens.
+    mapping(address => uint256) internal ownerToNFTokenCount;
+    /// @dev Mapping from NFT ID to approved address.
+    mapping(uint256 => address) internal idToApprovals;
+    /// @dev Mapping from owner address to mapping of operator addresses.
+    mapping(address => mapping(address => bool)) internal ownerToOperators;
+    /// @dev Mapping from NFT ID to the block number of the last ownership change.
+    mapping(uint256 => uint256) internal ownershipChange;
+    /// @inheritdoc IDustLock
+    mapping(address => mapping(uint256 => uint256)) public override ownerToNFTokenIdList;
+    /// @notice Mapping from NFT ID to index of owner
+    mapping(uint256 => uint256) internal tokenToOwnerIndex;
+
+    /*//////////////////////////////////////////////////////////////
+                            ESCROW STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IDustLock
+    uint256 public override epoch;
+    /// @inheritdoc IDustLock
+    uint256 public override supply;
+
+    /// @notice Mapping from veNFT id to locked balance
+    mapping(uint256 => LockedBalance) internal _locked;
+    /// @notice Mapping from veNFT id to user point history
+    mapping(uint256 => UserPoint[MAX_USER_POINTS]) internal _userPointHistory;
+    /// @notice Mapping from veNFT id to user point epoch
+    mapping(uint256 => uint256) public userPointEpoch;
+
+    /// @inheritdoc IDustLock
+    mapping(uint256 => int256) public override slopeChanges;
+    /// @inheritdoc IDustLock
+    mapping(address => bool) public override canSplit;
+    /// @inheritdoc IDustLock
+    uint256 public override permanentLockBalance;
+    /// @inheritdoc IDustLock
+    uint256 public override earlyWithdrawPenalty;
+    /// @inheritdoc IDustLock
+    address public override earlyWithdrawTreasury;
+
+    /*//////////////////////////////////////////////////////////////
+                    PROTOCOL CONFIGURATION STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Minimum amount of DUST required to create or increase a lock (18 decimals)
+    uint256 public override minLockAmount;
+    /// @notice Revenue reward contract used for distributing external rewards (address(0) if unset)
+    IRevenueReward public override revenueReward;
+
+    /*//////////////////////////////////////////////////////////////
+                      CREATOR EARNINGS STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IDustLock
+    address public override transferValidator;
+    /// @inheritdoc IDustLock
+    address public override royaltyReceiver;
+    /// @inheritdoc IDustLock
+    uint96 public override royaltyFeeBps;
+    /// @notice Selector used for transfer validation calls to the validator (ERC721-C)
+    bytes4 private transferValidationFunctionSelector;
+    /// @notice Whether the transfer validation selector should be invoked as a view call
+    bool private transferValidationFunctionIsView;
+    /// @notice Operator index+1 in the fee-enforced operator list (0 = not enforced)
+    mapping(address => uint256) private feeEnforcedOperatorIndexPlusOne;
+    /// @notice List of operators that enforce creator fees
+    address[] private feeEnforcedOperators;
+
+    /*//////////////////////////////////////////////////////////////
+                       UPGRADEABILITY STORAGE
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Storage gap for upgradeable safety reduced by 5 slots for:
+     *      1) transferValidator
+     *      2) royaltyReceiver + royaltyFeeBps (packed)
+     *      3) transferValidationFunctionSelector + transferValidationFunctionIsView (packed)
+     *      4) feeEnforcedOperatorIndexPlusOne
+     *      5) feeEnforcedOperators
+     */
+    uint256[45] private __gap;
+
     /**
      * @notice Returns whether `forwarderToCheck` is the trusted ERC2771 forwarder.
      * @dev Uses storage `forwarder` (initialized on the proxy) instead of immutable
@@ -169,20 +285,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         emit TeamProposalCancelled(team, cancelledTeam);
     }
 
-    /*///////////////////////////////////////////////////////////////
-                             METADATA STORAGE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Token name
-    string public constant name = "Voting Escrow DUST";
-    /// @notice Token symbol
-    string public constant symbol = "veDUST";
-    /// @notice Token version
-    string public constant version = "2.0.0";
-    /// @notice Base URI for token metadata
-    string internal baseURI;
-
-    /*///////////////////////////////////////////////////////////////
+    /*//////////////////////////////////////////////////////////////
                                 ERC721 LOGIC
     //////////////////////////////////////////////////////////////*/
 
@@ -205,21 +308,11 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         if (tokenId > 0) emit BatchMetadataUpdate(1, tokenId);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                      ERC721 BALANCE/OWNER STORAGE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @dev Mapping from NFT ID to the address that owns it.
-    mapping(uint256 => address) internal idToOwner;
-
-    /// @dev Mapping from owner address to count of his tokens.
-    mapping(address => uint256) internal ownerToNFTokenCount;
-
     /**
      * @notice Returns the owner address of a token without reverting.
      * @dev Returns address(0) if the token does not exist.
      * @param _tokenId The veNFT id to query ownership for.
-     * @return The current owner address or address(0) if unminted.
+     * @return The current owner address or address(0) if burned/non-minted.
      */
     function _ownerOf(uint256 _tokenId) internal view returns (address) {
         address tokenOwner = idToOwner[_tokenId];
@@ -245,21 +338,9 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     /// @inheritdoc IDustLock
     function balanceOf(address _owner) external view override returns (uint256) {
         CommonChecksLibrary.revertIfZeroAddress(_owner);
+
         return ownerToNFTokenCount[_owner];
     }
-
-    /*//////////////////////////////////////////////////////////////
-                         ERC721 APPROVAL STORAGE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @dev Mapping from NFT ID to approved address.
-    mapping(uint256 => address) internal idToApprovals;
-
-    /// @dev Mapping from owner address to mapping of operator addresses.
-    mapping(address => mapping(address => bool)) internal ownerToOperators;
-
-    /// @dev Mapping from NFT ID to the block number of the last ownership change.
-    mapping(uint256 => uint256) internal ownershipChange;
 
     /// @inheritdoc IDustLock
     function getApproved(uint256 _tokenId) external view override returns (address) {
@@ -294,7 +375,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     }
 
     /*//////////////////////////////////////////////////////////////
-                              ERC721 LOGIC
+                        ERC721 APPROVAL LOGIC
     //////////////////////////////////////////////////////////////*/
 
     /// @inheritdoc IDustLock
@@ -341,6 +422,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
      * @param _sender The original caller used for approval checks and receiver callbacks.
      */
     function _transferFrom(address _from, address _to, uint256 _tokenId, address _sender) internal {
+        CommonChecksLibrary.revertIfEpochFinalizationPending(WEEK);
         CommonChecksLibrary.revertIfZeroAddress(_to);
         // Check requirements
         if (!_isApprovedOrOwner(_sender, _tokenId)) revert NotApprovedOrOwner();
@@ -424,20 +506,14 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     function supportsInterface(bytes4 _interfaceID) external view override returns (bool) {
         return _interfaceID == ERC165_INTERFACE_ID || _interfaceID == ERC721_INTERFACE_ID
             || _interfaceID == ERC721_METADATA_INTERFACE_ID || _interfaceID == ERC4906_INTERFACE_ID
-            || _interfaceID == ERC6372_INTERFACE_ID || _interfaceID == type(IDustLock).interfaceId
-            || _interfaceID == type(IERC2981).interfaceId || _interfaceID == type(ICreatorToken).interfaceId
-            || supportedInterfaces[_interfaceID];
+            || _interfaceID == ERC6372_INTERFACE_ID || _interfaceID == PREDECESSOR_INTERFACE_ID
+            || _interfaceID == type(IDustLock).interfaceId || _interfaceID == type(IERC2981).interfaceId
+            || _interfaceID == type(ICreatorToken).interfaceId || supportedInterfaces[_interfaceID];
     }
 
     /*//////////////////////////////////////////////////////////////
                         INTERNAL MINT/BURN LOGIC
     //////////////////////////////////////////////////////////////*/
-
-    /// @inheritdoc IDustLock
-    mapping(address => mapping(uint256 => uint256)) public override ownerToNFTokenIdList;
-
-    /// @notice Mapping from NFT ID to index of owner
-    mapping(uint256 => uint256) internal tokenToOwnerIndex;
 
     /**
      * @notice Internal function to add a NFT to an index mapping to a given address
@@ -482,6 +558,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         _addTokenTo(_to, _tokenId);
 
         emit Transfer(address(0), _to, _tokenId);
+
         return true;
     }
 
@@ -503,14 +580,12 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         } else {
             uint256 lastTokenId = ownerToNFTokenIdList[_from][currentCount];
 
-            // Add
-            // update ownerToNFTokenIdList
+            // add ownerToNFTokenIdList
             ownerToNFTokenIdList[_from][currentIndex] = lastTokenId;
             // update tokenToOwnerIndex
             tokenToOwnerIndex[lastTokenId] = currentIndex;
 
-            // Delete
-            // update ownerToNFTokenIdList
+            // delete ownerToNFTokenIdList
             ownerToNFTokenIdList[_from][currentCount] = 0;
             // update tokenToOwnerIndex
             tokenToOwnerIndex[_tokenId] = 0;
@@ -552,43 +627,6 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         emit Transfer(tokenOwner, address(0), _tokenId);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                             ESCROW STORAGE
-    //////////////////////////////////////////////////////////////*/
-
-    /// Constants
-    uint256 internal constant WEEK = 1 weeks;
-    uint256 internal constant MINTIME = 28 * 24 * 3600;
-    uint256 internal constant MAXTIME = 1 * 365 * 86400;
-    uint256 internal constant MULTIPLIER = 1 ether;
-    uint256 internal constant BASIS_POINTS = 10_000;
-    uint256 internal constant MAX_USER_POINTS = 1_000_000_000;
-    uint256 internal constant MAX_CHECKPOINT_ITERATIONS = 255;
-    uint256 internal constant DEFAULT_EARLY_WITHDRAW_PENALTY_BP = 5_000;
-
-    /// @inheritdoc IDustLock
-    uint256 public override epoch;
-    /// @inheritdoc IDustLock
-    uint256 public override supply;
-
-    /// @notice Mapping from veNFT id to locked balance
-    mapping(uint256 => LockedBalance) internal _locked;
-    /// @notice Mapping from veNFT id to user point history
-    mapping(uint256 => UserPoint[MAX_USER_POINTS]) internal _userPointHistory;
-    /// @notice Mapping from veNFT id to user point epoch
-    mapping(uint256 => uint256) public userPointEpoch;
-
-    /// @inheritdoc IDustLock
-    mapping(uint256 => int256) public override slopeChanges;
-    /// @inheritdoc IDustLock
-    mapping(address => bool) public override canSplit;
-    /// @inheritdoc IDustLock
-    uint256 public override permanentLockBalance;
-    /// @inheritdoc IDustLock
-    uint256 public override earlyWithdrawPenalty;
-    /// @inheritdoc IDustLock
-    address public override earlyWithdrawTreasury;
-
     /// @inheritdoc IDustLock
     function locked(uint256 _tokenId) external view override returns (LockedBalance memory) {
         return _locked[_tokenId];
@@ -620,10 +658,12 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
      * @param _newLocked New locked amount / end lock time / permanent status for the user
      */
     function _checkpoint(uint256 _tokenId, LockedBalance memory _oldLocked, LockedBalance memory _newLocked) internal {
+        CommonChecksLibrary.revertIfEpochFinalizationPending(WEEK);
+
         UserPoint memory uOld;
         UserPoint memory uNew;
-        int256 oldDslope = 0;
-        int256 newDslope = 0;
+        int256 oldDSlope = 0;
+        int256 newDSlope = 0;
         uint256 _epoch = epoch;
 
         if (_tokenId != 0) {
@@ -634,8 +674,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
                 uint256 timeDiff = _oldLocked.end - block.timestamp;
                 uint256 maxTime = MAXTIME;
 
-                // Use PRB Math UD60x18 for 18 decimal precision
-                // Convert inputs to WAD
+                // convert inputs to WAD
                 UD60x18 amountWAD = convert(amount);
                 UD60x18 timeDiffWAD = convert(timeDiff);
                 UD60x18 maxTimeWAD = convert(maxTime);
@@ -652,8 +691,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
                 uint256 timeDiff = _newLocked.end - block.timestamp;
                 uint256 maxTime = MAXTIME;
 
-                // Use PRB Math UD60x18 for 18 decimal precision
-                // Convert inputs to WAD
+                // convert inputs to WAD
                 UD60x18 amountWAD = convert(amount);
                 UD60x18 timeDiffWAD = convert(timeDiff);
                 UD60x18 maxTimeWAD = convert(maxTime);
@@ -666,15 +704,17 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
                 uNew.slope = int256(slopeResult.intoUint256());
             }
 
-            // Read values of scheduled changes in the slope
-            // _oldLocked.end can be in the past and in the future
-            // _newLocked.end can ONLY by in the FUTURE unless everything expired: than zeros
-            oldDslope = slopeChanges[_oldLocked.end];
+            /*
+             * Read values of scheduled changes in the slope
+             * _oldLocked.end can be in the past and in the future
+             * _newLocked.end can ONLY by in the FUTURE unless everything expired: than zeros
+             */
+            oldDSlope = slopeChanges[_oldLocked.end];
             if (_newLocked.end != 0) {
                 if (_newLocked.end == _oldLocked.end) {
-                    newDslope = oldDslope;
+                    newDSlope = oldDSlope;
                 } else {
-                    newDslope = slopeChanges[_newLocked.end];
+                    newDSlope = slopeChanges[_newLocked.end];
                 }
             }
         }
@@ -685,9 +725,11 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
             lastPoint = _pointHistory[_epoch];
         }
         uint256 lastCheckpoint = lastPoint.ts;
-        // initialLastPoint is used for extrapolation to calculate block number
-        // (approximately, for *At methods) and save them
-        // as we cannot figure that out exactly from inside the contract
+        /*
+         * initialLastPoint is used for extrapolation to calculate block number
+         * (approximately, for *At methods) and save them
+         * as we cannot figure that out exactly from inside the contract
+         */
         GlobalPoint memory initialLastPoint = GlobalPoint({
             bias: lastPoint.bias,
             slope: lastPoint.slope,
@@ -695,19 +737,23 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
             blk: lastPoint.blk,
             permanentLockBalance: lastPoint.permanentLockBalance
         });
-        uint256 blockSlope = 0; // dblock/dt
+        uint256 blockSlope = 0; // dBlock/dt
         if (block.timestamp > lastPoint.ts) {
             blockSlope = (MULTIPLIER * (block.number - lastPoint.blk)) / (block.timestamp - lastPoint.ts);
         }
-        // If last point is already recorded in this block, slope=0
-        // But that's ok b/c we know the block in such case
+        /*
+         * If last point is already recorded in this block, slope=0
+         * But that's ok b/c we know the block in such case
+         */
 
         // Go over weeks to fill history and calculate what the current point is
         {
             uint256 tCurr = (lastCheckpoint / WEEK) * WEEK;
             for (uint256 i = 0; i < MAX_CHECKPOINT_ITERATIONS; ++i) {
-                // Hopefully it won't happen that this won't get used in 5 years!
-                // If it does, users will be able to withdraw but vote weight will be broken
+                /*
+                 * Hopefully it won't happen that this won't get used in 5 years!
+                 * If it does, users will be able to withdraw but vote weight will be broken
+                 */
                 tCurr += WEEK; // Initial value of tCurr is always larger than the ts of the last point
                 int256 dSlope = 0;
                 if (tCurr > block.timestamp) {
@@ -715,8 +761,10 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
                 } else {
                     dSlope = slopeChanges[tCurr];
                 }
-                // Time difference in seconds, slope is in WAD format
-                // slope * time_seconds gives WAD result
+                /*
+                 * Time difference in seconds, slope is in WAD format
+                 * slope * time_seconds gives WAD result
+                 */
                 lastPoint.bias -= lastPoint.slope * int256(tCurr - lastCheckpoint);
                 lastPoint.slope += dSlope;
                 if (lastPoint.bias < 0) {
@@ -741,8 +789,10 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         }
 
         if (_tokenId != 0) {
-            // If last point was in this block, the slope change has been applied already
-            // But in such case we have 0 slope(s)
+            /*
+             * If last point was in this block, the slope change has been applied already
+             * But in such case we have 0 slope(s)
+             */
             lastPoint.slope += (uNew.slope - uOld.slope);
             lastPoint.bias += (uNew.bias - uOld.bias);
             if (lastPoint.slope < 0) {
@@ -754,13 +804,15 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
             lastPoint.permanentLockBalance = permanentLockBalance;
         }
 
-        // If timestamp of last global point is the same, overwrite the last global point
-        // Else record the new global point into history
-        // Exclude epoch 0 (note: _epoch is always >= 1, see above)
-        // Two possible outcomes:
-        // Missing global checkpoints in prior weeks. In this case, _epoch = epoch + x, where x > 1
-        // No missing global checkpoints, but timestamp != block.timestamp. Create new checkpoint.
-        // No missing global checkpoints, but timestamp == block.timestamp. Overwrite last checkpoint.
+        /*
+         * If timestamp of last global point is the same, overwrite the last global point
+         * Else record the new global point into history
+         * Exclude epoch 0 (note: _epoch is always >= 1, see above)
+         * Two possible outcomes:
+         * Missing global checkpoints in prior weeks. In this case, _epoch = epoch + x, where x > 1
+         * No missing global checkpoints, but timestamp != block.timestamp. Create new checkpoint.
+         * No missing global checkpoints, but timestamp == block.timestamp. Overwrite last checkpoint.
+         */
         if (_epoch != 1 && _pointHistory[_epoch - 1].ts == block.timestamp) {
             // _epoch = epoch + 1, so we do not increment epoch
             _pointHistory[_epoch - 1] = lastPoint;
@@ -771,29 +823,33 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         }
 
         if (_tokenId != 0) {
-            // Schedule the slope changes (slope is going down)
-            // We subtract new_user_slope from [_newLocked.end]
-            // and add old_user_slope to [_oldLocked.end]
+            /*
+             * Schedule the slope changes (slope is going down)
+             * We subtract new_user_slope from [_newLocked.end]
+             * and add old_user_slope to [_oldLocked.end]
+             */
             if (_oldLocked.end > block.timestamp) {
-                // oldDslope was <something> - uOld.slope, so we cancel that
-                oldDslope += uOld.slope;
+                // oldDSlope was <something> - uOld.slope, so we cancel that
+                oldDSlope += uOld.slope;
                 if (_newLocked.end == _oldLocked.end) {
-                    oldDslope -= uNew.slope; // It was a new deposit, not extension
+                    oldDSlope -= uNew.slope; // It was a new deposit, not extension
                 }
-                slopeChanges[_oldLocked.end] = oldDslope;
+                slopeChanges[_oldLocked.end] = oldDSlope;
             }
 
             if (_newLocked.end > block.timestamp) {
                 // update slope if new lock is greater than old lock and is not permanent or if old lock is permanent
                 if ((_newLocked.end > _oldLocked.end)) {
-                    newDslope -= uNew.slope; // old slope disappeared at this point
-                    slopeChanges[_newLocked.end] = newDslope;
+                    newDSlope -= uNew.slope; // old slope disappeared at this point
+                    slopeChanges[_newLocked.end] = newDSlope;
                 }
-                // else: we recorded it already in oldDslope
+                // else: we recorded it already in oldDSlope
             }
-            // If timestamp of last user point is the same, overwrite the last user point
-            // Else record the new user point into history
-            // Exclude epoch 0
+            /*
+             * If timestamp of last user point is the same, overwrite the last user point
+             * Else record the new user point into history
+             * Exclude epoch 0
+             */
             uNew.ts = block.timestamp;
             uNew.blk = block.number;
             uint256 userEpoch = userPointEpoch[_tokenId];
@@ -857,11 +913,13 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
 
         _locked[_tokenId] = newLocked;
 
-        // Possibilities:
-        // Both _oldLocked.end could be current or expired (>/< block.timestamp)
-        // or if the lock is a permanent lock, then _oldLocked.end == 0
-        // value == 0 (extend lock) or value > 0 (add to lock or extend lock)
-        // newLocked.end > block.timestamp (always)
+        /*
+         * Possibilities:
+         * Both _oldLocked.end could be current or expired (>/< block.timestamp)
+         * or if the lock is a permanent lock, then _oldLocked.end == 0
+         * value == 0 (extend lock) or value > 0 (add to lock or extend lock)
+         * newLocked.end > block.timestamp (always)
+         */
         _checkpoint(_tokenId, _oldLocked, newLocked);
 
         address from = _msgSender();
@@ -927,6 +985,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         _notifyTokenMinted(_tokenId, _to, _msgSender());
 
         _depositFor(_tokenId, _value, unlockTime, _locked[_tokenId], DepositType.CREATE_LOCK_TYPE);
+
         return _tokenId;
     }
 
@@ -955,6 +1014,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         address creator = _msgSender();
         uint256 newTokenId = _createLock(_value, _lockDuration, creator);
         _lockPermanent(creator, newTokenId);
+
         return newTokenId;
     }
 
@@ -967,6 +1027,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     {
         uint256 newTokenId = _createLock(_value, _lockDuration, _to);
         _lockPermanent(_to, newTokenId);
+
         return newTokenId;
     }
 
@@ -993,7 +1054,9 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
             (_depositType == DepositType.DEPOSIT_FOR_TYPE || _depositType == DepositType.INCREASE_LOCK_AMOUNT)
                 && !oldLocked.isPermanent
         ) {
-            if (oldLocked.end < block.timestamp + MINTIME) revert DepositForLockDurationTooShort();
+            if (oldLocked.end < block.timestamp + MINTIME) {
+                revert DepositForLockDurationTooShort();
+            }
         }
 
         if (oldLocked.isPermanent) permanentLockBalance += _value;
@@ -1046,9 +1109,11 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         uint256 supplyBefore = supply;
         supply = supplyBefore - value;
 
-        // oldLocked can have either expired <= timestamp or zero end
-        // oldLocked has only 0 end
-        // Both can have >= 0 amount
+        /*
+         * oldLocked can have either expired <= timestamp or zero end
+         * oldLocked has only 0 end
+         * Both can have >= 0 amount
+         */
         _checkpoint(_tokenId, oldLocked, LockedBalance(0, 0, 0, false));
         _notifyAfterTokenBurned(_tokenId, tokenOwner, sender);
 
@@ -1059,13 +1124,62 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     }
 
     /// @inheritdoc IDustLock
+    function earlyWithdrawPenaltyAmount(uint256 _tokenId) public view override returns (uint256) {
+        LockedBalance memory lock = _locked[_tokenId];
+        uint256 amount = lock.amount.toUint256();
+        if (amount == 0) return 0;
+
+        /*
+         * Permanent locks cannot earlyWithdraw directly; the executable exit path is
+         * unlockPermanent followed by earlyWithdraw. Quote that path: the fresh weekly-rounded
+         * end unlockPermanent would write, priced on the timed curve.
+         */
+        uint256 remaining;
+        if (lock.isPermanent) {
+            remaining = ((block.timestamp + MAXTIME) / WEEK) * WEEK - block.timestamp;
+        } else {
+            remaining = lock.end > block.timestamp ? lock.end - block.timestamp : 0;
+        }
+        if (remaining == 0) return 0;
+        remaining = Math.min(remaining, MAXTIME);
+
+        uint256 penaltyDenominator = BASIS_POINTS * MAXTIME;
+        uint256 penaltyNumerator = MIN_EARLY_WITHDRAW_PENALTY_BPS * MAXTIME
+            + (earlyWithdrawPenalty - MIN_EARLY_WITHDRAW_PENALTY_BPS) * remaining;
+
+        // Floor user proceeds, then take the complement so the exact penalty rounds up.
+        uint256 proceeds = Math.mulDiv(amount, penaltyDenominator - penaltyNumerator, penaltyDenominator);
+
+        return amount - proceeds;
+    }
+
+    /// @inheritdoc IDustLock
     function earlyWithdraw(uint256 _tokenId) external override nonReentrant {
-        address sender = _msgSender();
+        _earlyWithdraw(_msgSender(), _tokenId, type(uint256).max);
+    }
+
+    /// @inheritdoc IDustLock
+    function earlyWithdraw(uint256 _tokenId, uint256 _maxPenalty) external override nonReentrant {
+        _earlyWithdraw(_msgSender(), _tokenId, _maxPenalty);
+    }
+
+    /**
+     * @notice Executes an early withdrawal with a penalty ceiling
+     * @dev Reverts with `EarlyWithdrawPenaltyAboveMax` before unlocking or burning when the
+     *      execution-time penalty exceeds `_maxPenalty`.
+     * @param sender The original caller used for approval checks
+     * @param _tokenId The veNFT id to withdraw early from
+     * @param _maxPenalty The maximum acceptable penalty (type(uint256).max for unbounded)
+     */
+    function _earlyWithdraw(address sender, uint256 _tokenId, uint256 _maxPenalty) internal {
         if (!_isApprovedOrOwner(sender, _tokenId)) revert NotApprovedOrOwner();
 
         LockedBalance memory oldLocked = _locked[_tokenId];
+        uint256 userPenaltyAmount = earlyWithdrawPenaltyAmount(_tokenId);
+        if (userPenaltyAmount > _maxPenalty) revert EarlyWithdrawPenaltyAboveMax(userPenaltyAmount, _maxPenalty);
+
         if (oldLocked.isPermanent) {
-            unlockPermanent(_tokenId);
+            _unlockPermanent(sender, _tokenId);
             oldLocked = _locked[_tokenId];
         }
 
@@ -1079,36 +1193,17 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         uint256 supplyBefore = supply;
         supply = supplyBefore - userLockedAmount;
 
-        // Calculate lock creation time and end time
-        uint256 effectiveStart = oldLocked.effectiveStart;
-        uint256 lockEndTime = oldLocked.end;
-
-        // Calculate penalty based on remaining time from effective start to end
-        // penaltyFactor = (lockEndTime - block.timestamp) / (lockEndTime - effectiveStart)
-        // userPenaltyAmount = earlyWithdrawPenalty * penaltyFactor * userLockedAmount / BASIS_POINTS
-        uint256 remainingTime = lockEndTime > block.timestamp ? lockEndTime - block.timestamp : 0;
-        uint256 totalLockTime = lockEndTime - effectiveStart;
-
-        uint256 userPenaltyAmount;
-        if (totalLockTime > 0 && remainingTime > 0) {
-            // penalty = amount * penalty * remainingTime / (BASIS_POINTS * totalLockTime)
-            userPenaltyAmount =
-                Math.mulDiv(userLockedAmount, earlyWithdrawPenalty * remainingTime, BASIS_POINTS * totalLockTime);
-        } else {
-            userPenaltyAmount = 0;
-        }
-
         uint256 userTransferAmount = userLockedAmount - userPenaltyAmount;
-        uint256 treasuryTransferAmount = userPenaltyAmount;
 
-        // oldLocked can have either expired <= timestamp or zero end
-        // oldLocked has only 0 end
-        // Both can have >= 0 amount
+        /*
+         * oldLocked can have either expired <= timestamp or zero end.
+         * oldLocked has only 0 end. Both can have a nonnegative amount.
+         */
         _checkpoint(_tokenId, oldLocked, LockedBalance(0, 0, 0, false));
         _notifyAfterTokenBurned(_tokenId, tokenOwner, sender);
 
         IERC20(token).safeTransfer(tokenOwner, userTransferAmount);
-        IERC20(token).safeTransfer(earlyWithdrawTreasury, treasuryTransferAmount);
+        if (userPenaltyAmount != 0) IERC20(token).safeTransfer(earlyWithdrawTreasury, userPenaltyAmount);
 
         emit EarlyWithdraw(tokenOwner, _tokenId, userLockedAmount, userTransferAmount, block.timestamp);
         emit Supply(supplyBefore, supply);
@@ -1117,7 +1212,9 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     /// @inheritdoc IDustLock
     function setEarlyWithdrawPenalty(uint256 _earlyWithdrawPenalty) external override nonReentrant {
         if (_msgSender() != team) revert NotTeam();
-        if (_earlyWithdrawPenalty >= BASIS_POINTS) revert InvalidWithdrawPenalty();
+        if (_earlyWithdrawPenalty < MIN_EARLY_WITHDRAW_PENALTY_BPS || _earlyWithdrawPenalty >= BASIS_POINTS) {
+            revert InvalidWithdrawPenalty();
+        }
 
         uint256 old = earlyWithdrawPenalty;
         earlyWithdrawPenalty = _earlyWithdrawPenalty;
@@ -1151,6 +1248,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         if (oldLockedFrom.isPermanent && !oldLockedTo.isPermanent) revert PermanentLock();
 
         uint256 end = oldLockedFrom.end >= oldLockedTo.end ? oldLockedFrom.end : oldLockedTo.end;
+        bool ownershipChangedThisBlock = ownershipChange[_from] == block.number || ownershipChange[_to] == block.number;
 
         address tokenOwner = _ownerOf(_from);
         _notifyAfterTokenMerged(_from, _to, tokenOwner);
@@ -1177,6 +1275,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         }
         _checkpoint(_to, oldLockedTo, newLockedTo);
         _locked[_to] = newLockedTo;
+        if (ownershipChangedThisBlock) ownershipChange[_to] = block.number;
 
         emit Merge(
             sender,
@@ -1209,6 +1308,7 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         if (newLocked.isPermanent) revert PermanentLock();
         if (_amount < minLockAmount) revert AmountTooSmall();
 
+        bool ownershipChangedThisBlock = ownershipChange[_from] == block.number;
         int256 splitAmount = _amount.toInt256();
         if (newLocked.amount <= splitAmount) revert AmountTooBig();
         if (uint256(newLocked.amount - splitAmount) < minLockAmount) revert AmountTooSmall();
@@ -1226,6 +1326,10 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         // Create new veNFT using amount
         newLocked.amount = splitAmount;
         _tokenId2 = _createSplitNFT(tokenOwner, newLocked);
+        if (ownershipChangedThisBlock) {
+            ownershipChange[_tokenId1] = block.number;
+            ownershipChange[_tokenId2] = block.number;
+        }
 
         _notifyAfterTokenSplit(_from, _tokenId1, token1Amount, _tokenId2, _amount, tokenOwner);
 
@@ -1269,8 +1373,13 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     }
 
     /// @inheritdoc IDustLock
-    function lockPermanent(uint256 _tokenId) external override {
+    function lockPermanent(uint256 _tokenId) external override nonReentrant {
         _lockPermanent(_msgSender(), _tokenId);
+    }
+
+    /// @inheritdoc IDustLock
+    function unlockPermanent(uint256 _tokenId) external override nonReentrant {
+        _unlockPermanent(_msgSender(), _tokenId);
     }
 
     /**
@@ -1300,10 +1409,14 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         emit MetadataUpdate(_tokenId);
     }
 
-    /// @inheritdoc IDustLock
-    function unlockPermanent(uint256 _tokenId) public override {
-        address sender = _msgSender();
-        if (!_isApprovedOrOwner(sender, _tokenId)) revert NotApprovedOrOwner();
+    /**
+     * @notice Converts a permanent lock back into a time-locked veNFT
+     * @dev Core implementation shared by the external wrapper and permanent early withdrawals.
+     * @param caller Address used for approval/ownership checks (msg.sender).
+     * @param _tokenId The veNFT id to unlock.
+     */
+    function _unlockPermanent(address caller, uint256 _tokenId) internal {
+        if (!_isApprovedOrOwner(caller, _tokenId)) revert NotApprovedOrOwner();
         LockedBalance memory _newLocked = _locked[_tokenId];
         if (!_newLocked.isPermanent) revert NotPermanentLock();
 
@@ -1320,8 +1433,8 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
         emit MetadataUpdate(_tokenId);
     }
 
-    /*///////////////////////////////////////////////////////////////
-                           GAUGE VOTING STORAGE
+    /*//////////////////////////////////////////////////////////////
+                            GAUGE VOTING LOGIC
     //////////////////////////////////////////////////////////////*/
 
     /**
@@ -1384,9 +1497,6 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
                           MIN LOCK AMOUNT
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Minimum amount of DUST required to create or increase a lock (18 decimals)
-    uint256 public override minLockAmount;
-
     /// @inheritdoc IDustLock
     function setMinLockAmount(uint256 newMinLockAmount) public override {
         if (_msgSender() != team) revert NotTeam();
@@ -1401,9 +1511,6 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     /*//////////////////////////////////////////////////////////////
                           NOTIFY CONTRACTS
     //////////////////////////////////////////////////////////////*/
-
-    /// @notice Revenue reward contract used for distributing external rewards (address(0) if unset)
-    IRevenueReward public override revenueReward;
 
     /// @inheritdoc IDustLock
     function setRevenueReward(IRevenueReward _revenueReward) public override {
@@ -1511,63 +1618,37 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
 
     /// @inheritdoc ICreatorToken
     function getTransferValidationFunction() external view override returns (bytes4, bool) {
-        return _getTransferValidationFunction();
+        return CreatorTokenLibrary.getTransferValidationFunction(
+            transferValidationFunctionSelector, transferValidationFunctionIsView
+        );
     }
 
     /// @inheritdoc ICreatorToken
     function setTransferValidator(address newValidator) external override {
         if (_msgSender() != team) revert NotTeam();
-        if (newValidator != address(0) && !CommonLibrary.isContract(newValidator)) {
-            revert InvalidTransferValidatorContract();
-        }
 
-        address oldValidator = transferValidator;
+        CreatorTokenLibrary.setTransferValidator(transferValidator, newValidator);
         transferValidator = newValidator;
-
-        emit TransferValidatorUpdated(oldValidator, newValidator);
     }
 
     /// @inheritdoc IDustLock
     function setTransferValidationFunction(bytes4 validationSelector, bool isViewFunction) external override {
         if (_msgSender() != team) revert NotTeam();
 
-        (bytes4 oldSelector, bool oldIsView) = _getTransferValidationFunction();
-        bool nextIsViewFunction = validationSelector == bytes4(0) ? true : isViewFunction;
-
+        bool nextIsViewFunction = CreatorTokenLibrary.setTransferValidationFunction(
+            transferValidationFunctionSelector, transferValidationFunctionIsView, validationSelector, isViewFunction
+        );
         transferValidationFunctionSelector = validationSelector;
         transferValidationFunctionIsView = nextIsViewFunction;
-
-        emit TransferValidationFunctionUpdated(oldSelector, validationSelector, oldIsView, nextIsViewFunction);
     }
 
     /// @inheritdoc IDustLock
     function setFeeEnforcedOperator(address operator, bool enforced) external override {
         if (_msgSender() != team) revert NotTeam();
-        CommonChecksLibrary.revertIfZeroAddress(operator);
 
-        uint256 indexPlusOne = feeEnforcedOperatorIndexPlusOne[operator];
-        if (enforced) {
-            if (indexPlusOne == 0) {
-                feeEnforcedOperators.push(operator);
-                feeEnforcedOperatorIndexPlusOne[operator] = feeEnforcedOperators.length;
-                emit FeeEnforcedOperatorUpdated(operator, true);
-            }
-            return;
-        }
-
-        if (indexPlusOne == 0) return;
-
-        uint256 index = indexPlusOne - 1;
-        uint256 lastIndex = feeEnforcedOperators.length - 1;
-        if (index != lastIndex) {
-            address lastOperator = feeEnforcedOperators[lastIndex];
-            feeEnforcedOperators[index] = lastOperator;
-            feeEnforcedOperatorIndexPlusOne[lastOperator] = index + 1;
-        }
-
-        feeEnforcedOperators.pop();
-        delete feeEnforcedOperatorIndexPlusOne[operator];
-        emit FeeEnforcedOperatorUpdated(operator, false);
+        CreatorTokenLibrary.setFeeEnforcedOperator(
+            feeEnforcedOperatorIndexPlusOne, feeEnforcedOperators, operator, enforced
+        );
     }
 
     /// @inheritdoc IDustLock
@@ -1611,8 +1692,8 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
 
         royaltyReceiver = receiver;
         royaltyFeeBps = feeBps;
-        emit RoyaltyInfoUpdated(oldReceiver, receiver, oldFeeBps, feeBps);
 
+        emit RoyaltyInfoUpdated(oldReceiver, receiver, oldFeeBps, feeBps);
         if (tokenId > 0) emit BatchMetadataUpdate(1, tokenId);
     }
 
@@ -1621,90 +1702,26 @@ contract DustLock is IDustLock, Initializable, ERC2771ContextUpgradeable, Reentr
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Returns the selector and call type for the transfer validation function.
-     * @dev Defaults to SIP-7 substandard 8 (`validateTransfer`) when no custom selector is set.
-     * @return validationSelector The 4-byte selector used to call the transfer validator.
-     * @return isViewFunction True if the validator should be invoked via `staticcall`.
-     */
-    function _getTransferValidationFunction() internal view returns (bytes4 validationSelector, bool isViewFunction) {
-        validationSelector = transferValidationFunctionSelector;
-        if (validationSelector == bytes4(0)) {
-            // SIP-7 substandard 8: validateTransfer(address,address,address,uint256)
-            return (ITransferValidator.validateTransfer.selector, true);
-        }
-        return (validationSelector, transferValidationFunctionIsView);
-    }
-
-    /**
      * @notice Validates a token transfer against the ERC721-C transfer validator.
-     * @dev - Fee-enforced operators (marketplace conduits) are always validated.
-     *      - Forwarder-relayed transfers are explicitly blocked when a validator is
-     *        active because the forwarder obscures the original operator identity,
-     *        preventing the validator from distinguishing marketplace sales from
-     *        peer-to-peer transfers. Users should transfer directly for P2P.
-     *      - All other callers (non-enforced, non-forwarder) skip validation,
-     *        allowing free peer-to-peer transfers.
+     * @dev Delegates to `CreatorTokenLibrary.validateTransfer`, which runs under this contract's
+     *      `delegatecall`. Fee-enforced operators are validated; forwarder-relayed transfers are
+     *      blocked while a validator is active; all other callers skip validation.
      * @param caller The address initiating the transfer (msg.sender).
      * @param from The current owner of the token.
      * @param to The recipient of the token.
      * @param tokenId_ The token id being transferred.
      */
     function _validateTransfer(address caller, address from, address to, uint256 tokenId_) internal {
-        address validator_ = transferValidator;
-        if (validator_ == address(0)) return;
-
-        // Block forwarder-relayed transfers when a validator is active.
-        // The forwarder obscures the original operator, so the validator cannot
-        // distinguish marketplace sales from P2P transfers. Users should transfer
-        // directly (not via meta-tx) when ERC721-C validation is enabled.
-        if (isTrustedForwarder(msg.sender)) revert ForwarderTransferNotAllowed();
-
-        // Only validate fee-enforced operators (marketplace conduits).
-        // Non-enforced callers (regular users) skip validation for free P2P transfers.
-        if (!isFeeEnforcedOperator(caller)) return;
-
-        (bytes4 validationSelector, bool isViewFunction) = _getTransferValidationFunction();
-
-        bytes memory data = abi.encodeWithSelector(validationSelector, caller, from, to, tokenId_);
-        (bool success, bytes memory returnData) = isViewFunction ? validator_.staticcall(data) : validator_.call(data);
-        if (!success) {
-            if (returnData.length == 0) revert TransferValidationFailed();
-            assembly {
-                revert(add(32, returnData), mload(returnData))
-            }
-        }
+        CreatorTokenLibrary.validateTransfer(
+            transferValidator,
+            isTrustedForwarder(msg.sender),
+            transferValidationFunctionSelector,
+            transferValidationFunctionIsView,
+            feeEnforcedOperatorIndexPlusOne,
+            caller,
+            from,
+            to,
+            tokenId_
+        );
     }
-
-    /*//////////////////////////////////////////////////////////////
-                        CREATOR EARNINGS STORAGE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Transfer validator contract for ERC721-C enforcement
-    address public transferValidator;
-
-    /// @notice Royalty receiver address (protocol treasury for buyback & burn)
-    address public royaltyReceiver;
-
-    /// @notice Royalty fee in basis points (e.g., 250 = 2.5%)
-    uint96 public royaltyFeeBps;
-
-    /// @notice Selector used for transfer validation calls to the validator (ERC721-C)
-    bytes4 private transferValidationFunctionSelector;
-
-    /// @notice Whether the transfer validation selector should be invoked as a view call
-    bool private transferValidationFunctionIsView;
-
-    /// @notice Operator index+1 in the fee-enforced operator list (0 = not enforced)
-    mapping(address => uint256) private feeEnforcedOperatorIndexPlusOne;
-
-    /// @notice List of operators that enforce creator fees
-    address[] private feeEnforcedOperators;
-
-    // Storage gap for upgradeable safety reduced by 5 slots for:
-    // 1) transferValidator
-    // 2) royaltyReceiver + royaltyFeeBps (packed)
-    // 3) transferValidationFunctionSelector + transferValidationFunctionIsView (packed)
-    // 4) feeEnforcedOperatorIndexPlusOne
-    // 5) feeEnforcedOperators
-    uint256[45] private __gap;
 }

@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import {IDustLock} from "../../src/interfaces/IDustLock.sol";
-import {IRevenueReward} from "../../src/interfaces/IRevenueReward.sol";
+import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
+
+import {ICreatorToken} from "../../../src/interfaces/ICreatorToken.sol";
+import {IDustLock} from "../../../src/interfaces/IDustLock.sol";
+import {IRevenueReward} from "../../../src/interfaces/IRevenueReward.sol";
 import {Vm} from "forge-std/Vm.sol";
 
-import {CommonChecksLibrary} from "../../src/libraries/CommonChecksLibrary.sol";
+import {CommonChecksLibrary} from "../../../src/libraries/CommonChecksLibrary.sol";
 
-import {RevenueReward} from "../../src/rewards/RevenueReward.sol";
-import "../BaseTestLocal.sol";
+import {RevenueReward} from "../../../src/rewards/RevenueReward.sol";
+import {DustLock} from "../../../src/tokens/DustLock.sol";
+import {BaseTestLocal} from "../../BaseTestLocal.sol";
 
 contract MaliciousRevenueReward is RevenueReward {
     constructor(address forwarder) RevenueReward(forwarder) {}
@@ -39,6 +43,17 @@ contract DustLockTests is BaseTestLocal {
     // Local event declaration for expectEmit matching (ERC-4906)
     event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
 
+    struct PermanentLockEventScan {
+        uint256 iTransfer;
+        uint256 iDeposit;
+        uint256 iLockPerm;
+        uint256 iMetadata;
+        uint256 cTransfer;
+        uint256 cDeposit;
+        uint256 cLockPerm;
+        uint256 cMetadata;
+    }
+
     function _setUp() internal override {
         // Initial time => 1 sec after the start of week1
         assertEq(block.timestamp, 1 weeks + 1);
@@ -62,6 +77,100 @@ contract DustLockTests is BaseTestLocal {
 
         // flash protection
         assertEq(dustLock.balanceOfNFT(1), 0);
+    }
+
+    function testMergeFromSameBlockTransferPropagatesFlashProtection() public {
+        mintErc20Token(address(DUST), user2, TOKEN_10K);
+
+        vm.startPrank(user2);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 fromToken = dustLock.createLock(TOKEN_1K, MAXTIME);
+        uint256 toToken = dustLock.createLock(TOKEN_1K, MAXTIME);
+        vm.stopPrank();
+
+        skipAndRoll(1);
+
+        vm.prank(user2);
+        dustLock.transferFrom(user2, user4, toToken);
+
+        skipAndRoll(1);
+
+        vm.prank(user2);
+        dustLock.transferFrom(user2, user4, fromToken);
+        assertEq(dustLock.balanceOfNFT(fromToken), 0);
+
+        vm.prank(user4);
+        dustLock.merge(fromToken, toToken);
+
+        assertEq(dustLock.ownerOf(toToken), user4);
+        // Same-block flash protection propagates from the just-transferred source to the merge target.
+        assertEq(dustLock.balanceOfNFT(toToken), 0);
+
+        skipAndRoll(1);
+        // Protection clears the following block; the merged balance becomes readable.
+        assertGt(dustLock.balanceOfNFT(toToken), 0);
+    }
+
+    function testSplitFromSameBlockTransferPropagatesFlashProtection() public {
+        mintErc20Token(address(DUST), user2, TOKEN_10K);
+
+        vm.startPrank(user2);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 tokenId = dustLock.createLock(20 * TOKEN_1, MAXTIME);
+        vm.stopPrank();
+
+        dustLock.toggleSplit(user4, true);
+        skipAndRoll(1);
+
+        vm.prank(user2);
+        dustLock.transferFrom(user2, user4, tokenId);
+        assertEq(dustLock.balanceOfNFT(tokenId), 0);
+
+        vm.prank(user4);
+        (uint256 tokenId1, uint256 tokenId2) = dustLock.split(tokenId, 10 * TOKEN_1);
+
+        assertEq(dustLock.ownerOf(tokenId1), user4);
+        assertEq(dustLock.ownerOf(tokenId2), user4);
+        // Same-block flash protection propagates from the just-transferred parent to both split children.
+        assertEq(dustLock.balanceOfNFT(tokenId1), 0);
+        assertEq(dustLock.balanceOfNFT(tokenId2), 0);
+
+        skipAndRoll(1);
+        // Protection clears the following block; both children's balances become readable.
+        assertGt(dustLock.balanceOfNFT(tokenId1), 0);
+        assertGt(dustLock.balanceOfNFT(tokenId2), 0);
+    }
+
+    function testMergeAndSplitWithoutSameBlockTransferDoNotFlagFlashProtection() public {
+        mintErc20Token(address(DUST), user2, TOKEN_10K);
+
+        vm.startPrank(user2);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 fromToken = dustLock.createLock(TOKEN_1K, MAXTIME);
+        uint256 toToken = dustLock.createLock(TOKEN_1K, MAXTIME);
+        uint256 splitToken = dustLock.createLock(20 * TOKEN_1, MAXTIME);
+        vm.stopPrank();
+
+        dustLock.toggleSplit(user4, true);
+        skipAndRoll(1);
+
+        vm.startPrank(user2);
+        dustLock.transferFrom(user2, user4, fromToken);
+        dustLock.transferFrom(user2, user4, toToken);
+        dustLock.transferFrom(user2, user4, splitToken);
+        vm.stopPrank();
+
+        skipAndRoll(1);
+
+        // Transfers happened in an earlier block, so flash protection must NOT propagate.
+        vm.startPrank(user4);
+        dustLock.merge(fromToken, toToken);
+        (uint256 tokenId1, uint256 tokenId2) = dustLock.split(splitToken, 10 * TOKEN_1);
+        vm.stopPrank();
+
+        assertGt(dustLock.balanceOfNFT(toToken), 0);
+        assertGt(dustLock.balanceOfNFT(tokenId1), 0);
+        assertGt(dustLock.balanceOfNFT(tokenId2), 0);
     }
 
     function testTransferToAddressZeroReverts() public {
@@ -196,6 +305,35 @@ contract DustLockTests is BaseTestLocal {
         assertEq(dustLock.permanentLockBalance(), plbBefore + TOKEN_1);
     }
 
+    function testMutatingLockCatchesUpWithinLiveCheckpointWindow() public {
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 id = dustLock.createLockPermanent(TOKEN_1K, MAXTIME);
+
+        skipAndRoll(129 weeks + 1);
+
+        dustLock.increaseAmount(id, TOKEN_1);
+
+        assertEq(uint256(dustLock.locked(id).amount), TOKEN_1K + TOKEN_1);
+        assertEq(dustLock.pointHistory(dustLock.epoch()).ts, block.timestamp);
+    }
+
+    function testPublicCheckpointCatchesUpLongInactivityInBatches() public {
+        DUST.approve(address(dustLock), TOKEN_10K);
+        dustLock.createLockPermanent(TOKEN_1K, MAXTIME);
+
+        skipAndRoll(300 weeks);
+
+        uint256 calls;
+        while (dustLock.pointHistory(dustLock.epoch()).ts < block.timestamp) {
+            assertLt(calls, 3, "checkpoint catch-up should finish in two live batches");
+            dustLock.checkpoint();
+            ++calls;
+        }
+
+        assertEq(calls, 2);
+        assertEq(dustLock.pointHistory(dustLock.epoch()).ts, block.timestamp);
+    }
+
     /* ========== MERGE EDGE CASES ========== */
 
     function testMergeIntoPermanentKeepsPermanent() public {
@@ -257,6 +395,17 @@ contract DustLockTests is BaseTestLocal {
         assertTrue(dustLock.supportsInterface(0x5b5e139f));
         // IDustLock
         assertTrue(dustLock.supportsInterface(type(IDustLock).interfaceId));
+        // Deployed 2.0.0 IDustLock id remains supported explicitly by candidate logic.
+        assertTrue(dustLock.supportsInterface(0x03448477));
+        // EIP-2981 (royalty info) — required for marketplace fee enforcement; pin so the
+        // supportsInterface allow-list cannot silently drop the ERC721-C / royalty branch.
+        assertTrue(dustLock.supportsInterface(type(IERC2981).interfaceId));
+        // ICreatorToken (Limit Break ERC721-C) — required for transfer-validator integration.
+        assertTrue(dustLock.supportsInterface(type(ICreatorToken).interfaceId));
+        // Historical IDustLock id before ERC721-C/EIP-2981 and removed-view surface changes.
+        assertFalse(dustLock.supportsInterface(0x4c678d9c));
+        // IDustLock id from the removed earlyWithdrawPenaltyAmount(uint256) public view
+        assertFalse(dustLock.supportsInterface(0xda49082b));
         // Negative case
         assertFalse(dustLock.supportsInterface(0xffffffff));
     }
@@ -280,6 +429,67 @@ contract DustLockTests is BaseTestLocal {
         vm.prank(user2);
         dustLock.transferFrom(user, user3, id);
         assertEq(dustLock.ownerOf(id), user3);
+    }
+
+    function testApprovedOperatorCanMutateLockLifecycle() public {
+        dustLock.toggleSplit(user, true);
+        DUST.approve(address(dustLock), 20 * TOKEN_1);
+
+        uint256 extendId = dustLock.createLock(TOKEN_1, 26 weeks);
+        uint256 oldEnd = dustLock.locked(extendId).end;
+        dustLock.approve(user2, extendId);
+        vm.prank(user2);
+        dustLock.increaseUnlockTime(extendId, MAXTIME);
+        assertGt(dustLock.locked(extendId).end, oldEnd);
+
+        uint256 earlyWithdrawId = dustLock.createLock(TOKEN_1, MAXTIME);
+        dustLock.approve(user2, earlyWithdrawId);
+        vm.prank(user2);
+        dustLock.earlyWithdraw(earlyWithdrawId);
+        assertEq(dustLock.locked(earlyWithdrawId).amount, 0);
+
+        uint256 permanentId = dustLock.createLock(TOKEN_1, MAXTIME);
+        dustLock.approve(user2, permanentId);
+        vm.prank(user2);
+        dustLock.lockPermanent(permanentId);
+        assertTrue(dustLock.locked(permanentId).isPermanent);
+
+        vm.prank(user2);
+        dustLock.unlockPermanent(permanentId);
+        assertFalse(dustLock.locked(permanentId).isPermanent);
+
+        uint256 splitId = dustLock.createLock(2 * TOKEN_1, MAXTIME);
+        dustLock.approve(user2, splitId);
+        vm.prank(user2);
+        (uint256 splitId1, uint256 splitId2) = dustLock.split(splitId, TOKEN_1);
+        assertEq(dustLock.ownerOf(splitId1), user);
+        assertEq(dustLock.ownerOf(splitId2), user);
+
+        uint256 mergeSource = dustLock.createLock(TOKEN_1, MAXTIME);
+        uint256 mergeDestination = dustLock.createLock(TOKEN_1, MAXTIME);
+        dustLock.approve(user2, mergeSource);
+        dustLock.approve(user2, mergeDestination);
+        vm.prank(user2);
+        dustLock.merge(mergeSource, mergeDestination);
+        assertEq(uint256(dustLock.locked(mergeDestination).amount), 2 * TOKEN_1);
+    }
+
+    function testMergeAllowsApprovedCrossOwnerDestination() public {
+        DUST.approve(address(dustLock), TOKEN_1);
+        uint256 sourceId = dustLock.createLock(TOKEN_1, MAXTIME);
+
+        mintErc20Token(address(DUST), user2, TOKEN_1);
+        vm.startPrank(user2);
+        DUST.approve(address(dustLock), TOKEN_1);
+        uint256 destinationId = dustLock.createLock(TOKEN_1, MAXTIME);
+        dustLock.approve(user, destinationId);
+        vm.stopPrank();
+
+        dustLock.merge(sourceId, destinationId);
+
+        assertEq(dustLock.ownerOf(destinationId), user2);
+        assertEq(uint256(dustLock.locked(sourceId).amount), 0);
+        assertEq(uint256(dustLock.locked(destinationId).amount), 2 * TOKEN_1);
     }
 
     function testSafeTransferToBadReceiverReverts() public {
@@ -445,57 +655,68 @@ contract DustLockTests is BaseTestLocal {
         dustLock.createLockPermanent(amount, MAXTIME);
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
-        bytes32 SIG_TRANSFER = keccak256("Transfer(address,address,uint256)");
-        bytes32 SIG_DEPOSIT = keccak256("Deposit(address,uint256,uint8,uint256,uint256,uint256)");
-        bytes32 SIG_LOCK_PERM = keccak256("LockPermanent(address,uint256,uint256,uint256)");
-        bytes32 SIG_METADATA = keccak256("MetadataUpdate(uint256)");
+        PermanentLockEventScan memory scan = _scanPermanentLockEvents(logs);
 
-        uint256 max = type(uint256).max;
-        uint256 iTransfer = max;
-        uint256 iDeposit = max;
-        uint256 iLockPerm = max;
-        uint256 iMetadata = max;
-        uint256 cTransfer;
-        uint256 cDeposit;
-        uint256 cLockPerm;
-        uint256 cMetadata;
+        assertEq(scan.cTransfer, 1);
+        assertEq(scan.cDeposit, 1);
+        assertEq(scan.cLockPerm, 1);
+        assertTrue(scan.cMetadata >= 1);
 
-        for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter != address(dustLock)) continue; // only DustLock events
-            bytes32 topic0 = logs[i].topics[0];
-            if (topic0 == SIG_TRANSFER && logs[i].topics.length == 4) {
-                if (iTransfer == max) iTransfer = i;
-                unchecked {
-                    cTransfer++;
-                }
-            } else if (topic0 == SIG_DEPOSIT) {
-                if (iDeposit == max) iDeposit = i;
-                unchecked {
-                    cDeposit++;
-                }
-            } else if (topic0 == SIG_LOCK_PERM) {
-                if (iLockPerm == max) iLockPerm = i;
-                unchecked {
-                    cLockPerm++;
-                }
-            } else if (topic0 == SIG_METADATA) {
-                if (iMetadata == max) iMetadata = i;
-                unchecked {
-                    cMetadata++;
-                }
-            }
-        }
-
-        assertEq(cTransfer, 1);
-        assertEq(cDeposit, 1);
-        assertEq(cLockPerm, 1);
-        assertTrue(cMetadata >= 1);
-
-        assertTrue(iTransfer < max && iDeposit < max && iLockPerm < max && iMetadata < max, "events present");
-        assertLt(iTransfer, iDeposit, "Transfer before Deposit");
-        assertLt(iDeposit, iLockPerm, "Deposit before LockPermanent");
+        assertTrue(
+            scan.iTransfer < type(uint256).max && scan.iDeposit < type(uint256).max
+                && scan.iLockPerm < type(uint256).max && scan.iMetadata < type(uint256).max,
+            "events present"
+        );
+        assertLt(scan.iTransfer, scan.iDeposit, "Transfer before Deposit");
+        assertLt(scan.iDeposit, scan.iLockPerm, "Deposit before LockPermanent");
 
         // Optional: details can be checked here if needed; order sanity is sufficient for this test
+    }
+
+    /// @dev Scans recorded logs for the permanent-lock event ordering. Extracted into its own
+    /// stack frame so the optimizer-off coverage build does not overflow the EVM stack.
+    function _scanPermanentLockEvents(Vm.Log[] memory logs) internal view returns (PermanentLockEventScan memory scan) {
+        scan.iTransfer = type(uint256).max;
+        scan.iDeposit = type(uint256).max;
+        scan.iLockPerm = type(uint256).max;
+        scan.iMetadata = type(uint256).max;
+
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == address(dustLock)) {
+                _countPermanentLockEvent(logs[i], i, scan);
+            }
+        }
+    }
+
+    /// @dev Records the first index and running count for each permanent-lock event type.
+    function _countPermanentLockEvent(Vm.Log memory entry, uint256 index, PermanentLockEventScan memory scan)
+        internal
+        pure
+    {
+        if (entry.topics.length == 0) return;
+
+        bytes32 topic0 = entry.topics[0];
+        if (topic0 == keccak256("Transfer(address,address,uint256)") && entry.topics.length == 4) {
+            if (scan.iTransfer == type(uint256).max) scan.iTransfer = index;
+            unchecked {
+                scan.cTransfer++;
+            }
+        } else if (topic0 == keccak256("Deposit(address,uint256,uint8,uint256,uint256,uint256)")) {
+            if (scan.iDeposit == type(uint256).max) scan.iDeposit = index;
+            unchecked {
+                scan.cDeposit++;
+            }
+        } else if (topic0 == keccak256("LockPermanent(address,uint256,uint256,uint256)")) {
+            if (scan.iLockPerm == type(uint256).max) scan.iLockPerm = index;
+            unchecked {
+                scan.cLockPerm++;
+            }
+        } else if (topic0 == keccak256("MetadataUpdate(uint256)")) {
+            if (scan.iMetadata == type(uint256).max) scan.iMetadata = index;
+            unchecked {
+                scan.cMetadata++;
+            }
+        }
     }
 
     /* ========== LOCK BALANCE DECAY ========== */
@@ -504,9 +725,9 @@ contract DustLockTests is BaseTestLocal {
         DUST.approve(address(dustLock), TOKEN_1 * 2);
 
         // move block.timestamp
-        skipAndRoll(1 weeks - 1);
+        skipAndRoll(1 weeks);
 
-        assertEq(block.timestamp, 2 weeks);
+        assertEq(block.timestamp, 2 weeks + 1);
         uint256 lockTime = MAXTIME / 2;
         uint256 tokenId = dustLock.createLock(TOKEN_1, lockTime);
         emit log_named_uint("[dustLock] created tokenId", tokenId);
@@ -580,6 +801,26 @@ contract DustLockTests is BaseTestLocal {
         assertEq(totalSupplyAt7, dustLock.totalSupplyAt(timestamp7));
     }
 
+    function testMergeDifferentEndTimedLocksConservesGlobalSupplyWhenSourceShorter() public {
+        DUST.approve(address(dustLock), TOKEN_1K * 2);
+        uint256 shortToken = dustLock.createLock(TOKEN_1K, MINTIME + WEEK);
+        uint256 longToken = dustLock.createLock(TOKEN_1K, MAXTIME);
+
+        dustLock.merge(shortToken, longToken);
+
+        _assertSingleLiveTokenMatchesSupply(longToken);
+    }
+
+    function testMergeDifferentEndTimedLocksConservesGlobalSupplyWhenDestinationShorter() public {
+        DUST.approve(address(dustLock), TOKEN_1K * 2);
+        uint256 shortToken = dustLock.createLock(TOKEN_1K, MINTIME + WEEK);
+        uint256 longToken = dustLock.createLock(TOKEN_1K, MAXTIME);
+
+        dustLock.merge(longToken, shortToken);
+
+        _assertSingleLiveTokenMatchesSupply(shortToken);
+    }
+
     function _getBalanceOfAllNftsAt(uint256[] memory tokens, uint256 ts) internal view returns (uint256) {
         uint256 balanceOfAllNftAt = 0;
         for (uint256 i = 0; i < tokens.length; i++) {
@@ -587,6 +828,18 @@ contract DustLockTests is BaseTestLocal {
             balanceOfAllNftAt += dustLock.balanceOfNFTAt(tokens[i], ts);
         }
         return balanceOfAllNftAt;
+    }
+
+    function _assertSingleLiveTokenMatchesSupply(uint256 tokenId_) internal view {
+        uint256 nowTs = block.timestamp;
+        assertEq(dustLock.balanceOfNFTAt(tokenId_, nowTs), dustLock.totalSupplyAt(nowTs), "current supply mismatch");
+
+        uint256 nextEpoch = (nowTs / WEEK + 1) * WEEK;
+        assertEq(
+            dustLock.balanceOfNFTAt(tokenId_, nextEpoch),
+            dustLock.totalSupplyAt(nextEpoch),
+            "next epoch supply mismatch"
+        );
     }
 
     /* ========== MIN/MAX LOCK TIME ========== */
@@ -602,13 +855,34 @@ contract DustLockTests is BaseTestLocal {
         assertEq(lockedTokenId1.end, startOfCurrentWeek + 5 weeks);
         assertEq(lockedTokenId2.end, startOfCurrentWeek + 5 weeks);
 
-        emit log("[dustLock] Expect revert: min lock time");
+        // A sub-MINTIME request reverts at any timestamp.
+        emit log("[dustLock] Expect revert: below min lock time");
+        vm.expectRevert(IDustLock.LockDurationTooShort.selector);
+        dustLock.createLock(TOKEN_1, MINTIME - WEEK);
+    }
+
+    function testExactMinDurationRevertsAtBoundaryPlusOneAndTwo() public {
+        // Accepted behavior: exact week-multiple durations are unpurchasable. setUp starts at T + 1;
+        // exact-MINTIME reverts immediately (no grace) and again at T + 2.
+        emit log("[dustLock] Expect revert: exact-MINTIME at T + 1");
         vm.expectRevert(IDustLock.LockDurationTooShort.selector);
         dustLock.createLock(TOKEN_1, MINTIME);
 
-        emit log("[dustLock] Expect revert: createLockFor min lock time");
+        // one more second puts us at T + 2
+        skipAndRoll(1);
+        assertEq(block.timestamp, 1 weeks + 2);
+        emit log("[dustLock] Expect revert: exact-MINTIME at T + 2");
         vm.expectRevert(IDustLock.LockDurationTooShort.selector);
-        dustLock.createLockFor(TOKEN_1, MINTIME, user2);
+        dustLock.createLock(TOKEN_1, MINTIME);
+    }
+
+    function testSubMintimeRequestRevertsAtBoundaryPlusOne() public {
+        // A MINTIME - 1 request rounds to the same unlockTime as exact-MINTIME and reverts at T + 1.
+        assertEq(block.timestamp, 1 weeks + 1);
+
+        emit log("[dustLock] Expect revert: sub-MINTIME at T + 1");
+        vm.expectRevert(IDustLock.LockDurationTooShort.selector);
+        dustLock.createLock(TOKEN_1, MINTIME - 1);
     }
 
     function testCreateLockMinLockTimeEndOfWeek() public {
@@ -634,7 +908,7 @@ contract DustLockTests is BaseTestLocal {
         dustLock.createLockFor(TOKEN_1, MINTIME, user2);
     }
 
-    function testCreateLockMinLockTimeExactlyAtWeek() public {
+    function testCreateLockAtExactWeekDefersAndExactMinDurationRevertsAtTPlusOne() public {
         // arrange
         skipAndRoll(1 weeks - 1);
         assertEq(block.timestamp, 2 weeks); // week2
@@ -642,19 +916,66 @@ contract DustLockTests is BaseTestLocal {
         uint256 startOfCurrentWeek = block.timestamp / WEEK * WEEK;
         assertEq(startOfCurrentWeek, 2 weeks);
 
-        // act/assert
+        vm.expectRevert(CommonChecksLibrary.EpochFinalizationPending.selector);
+        dustLock.createLock(TOKEN_1, MINTIME);
+        vm.expectRevert(CommonChecksLibrary.EpochFinalizationPending.selector);
+        dustLock.createLockFor(TOKEN_1, MINTIME, user2);
+
+        skipAndRoll(1);
+
+        // MINTIME + WEEK survives weekly rounding from T + 1.
         (DustLock.LockedBalance memory lockedTokenId1, DustLock.LockedBalance memory lockedTokenId2) =
-            _createLocks(TOKEN_1, MINTIME);
-        assertEq(lockedTokenId1.end, startOfCurrentWeek + 4 weeks);
-        assertEq(lockedTokenId2.end, startOfCurrentWeek + 4 weeks);
+            _createLocks(TOKEN_1, MINTIME + WEEK);
+        assertEq(lockedTokenId1.end, startOfCurrentWeek + 5 weeks);
+        assertEq(lockedTokenId2.end, startOfCurrentWeek + 5 weeks);
 
-        emit log("[dustLock] Expect revert: lock duration too short by 1");
+        // Accepted behavior: the exact-MINTIME retry at T + 1 reverts; there is no grace. The rounded
+        // commitment of 28 days minus one second stays below the minimum.
+        emit log("[dustLock] Expect revert: exact-MINTIME retry at T + 1");
         vm.expectRevert(IDustLock.LockDurationTooShort.selector);
-        dustLock.createLock(TOKEN_1, MINTIME - 1);
+        dustLock.createLock(TOKEN_1, MINTIME);
+        vm.expectRevert(IDustLock.LockDurationTooShort.selector);
+        dustLock.createLockFor(TOKEN_1, MINTIME, user2);
+    }
 
-        emit log("[dustLock] Expect revert: createLockFor duration too short by 1");
-        vm.expectRevert(IDustLock.LockDurationTooShort.selector);
-        dustLock.createLockFor(TOKEN_1, MINTIME - 1, user2);
+    function testDepositForAndIncreaseAmountAtMinDurationCutoff() public {
+        uint256 lockAmount = TOKEN_1K;
+        mintErc20Token(address(DUST), user, lockAmount * 3);
+        mintErc20Token(address(DUST), user2, lockAmount);
+
+        vm.startPrank(user);
+        DUST.approve(address(dustLock), lockAmount * 3);
+        uint256 increaseTokenId = dustLock.createLock(lockAmount, MINTIME + WEEK);
+        uint256 depositForTokenId = dustLock.createLock(lockAmount, MINTIME + WEEK);
+        vm.stopPrank();
+
+        uint256 cutoff = dustLock.locked(increaseTokenId).end - MINTIME;
+        assertEq(cutoff % WEEK, 0, "cutoff should be an exact reward boundary");
+        skipAndRoll(cutoff - block.timestamp);
+
+        vm.expectRevert(CommonChecksLibrary.EpochFinalizationPending.selector);
+        vm.prank(user);
+        dustLock.increaseAmount(increaseTokenId, lockAmount);
+
+        vm.startPrank(user2);
+        DUST.approve(address(dustLock), lockAmount);
+        vm.expectRevert(CommonChecksLibrary.EpochFinalizationPending.selector);
+        dustLock.depositFor(depositForTokenId, lockAmount);
+        vm.stopPrank();
+
+        assertEq(dustLock.locked(increaseTokenId).amount, int256(lockAmount));
+        assertEq(dustLock.locked(depositForTokenId).amount, int256(lockAmount));
+
+        // Accepted behavior: the deposit window closes at the cutoff boundary; there is no grace at the
+        // cutoff + 1 retry, so both deposit paths revert DepositForLockDurationTooShort.
+        skipAndRoll(1);
+        vm.prank(user);
+        vm.expectRevert(IDustLock.DepositForLockDurationTooShort.selector);
+        dustLock.increaseAmount(increaseTokenId, lockAmount);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.DepositForLockDurationTooShort.selector);
+        dustLock.depositFor(depositForTokenId, lockAmount);
     }
 
     function testMaxLockTime() public {
@@ -762,7 +1083,11 @@ contract DustLockTests is BaseTestLocal {
         IDustLock.LockedBalance memory lockedBalance = dustLock.locked(tokenId);
         uint256 remainingTime = lockedBalance.end > block.timestamp ? lockedBalance.end - block.timestamp : 0;
         uint256 totalLockTime = lockedBalance.end - lockedBalance.effectiveStart;
-        uint256 expectedPenalty = (TOKEN_10K * 3000 * remainingTime) / (BASIS_POINTS * totalLockTime);
+        uint256 expectedPenalty = _expectedTimedPenaltyAtScalar(TOKEN_10K, remainingTime, 3_000);
+        assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId), expectedPenalty);
+        uint256 userBalanceBefore = DUST.balanceOf(user2);
+        uint256 treasuryBefore = DUST.balanceOf(user3);
+        uint256 totalSupplyBefore = DUST.totalSupply();
 
         emit log_named_uint("[penalty] Remaining time", remainingTime);
         emit log_named_uint("[penalty] Total lock time", totalLockTime);
@@ -785,8 +1110,10 @@ contract DustLockTests is BaseTestLocal {
         emit log_named_uint("[penalty] Expected user balance", TOKEN_10K - expectedPenalty);
 
         assertEq(actualUserBalance, TOKEN_10K - expectedPenalty);
-        assertEq(actualTreasuryBalance, expectedPenalty);
-        assertEq(actualUserBalance + actualTreasuryBalance, TOKEN_10K);
+        assertEq(actualTreasuryBalance - treasuryBefore, expectedPenalty);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
+        // Conservation: independently-measured user and treasury deltas sum to the principal.
+        assertEq((actualUserBalance - userBalanceBefore) + (actualTreasuryBalance - treasuryBefore), TOKEN_10K);
     }
 
     function testEarlyWithdrawSameBlockAfterTransfer() public {
@@ -825,12 +1152,9 @@ contract DustLockTests is BaseTestLocal {
         // Actual remaining = 31,449,599 - 15,768,000 = 15,681,599 seconds
         // Time ratio = 15,681,599 / 31,449,599 = 0.4986 = 49.86%
 
-        // Step-by-step penalty calculation using actual time values:
-        // penalty = (lockAmount x penaltyRate x remainingTime) / (10000 x totalLockTime)
-        // penalty = (10,000 x 10e21 x 3000 x 15,681,599) / (10000 x 31,449,599)
-        // penalty = (10 x 10²⁴ x 3000 x 15,681,599) / (10000 x 31,449,599)
-        // penalty = 470,447,970,000 x 10e21 / 314,495,990,000 = 1,495,879,073,052,727,953,701 wei
-        // penalty ≈ 1,495.88 tokens (about 14.96% of 10,000 tokens)
+        // The scalar-as-max curve prices the exit off remaining time only (effectiveStart and
+        // totalLockTime are not pricing inputs), so the expectation is the independent curve model
+        // at the 3000 scalar set above; the live quote is asserted to match it below.
 
         // Assert our manually calculated time values match actual contract values
         uint256 expectedRemainingTime = 15681599; // Half of MAXTIME minus week rounding
@@ -841,8 +1165,12 @@ contract DustLockTests is BaseTestLocal {
         assertEq(totalLockTime, expectedTotalLockTime);
         assertEq((remainingTime * BASIS_POINTS) / totalLockTime, expectedTimeRatioBP);
 
-        uint256 expectedPenalty = 1495879073052727953701; // ~1495.88 tokens
-        uint256 expectedUserAmount = 8504120926947272046299; // ~8504.12 tokens
+        uint256 expectedPenalty = _expectedTimedPenaltyAtScalar(TOKEN_10K, remainingTime, 3_000);
+        assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId), expectedPenalty);
+        uint256 expectedUserAmount = TOKEN_10K - expectedPenalty;
+        uint256 userBalanceBefore = DUST.balanceOf(user4);
+        uint256 treasuryBefore = DUST.balanceOf(user3);
+        uint256 totalSupplyBefore = DUST.totalSupply();
 
         emit log_named_uint("[penalty] Transfer test: remaining time", remainingTime);
         emit log_named_uint("[penalty] Transfer test: total lock time", totalLockTime);
@@ -868,8 +1196,10 @@ contract DustLockTests is BaseTestLocal {
         emit log_named_uint("[penalty] Transfer test: actual treasury balance", actualTreasuryBalance);
 
         assertEq(actualUserBalance, expectedUserAmount);
-        assertEq(actualTreasuryBalance, expectedPenalty);
-        assertEq(actualUserBalance + actualTreasuryBalance, TOKEN_10K);
+        assertEq(actualTreasuryBalance - treasuryBefore, expectedPenalty);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
+        // Conservation: independently-measured user and treasury deltas sum to the principal.
+        assertEq((actualUserBalance - userBalanceBefore) + (actualTreasuryBalance - treasuryBefore), TOKEN_10K);
     }
 
     function testEarlyWithdrawBasicPenalty() public {
@@ -907,21 +1237,9 @@ contract DustLockTests is BaseTestLocal {
             // Remaining time = 7,257,599 - 2,592,000 = 4,665,599 seconds
             // Lock amount: 1,000 tokens (1,000,000,000,000,000,000,000 wei)
 
-            // Step 1: Calculate time ratio
-            // remainingTime / totalLockTime = 4,665,599 / 7,257,599 = 0.642857142857...
-            // This means ~64.29% of lock time remains
-
-            // Step 2: Apply 50% maximum penalty rate proportionally
-            // Applied penalty rate = time ratio x max penalty = 0.642857... x 0.5 = 0.321428...
-            // This means actual penalty is ~32.14% of locked amount
-
-            // Step 3: Calculate exact penalty amount using integer math (contract formula)
-            // penalty = (lockAmount x 5000 x remainingTime) / (10000 x totalLockTime)
-            // penalty = (1x10e21 x 5000 x 4,665,599) / (10000 x 7,257,599)
-            // penalty = 23,327,995x10²⁴ / 72,575,990,000 = 321,428,546,823,818,731,236 wei
-
-            // Step 4: Calculate user receives
-            // userAmount = 1x10e21 - 321,428,546,823,818,731,236 = 678,571,453,176,181,268,764 wei
+            // The scalar-as-max curve prices the exit off remaining time only (effectiveStart and
+            // totalLockTime are not pricing inputs); at the default 7500 scalar the penalty equals
+            // _expectedTimedPenalty(lockAmount, 4,665,599).
 
             // Assert our manually calculated time values match actual contract values
             uint256 remainingTime = lockedBalance.end > block.timestamp ? lockedBalance.end - block.timestamp : 0;
@@ -934,9 +1252,9 @@ contract DustLockTests is BaseTestLocal {
             assertEq(totalLockTime, expectedTotalLockTime);
             assertEq((remainingTime * BASIS_POINTS) / totalLockTime, expectedTimeRatioBP);
 
-            // Use hardcoded calculated values instead of formulas for true validation
-            expectedPenalty = 321428546823818731236; // ~321.43 tokens
-            expectedUserAmount = 678571453176181268764; // ~678.57 tokens
+            expectedPenalty = _expectedTimedPenalty(lockAmount, remainingTime);
+            assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId), expectedPenalty);
+            expectedUserAmount = lockAmount - expectedPenalty;
 
             emit log_named_uint("[penalty] Expected penalty (calculated)", expectedPenalty);
             emit log_named_uint("[penalty] Expected user amount (calculated)", expectedUserAmount);
@@ -945,6 +1263,7 @@ contract DustLockTests is BaseTestLocal {
         {
             uint256 userBalanceBefore = DUST.balanceOf(user);
             uint256 treasuryBalanceBefore = DUST.balanceOf(user2);
+            uint256 totalSupplyBefore = DUST.totalSupply();
 
             dustLock.earlyWithdraw(tokenId);
 
@@ -961,8 +1280,37 @@ contract DustLockTests is BaseTestLocal {
             // Now we can properly validate the distribution
             assertEq(actualUserReceived, expectedUserAmount);
             assertEq(actualTreasuryReceived, expectedPenalty);
+            assertEq(DUST.totalSupply(), totalSupplyBefore);
+            // Conservation: independently-measured user and treasury deltas sum to the principal.
             assertEq(actualUserReceived + actualTreasuryReceived, lockAmount);
         }
+    }
+
+    /**
+     * @notice Calculates the independent expected timed exit penalty at the default 7500 maximum
+     * @param amount Locked DUST principal being priced
+     * @param remainingTime Actual remaining duration in seconds
+     * @return penalty Exact expected penalty remainder
+     */
+    function _expectedTimedPenalty(uint256 amount, uint256 remainingTime) internal pure returns (uint256 penalty) {
+        return amount - (amount * (3 * MAXTIME - 2 * remainingTime)) / (4 * MAXTIME);
+    }
+
+    /**
+     * @notice Calculates the independent expected timed exit penalty at an arbitrary scalar
+     * @param amount Locked DUST principal being priced
+     * @param remainingTime Actual remaining duration in seconds
+     * @param scalar Active earlyWithdrawPenalty maximum in basis points
+     * @return penalty Exact expected penalty remainder
+     */
+    function _expectedTimedPenaltyAtScalar(uint256 amount, uint256 remainingTime, uint256 scalar)
+        internal
+        pure
+        returns (uint256 penalty)
+    {
+        uint256 numerator = 2_500 * MAXTIME + (scalar - 2_500) * remainingTime;
+        uint256 denominator = BASIS_POINTS * MAXTIME;
+        return amount - (amount * (denominator - numerator)) / denominator;
     }
 
     function testEarlyWithdrawMergeGamingPrevention() public {
@@ -992,70 +1340,35 @@ contract DustLockTests is BaseTestLocal {
         // Wait 1 day after merge
         skipAndRoll(1 days);
 
-        // Get lock details BEFORE early withdraw (lock gets destroyed after)
-        IDustLock.LockedBalance memory lockedAfterWait = dustLock.locked(tokenId1);
-        uint256 remainingTime = lockedAfterWait.end > block.timestamp ? lockedAfterWait.end - block.timestamp : 0;
-        uint256 totalLockTime = lockedAfterWait.end - lockedAfterWait.effectiveStart;
+        // The merged lock keeps tokenId1's MAXTIME end and prices the WHOLE amount at the
+        // remaining-duration curve (25% floor rising to the earlyWithdrawPenalty maximum);
+        // effectiveStart stays tracked storage but is no longer a pricing input.
+        uint256 remainingTime;
+        {
+            IDustLock.LockedBalance memory lockedAfterWait = dustLock.locked(tokenId1);
+            remainingTime = lockedAfterWait.end - block.timestamp;
 
-        // Manual calculation for merge gaming prevention with 1-day decay:
+            // 91 elapsed days against the weekly-rounded MAXTIME end created at 604801.
+            assertEq(remainingTime, 23587199);
+            assertEq(lockedAfterWait.end - lockedAfterWait.effectiveStart, 31449599);
+        }
 
-        // Given scenario:
-        // - tokenId1: 1000 tokens, MAXTIME (365 days)
-        // - tokenId2: 500 tokens, 180 days
-        // - Total after merge: 1500 tokens
-        // - Merge happens after 90 days, then wait 1 day before early withdraw
+        // Independent expected penalty at the default 7500 maximum:
+        // proceeds = floor(amount * (3T - 2R) / 4T); penalty = amount - proceeds.
+        uint256 expectedPenalty = _expectedTimedPenalty(totalAmount, remainingTime);
+        assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId1), expectedPenalty);
 
-        // Time calculations for merge with weighted average preservation:
-        // With weighted average, effectiveStart is preserved (604801), not reset to merge time
-        // tokenId1 had MAXTIME, tokenId2 had 180 days, so merged token gets tokenId1's end time
-        // After 90 days elapsed + 1 day wait = 91 days total elapsed
+        // Merge no-discount: the merged quote never rounds below pricing each tranche
+        // separately at the same merged end (per-quote round-up bounds the gap to 1 wei).
+        uint256 tranche1Penalty = _expectedTimedPenalty(lockAmount1, remainingTime);
+        uint256 tranche2Penalty = _expectedTimedPenalty(lockAmount2, remainingTime);
+        assertGe(expectedPenalty + 1, tranche1Penalty + tranche2Penalty);
+        assertLe(expectedPenalty, tranche1Penalty + tranche2Penalty);
 
-        // Step 1: Calculate expected remaining time
-        // Original effectiveStart: 604801 (both locks created at same time)
-        // Original tokenId1 end: 32054400 (MAXTIME from 604801)
-        // Time elapsed: 90 days (skip) + 1 day (wait) = 91 days = 91 * 86400 = 7862400 seconds
-        // Current time: 604801 + 7862400 = 8467201
-        // But actual current time after operations: 8468401 (due to week rounding effects)
-        // Remaining time: 32054400 - 8467201 = 23587199 seconds
-        uint256 expectedRemainingTime = 23587199;
-
-        // Step 2: Calculate total lock time (preserved via weighted average)
-        // Total lock time = end - effectiveStart = 32054400 - 604801 = 31449599 seconds
-        uint256 expectedTotalLockTime = 31449599;
-
-        // Step 3: Calculate time ratio in basis points
-        // Time ratio = (remainingTime * 10000) / totalLockTime
-        // Time ratio = (23587199 * 10000) / 31449599 = 7499.9999205... ≈ 7499 BP (due to integer division)
-        uint256 expectedTimeRatioBP = 7499;
-
-        // Step 4: Calculate expected penalty using exact Solidity formula
-        // penalty = (totalAmount * penaltyRate * remainingTime) / (BASIS_POINTS * totalLockTime)
-        // totalAmount = 1500e18 = 1,500,000,000,000,000,000,000 wei
-        // penaltyRate = 5000 (50% in basis points)
-        // remainingTime = 23587199 seconds
-        // totalLockTime = 31449599 seconds
-        // BASIS_POINTS = 10000
-        //
-        // Step-by-step calculation:
-        // First: 1,500,000,000,000,000,000,000 * 5000 = 7,500,000,000,000,000,000,000,000
-        // Then: 7,500,000,000,000,000,000,000,000 * 23587199 = 176,903,992,500,000,000,000,000,000,000,000
-        // denominator = 10000 * 31449599 = 314,495,990,000
-        // penalty = 176,903,992,500,000,000,000,000,000,000,000 / 314,495,990,000
-        // penalty = 562,499,994,038,079,786,009 wei
-        uint256 expectedPenalty = 562499994038079786009; // ~562.5 tokens
-
-        // Step 5: Calculate expected user amount
-        // userAmount = totalAmount - penalty
-        // userAmount = 1,500,000,000,000,000,000,000 - 562,499,994,038,079,786,009
-        // userAmount = 937,500,005,961,920,213,991 wei
-        uint256 expectedUserAmount = 937500005961920213991; // ~937.5 tokens
-
-        // Assert our manually calculated time values match actual contract values
-        assertEq(remainingTime, expectedRemainingTime);
-        assertEq(totalLockTime, expectedTotalLockTime);
-        assertEq((remainingTime * BASIS_POINTS) / totalLockTime, expectedTimeRatioBP);
+        uint256 expectedUserAmount = totalAmount - expectedPenalty;
 
         // Early withdraw after 1 day - penalty should decay from max by 1 day
+        uint256 totalSupplyBefore = DUST.totalSupply();
         dustLock.earlyWithdraw(tokenId1);
 
         uint256 userBalanceAfter = DUST.balanceOf(user);
@@ -1070,6 +1383,7 @@ contract DustLockTests is BaseTestLocal {
 
         // Assert exact calculated values
         assertEq(actualPenalty, expectedPenalty);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
         assertEq(userBalanceAfter - userBalanceBefore, expectedUserAmount);
         assertEq(actualPenalty + (userBalanceAfter - userBalanceBefore), totalAmount);
     }
@@ -1104,35 +1418,26 @@ contract DustLockTests is BaseTestLocal {
 
         uint256 userBalanceBefore = DUST.balanceOf(user);
         uint256 treasuryBalanceBefore = DUST.balanceOf(user2);
+        uint256 totalAmount = initialAmount + addedAmount;
+
+        // The weighted-average start still tracks time served in storage (asserted above), but the
+        // scalar-as-max curve prices the whole 2000-token amount off remaining time only. Route the
+        // expectation through the shared helper at the default 7500 scalar, then confirm the view agrees.
+        uint256 remainingTime = dustLock.locked(tokenId).end - block.timestamp;
+        uint256 expectedPenalty = _expectedTimedPenalty(totalAmount, remainingTime);
+        assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId), expectedPenalty);
+
+        uint256 totalSupplyBefore = DUST.totalSupply();
 
         // Immediate early withdraw after amount increase
         dustLock.earlyWithdraw(tokenId);
 
-        uint256 totalAmount = initialAmount + addedAmount;
         uint256 actualPenalty = DUST.balanceOf(user2) - treasuryBalanceBefore;
         uint256 actualUserAmount = DUST.balanceOf(user) - userBalanceBefore;
 
-        // Manual penalty calculation with weighted average start time:
-        //
-        // Test scenario:
-        // - Initial lock: 1000 tokens, MAXTIME duration
-        // - After 26 weeks, add 1000 more tokens → Total: 2000 tokens
-        // - Weighted average start time prevents griefing while maintaining gaming prevention
-        //
-        // Weighted average formula: (oldAmount * oldStart + newAmount * currentTime) / (oldAmount + newAmount)
-        // Penalty formula: (totalAmount * 5000 * remainingTime) / (10000 * totalLockTime)
-        //
-        // With actual test values:
-        // - Original start: 604801, Increase timestamp: 16329601
-        // - Weighted start: (1000 * 604801 + 1000 * 16329601) / 2000 = 8467201
-        // - End time: 32054400
-        // - Total lock time from weighted start: 32054400 - 8467201 = 23587199
-        // - Remaining time at withdraw: 32054400 - 16329601 = 15724799
-        // - Expected penalty = (2000 * 5000 * 15724799) / (10000 * 23587199) = 666666652534707491126...
-
-        uint256 expectedPenalty = 666666652534707491126;
-
         assertEq(actualPenalty, expectedPenalty);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
+        // Conservation: independently-measured user and treasury deltas sum to the principal.
         assertEq(actualUserAmount + actualPenalty, totalAmount);
     }
 
@@ -1268,6 +1573,10 @@ contract DustLockTests is BaseTestLocal {
 
         uint256 userBalanceBefore = DUST.balanceOf(user);
         uint256 treasuryBalanceBefore = DUST.balanceOf(user2);
+        uint256 remainingTime = lockedAfter.end > block.timestamp ? lockedAfter.end - block.timestamp : 0;
+        uint256 expectedPenalty = _expectedTimedPenalty(lockAmount, remainingTime);
+        assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId), expectedPenalty);
+        uint256 totalSupplyBefore = DUST.totalSupply();
 
         dustLock.earlyWithdraw(tokenId);
 
@@ -1277,39 +1586,12 @@ contract DustLockTests is BaseTestLocal {
         uint256 actualPenalty = treasuryBalanceAfter - treasuryBalanceBefore;
         uint256 actualUserReceived = userBalanceAfter - userBalanceBefore;
 
-        // Manual calculation for time extension fairness:
+        // Extending the lock does not reset effectiveStart (asserted above), and the scalar-as-max
+        // curve prices the exit off remaining time only. Extending to MAXTIME pushes remaining up
+        // toward MAXTIME, which raises the penalty toward the ceiling rather than lowering it; the
+        // expectation is the independent curve model and the live quote is asserted to match it.
 
-        // Given scenario:
-        // - Create 1000 token lock for 26 weeks (15,724,800 seconds)
-        // - Skip 13 weeks (7,862,400 seconds) - half time elapsed
-        // - Extend to MAXTIME (365 days = 31,536,000 seconds from current time)
-        // - Time extension does NOT reset start time (fairness)
-
-        // Time calculations:
-        // - Original start: creation timestamp
-        // - After 13 weeks skip: start + 13 weeks
-        // - New end time: current time + MAXTIME = start + 13 weeks + 31,536,000
-        // - Total lock time: new end - original start = 13 weeks + 31,536,000 = 39,398,400 seconds
-        // - Remaining time: new end - current = 31,536,000 seconds (MAXTIME)
-
-        // Time ratio calculation:
-        // ratio = remainingTime / totalLockTime = 31,536,000 / 39,398,400 ≈ 0.8003
-        // This means ~80.03% of total lock time remains
-
-        // Step-by-step penalty calculation:
-        // penalty = (lockAmount x 5000 x remainingTime) / (10000 x totalLockTime)
-        // penalty = (1000 x 10e21 x 5000 x 31,536,000) / (10000 x 39,398,400)
-        // penalty = (1000 x 10e21 x 157,680,000,000) / 393,984,000,000
-        // penalty ≈ 400,000,000,000,000,000,000 wei ≈ 400 tokens
-
-        // Hardcoded calculated penalty based on the formula:
-        // 13 weeks = 7,862,400 seconds, MAXTIME = 31,536,000 seconds
-        // totalLockTime = 7,862,400 + 31,536,000 = 39,398,400 seconds
-        // penalty = (1000 x 10e21 x 5000 x 31,536,000) / (10000 x 39,398,400)
-        // penalty = 399,999,997,456,247,391,540 wei ≈ 399.999997 tokens
-
-        uint256 expectedPenalty = 399999997456247391540; // ~400 tokens (80% of 50% max)
-        uint256 expectedUserAmount = 600000002543752608460; // ~600 tokens remaining
+        uint256 expectedUserAmount = lockAmount - expectedPenalty;
 
         emit log_named_uint("[penalty] Time extension actual penalty", actualPenalty);
         emit log_named_uint("[penalty] Expected penalty (calculated)", expectedPenalty);
@@ -1318,6 +1600,7 @@ contract DustLockTests is BaseTestLocal {
 
         // Assert exact calculated values
         assertEq(actualPenalty, expectedPenalty);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
         assertEq(actualUserReceived, expectedUserAmount);
         assertEq(actualUserReceived + actualPenalty, lockAmount);
     }
@@ -1330,6 +1613,8 @@ contract DustLockTests is BaseTestLocal {
 
         uint256 penalty1;
         uint256 penalty2;
+        uint256 quote1;
+        uint256 quote2;
 
         // === Scenario A: Early withdraw WITHOUT extension ===
         {
@@ -1343,29 +1628,27 @@ contract DustLockTests is BaseTestLocal {
             uint256 remainingTime = lockDetails.end > block.timestamp ? lockDetails.end - block.timestamp : 0;
             uint256 totalLockTime = lockDetails.end - lockDetails.effectiveStart;
 
-            // Manual calculation for Scenario A:
-            // 26 weeks = 26 x 604,800 = 15,724,800 seconds
-            // Contract rounds: 15,724,800 → 15,724,799 seconds (timestamp offset)
-            // After 13 weeks = 13 x 604,800 = 7,862,400 seconds:
-            // Remaining time = 15,724,799 - 7,862,400 = 7,862,399 seconds
-            // Time ratio = 7,862,399 / 15,724,799 = 0.5 (50%)
-
-            // Step-by-step penalty calculation:
-            // penalty = (lockAmount x penaltyRate x remainingTime) / (10000 x totalLockTime)
-            // penalty = (1000 x 10e21 x 5000 x 7,862,399) / (10000 x 15,724,799)
-            // penalty = (1,000,000,000,000,000,000,000 x 5000 x 7,862,399) / (10000 x 15,724,799)
-            // penalty = 39,311,995,000,000,000,000,000,000 / 157,247,990,000
-            // penalty = 249,999,984,101,545,590,503 wei ≈ 250 tokens
-
+            // Weekly rounding: the 26-week lock rounds to 15,724,799s and, after 13 weeks elapse,
+            // remaining = 7,862,399s. The scalar-as-max curve prices the exit off remaining only, so
+            // the independent expectation is _expectedTimedPenalty(lockAmount, remaining).
             uint256 expectedRemainingTime1 = 7862399;
             uint256 expectedTotalLockTime1 = 15724799;
 
             assertEq(remainingTime, expectedRemainingTime1);
             assertEq(totalLockTime, expectedTotalLockTime1);
 
+            uint256 expectedPenalty1 = _expectedTimedPenalty(lockAmount, remainingTime);
+
             uint256 treasuryBefore = DUST.balanceOf(user2);
+            quote1 = dustLock.earlyWithdrawPenaltyAmount(tokenId1);
+            uint256 totalSupplyBefore = DUST.totalSupply();
             dustLock.earlyWithdraw(tokenId1);
             penalty1 = DUST.balanceOf(user2) - treasuryBefore;
+            assertEq(DUST.totalSupply(), totalSupplyBefore);
+
+            // Effect and view both match the independent curve model.
+            assertEq(penalty1, expectedPenalty1);
+            assertEq(quote1, expectedPenalty1);
 
             emit log_named_uint("[gaming] Scenario A penalty", penalty1);
         }
@@ -1386,39 +1669,30 @@ contract DustLockTests is BaseTestLocal {
                 lockDetailsExtended.end > block.timestamp ? lockDetailsExtended.end - block.timestamp : 0;
             uint256 totalLockTimeExtended = lockDetailsExtended.end - lockDetailsExtended.effectiveStart;
 
-            // Manual calculation for Scenario B:
-            // Original 26 weeks, skip 13 weeks, then extend to MAXTIME
-            // MAXTIME = 365 days = 31,536,000 seconds → rounds to 31,449,599 seconds
-            // Total lock time = 13 weeks elapsed + MAXTIME remaining = 7,862,400 + 31,449,599 = 39,311,999 seconds
-            // Remaining time = 31,449,599 seconds (MAXTIME from extension point)
-            // Time ratio = 31,449,599 / 39,311,999 ≈ 0.8 (80%)
-            //
-            // Step-by-step penalty calculation:
-            // penalty = (lockAmount x penaltyRate x remainingTime) / (10000 x totalLockTime)
-            // penalty = (1000 x 10e21 x 5000 x 31,449,599) / (10000 x 39,311,999)
-            // penalty = (1,000,000,000,000,000,000,000 x 5000 x 31,449,599) / (10000 x 39,311,999)
-            // penalty = 157,247,995,000,000,000,000,000,000 / 393,119,990,000
-            // penalty = 399,999,997,456,247,391,540 wei ≈ 400 tokens
-
+            // Extending to MAXTIME pushes remaining up to 31,449,599s (the week-rounded MAXTIME). The
+            // scalar-as-max curve prices the exit off remaining only, so the larger remaining yields a
+            // higher expectation: _expectedTimedPenalty(lockAmount, remaining).
             uint256 expectedRemainingTime2 = 31449599;
             uint256 expectedTotalLockTime2 = 39311999;
 
             assertEq(remainingTimeExtended, expectedRemainingTime2);
             assertEq(totalLockTimeExtended, expectedTotalLockTime2);
 
+            uint256 expectedPenalty2 = _expectedTimedPenalty(lockAmount, remainingTimeExtended);
+
             uint256 treasuryBefore = DUST.balanceOf(user2);
+            quote2 = dustLock.earlyWithdrawPenaltyAmount(tokenId2);
+            uint256 totalSupplyBefore = DUST.totalSupply();
             dustLock.earlyWithdraw(tokenId2);
             penalty2 = DUST.balanceOf(user2) - treasuryBefore;
+            assertEq(DUST.totalSupply(), totalSupplyBefore);
+
+            // Effect and view both match the independent curve model.
+            assertEq(penalty2, expectedPenalty2);
+            assertEq(quote2, expectedPenalty2);
 
             emit log_named_uint("[gaming] Scenario B penalty", penalty2);
         }
-
-        // Verify expected values calculated from formulas
-        uint256 expectedPenalty1 = 249999984101545590503; // ~250 tokens (50% time ratio)
-        uint256 expectedPenalty2 = 399999997456247391540; // ~400 tokens (80% time ratio)
-
-        assertEq(penalty1, expectedPenalty1);
-        assertEq(penalty2, expectedPenalty2);
 
         // CRITICAL: Extension should NOT reduce penalty - actually increases it
         assertTrue(penalty2 > penalty1, "Extension should increase penalty");
@@ -1426,7 +1700,7 @@ contract DustLockTests is BaseTestLocal {
         emit log("[gaming] Gaming prevention verified - extension increases penalty");
     }
 
-    function testEarlyWithdrawPermanentLockMaxPenalty() public {
+    function testEarlyWithdrawPermanentLockAutoUnlocksAndPricesFreshEnd() public {
         // Set treasury to different address for proper testing
         dustLock.setEarlyWithdrawTreasury(user2);
 
@@ -1442,46 +1716,26 @@ contract DustLockTests is BaseTestLocal {
         // Skip more time - permanent lock age shouldn't matter
         skipAndRoll(26 weeks);
 
+        // The quote prices the fresh weekly-rounded end that the internal unlock writes, identical to
+        // calling unlockPermanent and then earlyWithdraw as two manual steps. Permanent-lock age does
+        // not matter because the end is rewritten at exit time.
+        uint256 freshRemaining = ((block.timestamp + MAXTIME) / 1 weeks) * 1 weeks - block.timestamp;
+        uint256 expectedPenalty = _expectedTimedPenalty(lockAmount, freshRemaining);
+        uint256 expectedUserAmount = lockAmount - expectedPenalty;
+        assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId), expectedPenalty);
+
         uint256 userBalanceBefore = DUST.balanceOf(user);
         uint256 treasuryBalanceBefore = DUST.balanceOf(user2);
+        uint256 totalSupplyBefore = DUST.totalSupply();
 
-        // Early withdraw permanent lock (auto-unlocks then withdraws)
         dustLock.earlyWithdraw(tokenId);
 
-        uint256 userBalanceAfter = DUST.balanceOf(user);
-        uint256 treasuryBalanceAfter = DUST.balanceOf(user2);
-
-        uint256 actualPenalty = treasuryBalanceAfter - treasuryBalanceBefore;
-
-        // Manual calculation for permanent lock penalty:
-
-        // Given scenario:
-        // - Create 1000 token lock for MAXTIME (365 days)
-        // - Skip 13 weeks, make permanent with lockPermanent()
-        // - Skip another 26 weeks (total 39 weeks elapsed)
-        // - Early withdraw permanent lock
-
-        // For permanent locks, the contract always applies MAXIMUM penalty:
-        // - Permanent locks have end time set to type(uint256).max
-        // - remainingTime = end - current = type(uint256).max - current ≈ type(uint256).max
-        // - totalLockTime = end - start = type(uint256).max - start ≈ type(uint256).max
-        // - Time ratio = remainingTime / totalLockTime ≈ 1.0 (100%)
-
-        // Step-by-step penalty calculation:
-        // penalty = (lockAmount x 5000 x remainingTime) / (10000 x totalLockTime)
-        // For permanent: penalty = (lockAmount x 5000 x ∞) / (10000 x ∞) = lockAmount x 0.5
-        // penalty = 1000 x 0.5 = 500 tokens exactly
-
-        uint256 expectedPenalty = 500000000000000000000; // Exactly 500 tokens (50% of 1000)
-        uint256 expectedUserAmount = 500000000000000000000; // Remaining 500 tokens
-
-        emit log_named_uint("[penalty] Permanent lock penalty", actualPenalty);
-        emit log_named_uint("[penalty] Expected penalty (calculated)", expectedPenalty);
-
-        // Assert exact calculated values
+        uint256 actualPenalty = DUST.balanceOf(user2) - treasuryBalanceBefore;
         assertEq(actualPenalty, expectedPenalty);
-        assertEq(userBalanceAfter - userBalanceBefore, expectedUserAmount);
-        assertEq(userBalanceAfter - userBalanceBefore + actualPenalty, lockAmount);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
+        assertEq(DUST.balanceOf(user) - userBalanceBefore, expectedUserAmount);
+        assertEq(DUST.balanceOf(user) - userBalanceBefore + actualPenalty, lockAmount);
+        assertEq(dustLock.permanentLockBalance(), 0);
     }
 
     function testEarlyWithdrawEdgeCases() public {
@@ -1492,50 +1746,65 @@ contract DustLockTests is BaseTestLocal {
         // Manual calculation: minimum lock amount is 1e18 (MIN_LOCK_AMOUNT)
         uint256 minLockAmount = 1e18; // Hardcoded min lock amount
         DUST.approve(address(dustLock), minLockAmount * 2);
-        uint256 tokenId = dustLock.createLock(minLockAmount, MINTIME + WEEK);
+        {
+            uint256 tokenId = dustLock.createLock(minLockAmount, MINTIME + WEEK);
 
-        // Skip almost to expiry (1 minute remaining)
-        skipAndRoll(MINTIME + WEEK - 1 minutes);
+            // Skip almost to expiry (1 minute remaining)
+            skipAndRoll(MINTIME + WEEK - 1 minutes);
 
-        uint256 userBalanceBefore = DUST.balanceOf(user);
-        uint256 treasuryBalanceBefore = DUST.balanceOf(user2);
+            uint256 userBalanceBefore = DUST.balanceOf(user);
+            uint256 treasuryBalanceBefore = DUST.balanceOf(user2);
+            uint256 quotedPenalty = dustLock.earlyWithdrawPenaltyAmount(tokenId);
+            uint256 totalSupplyBefore = DUST.totalSupply();
 
-        dustLock.earlyWithdraw(tokenId);
+            // Independent curve expectation: the live quote must match the model, not itself.
+            IDustLock.LockedBalance memory lockedBalance = dustLock.locked(tokenId);
+            uint256 remainingTime = lockedBalance.end > block.timestamp ? lockedBalance.end - block.timestamp : 0;
+            assertEq(quotedPenalty, _expectedTimedPenalty(minLockAmount, remainingTime));
 
-        uint256 userBalanceAfter = DUST.balanceOf(user);
-        uint256 treasuryBalanceAfter = DUST.balanceOf(user2);
+            dustLock.earlyWithdraw(tokenId);
 
-        uint256 actualPenalty = treasuryBalanceAfter - treasuryBalanceBefore;
+            uint256 userBalanceAfter = DUST.balanceOf(user);
+            uint256 treasuryBalanceAfter = DUST.balanceOf(user2);
 
-        // With only 1 minute remaining out of MINTIME + WEEK, penalty should be very small
-        assertTrue(actualPenalty < minLockAmount / 1000); // Less than 0.1% penalty
+            uint256 actualPenalty = treasuryBalanceAfter - treasuryBalanceBefore;
 
-        emit log_named_uint("[penalty] Edge case penalty", actualPenalty);
-        emit log_named_uint("[penalty] Edge case user received", userBalanceAfter - userBalanceBefore);
+            // Every still-active timed lock is strictly above the 25% early-exit floor.
+            assertEq(actualPenalty, quotedPenalty);
+            assertGt(actualPenalty, minLockAmount / 4);
+            assertEq(DUST.totalSupply(), totalSupplyBefore);
+
+            emit log_named_uint("[penalty] Edge case penalty", actualPenalty);
+            emit log_named_uint("[penalty] Edge case user received", userBalanceAfter - userBalanceBefore);
+        }
 
         // Test zero penalty case (expired lock)
-        uint256 tokenId2 = dustLock.createLock(minLockAmount, MINTIME + WEEK);
-        skipAndRoll(MINTIME + WEEK + 1);
+        {
+            uint256 tokenId2 = dustLock.createLock(minLockAmount, MINTIME + WEEK);
+            skipAndRoll(MINTIME + WEEK + 1);
 
-        uint256 userBalance2Before = DUST.balanceOf(user);
-        uint256 treasuryBalance2Before = DUST.balanceOf(user2);
+            uint256 userBalance2Before = DUST.balanceOf(user);
+            uint256 treasuryBalance2Before = DUST.balanceOf(user2);
+            uint256 totalSupply2Before = DUST.totalSupply();
+            assertEq(dustLock.earlyWithdrawPenaltyAmount(tokenId2), 0);
 
-        dustLock.earlyWithdraw(tokenId2);
+            dustLock.earlyWithdraw(tokenId2);
 
-        uint256 userBalance2After = DUST.balanceOf(user);
-        uint256 treasuryBalance2After = DUST.balanceOf(user2);
+            uint256 userBalance2After = DUST.balanceOf(user);
+            uint256 treasuryBalance2After = DUST.balanceOf(user2);
 
-        // Expired lock should have zero penalty
-        assertEq(treasuryBalance2After - treasuryBalance2Before, 0);
-        assertEq(userBalance2After - userBalance2Before, minLockAmount);
+            // Expired lock should have zero penalty
+            assertEq(treasuryBalance2After - treasuryBalance2Before, 0);
+            assertEq(userBalance2After - userBalance2Before, minLockAmount);
+            assertEq(DUST.totalSupply(), totalSupply2Before);
 
-        emit log("[penalty] Expired lock: zero penalty confirmed");
+            emit log("[penalty] Expired lock: zero penalty confirmed");
+        }
     }
 
     /* ============= SYSTEM DISCOUNT ============= */
 
-    function testWeightedAveragePenaltyDiscount() public {
-        // Test showing that merged penalty < sum of separate penalties due to weighted averaging
+    function testWeightedAverageStartDoesNotDiscountClaimReformExit() public {
         dustLock.setEarlyWithdrawTreasury(user2);
 
         // Create initial lock: 1,000,000 DUST, then add 500,000 DUST at halfway point
@@ -1548,14 +1817,15 @@ contract DustLockTests is BaseTestLocal {
 
         IDustLock.LockedBalance memory lockedBalance = dustLock.locked(tokenId);
         uint256 treasuryBefore = DUST.balanceOf(user2);
+        uint256 quotedPenalty = dustLock.earlyWithdrawPenaltyAmount(tokenId);
+        uint256 totalSupplyBefore = DUST.totalSupply();
 
-        // Calculate what separate penalties would be based on actual values:
-        // Old tranche: (1,000,000 * 5,000 * remainingTime) / (10,000 * originalLockTime)
-        // New tranche: (500,000 * 5,000 * remainingTime) / (10,000 * remainingTime) = 50% of 500K
-        uint256 remainingTime = 32054400 - block.timestamp;
-        uint256 oldTranchePenalty = (TOKEN_1M * 5000 * remainingTime) / (BASIS_POINTS * 31449599);
-        uint256 newTranchePenalty = TOKEN_1M / 2 / 2; // 50% of 500K DUST
-        uint256 expectedSeparatePenalties = oldTranchePenalty + newTranchePenalty;
+        // Both tranches share the lock's single end; the curve prices amount at the
+        // remaining-duration rate only, so separate per-tranche quotes at that same rate
+        // can differ from the combined quote by at most the per-quote round-up wei.
+        uint256 remainingTime = lockedBalance.end - block.timestamp;
+        uint256 expectedSeparatePenalties =
+            _expectedTimedPenalty(TOKEN_1M, remainingTime) + _expectedTimedPenalty(TOKEN_1M / 2, remainingTime);
 
         dustLock.earlyWithdraw(tokenId);
         uint256 actualPenalty = DUST.balanceOf(user2) - treasuryBefore;
@@ -1563,15 +1833,15 @@ contract DustLockTests is BaseTestLocal {
         emit log_named_uint("[discount] Actual penalty", actualPenalty);
         emit log_named_uint("[discount] Separate penalties would be", expectedSeparatePenalties);
         emit log_named_uint("[discount] Weighted start", lockedBalance.effectiveStart);
-        emit log_named_uint("[discount] Discount amount", expectedSeparatePenalties - actualPenalty);
 
-        // Verify weighted average penalty is less than separate penalties would be
-        assertLt(actualPenalty, expectedSeparatePenalties);
+        assertEq(actualPenalty, quotedPenalty);
+        assertGe(actualPenalty + 1, expectedSeparatePenalties);
+        assertLe(actualPenalty, expectedSeparatePenalties);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
         assertEq(lockedBalance.effectiveStart, 5860801);
     }
 
-    function testTinyLockNoGamingBenefit() public {
-        // Test showing that tiny aged locks provide negligible benefit for large deposits
+    function testTinyAgedLockUsesRemainingDurationRateAfterDeposit() public {
         dustLock.setEarlyWithdrawTreasury(user2);
 
         // Create tiny lock, age it 300 days, add massive amount
@@ -1584,19 +1854,22 @@ contract DustLockTests is BaseTestLocal {
 
         IDustLock.LockedBalance memory lockedBalance = dustLock.locked(tokenId);
         uint256 treasuryBefore = DUST.balanceOf(user2);
+        uint256 quotedPenalty = dustLock.earlyWithdrawPenaltyAmount(tokenId);
+        uint256 totalSupplyBefore = DUST.totalSupply();
+
+        // Independent curve expectation: the live quote must match the model, not itself.
+        uint256 remainingTime = lockedBalance.end > block.timestamp ? lockedBalance.end - block.timestamp : 0;
+        assertEq(quotedPenalty, _expectedTimedPenalty(TOKEN_1K + TOKEN_1M, remainingTime));
 
         dustLock.earlyWithdraw(tokenId);
         uint256 actualPenalty = DUST.balanceOf(user2) - treasuryBefore;
 
         emit log_named_uint("[gaming] Weighted start", lockedBalance.effectiveStart);
         emit log_named_uint("[gaming] Actual penalty", actualPenalty);
-        emit log_named_uint("[gaming] Fresh 1M would pay", TOKEN_1M / 2);
-        emit log_named_uint("[gaming] Benefit", TOKEN_1M / 2 - actualPenalty);
 
-        // Verify tiny lock provides negligible gaming benefit
         assertEq(lockedBalance.effectiveStart, 26498906);
-        assertEq(actualPenalty, 498167093601397103479906);
-        assertLt(TOKEN_1M / 2 - actualPenalty, TOKEN_1M / 500); // <0.2% benefit
+        assertEq(actualPenalty, quotedPenalty);
+        assertEq(DUST.totalSupply(), totalSupplyBefore);
     }
 
     /* ============= REENTRANCY PROTECTION ============= */
