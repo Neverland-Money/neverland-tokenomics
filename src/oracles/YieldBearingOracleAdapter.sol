@@ -6,10 +6,10 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
+import {IYieldBearingOracleAdapter} from "../interfaces/IYieldBearingOracleAdapter.sol";
+
 import {CommonChecksLibrary} from "../libraries/CommonChecksLibrary.sol";
 import {OracleLib} from "../libraries/OracleLib.sol";
-
-import {IYieldBearingOracleAdapter} from "../interfaces/IYieldBearingOracleAdapter.sol";
 
 /**
  * @title YieldBearingOracleAdapter
@@ -71,13 +71,13 @@ contract YieldBearingOracleAdapter is IYieldBearingOracleAdapter, Ownable2Step {
     /// @notice Address authorized to update snapshots (in addition to owner)
     address public keeper;
 
-    // @notice Current snapshot ratio (assets per shareUnit, in asset decimals)
+    /// @notice Current snapshot ratio (assets per shareUnit, in asset decimals)
     uint104 private _snapshotRatio;
-    // @notice Timestamp when the snapshot became effective
+    /// @notice Timestamp when the snapshot became effective
     uint48 private _snapshotTimestamp;
-    // @notice Growth rate per second (scaled by PRECISION_SCALE)
+    /// @notice Growth rate per second (scaled by PRECISION_SCALE)
     uint104 private _growthRatePerSecond;
-    // @notice Maximum annual growth rate in basis points
+    /// @notice Maximum annual growth rate in basis points
     uint16 private _maxAnnualGrowthBps;
 
     /// @notice Pending snapshot waiting for timelock
@@ -375,8 +375,10 @@ contract YieldBearingOracleAdapter is IYieldBearingOracleAdapter, Ownable2Step {
             if (currentRatio == 0) return (0, false);
             if (currentRatio >= maxAllowedRatio) return (0, true);
 
-            // denominator=maxAllowedRatio>0 (checked above), x=(maxAllowedRatio-currentRatio)<denominator,
-            // y=BPS_DENOMINATOR (10_000). `ok` should always be true, but keep a defensive check.
+            /*
+             * denominator=maxAllowedRatio>0 (checked above), x=(maxAllowedRatio-currentRatio)<denominator,
+             * y=BPS_DENOMINATOR (10_000). `ok` should always be true, but keep a defensive check.
+             */
             (uint256 slack, bool okSlack) =
                 OracleLib.tryMulDiv(maxAllowedRatio - currentRatio, BPS_DENOMINATOR, maxAllowedRatio);
             if (!okSlack) return (0, false);

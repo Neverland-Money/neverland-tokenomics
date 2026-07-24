@@ -4,26 +4,40 @@ out = "out"
 libs = ["lib"]
 optimizer = true
 optimizer-runs = 200
+evm_version = "cancun"
+bytecode_hash = "none"
 extra_output_files = ["abi", "metadata"]
 ignored_error_codes = ["license","code-size","init-code-size","transient-storage",8760,2519,3628]
-fs_permissions = [{ access = "read", path = "./deployments" }]
+no_match_coverage = "^(script|test)/|^src/leaderboard/ProxyImports\\.sol$"
+fs_permissions = [
+  { access = "read", path = "./deployments" },
+  { access = "read", path = "./script/hardhat/config" },
+  { access = "read", path = "./src" },
+  { access = "read", path = "./out" },
+]
 
-[profile.oracle-coverage]
-src = "src/oracles"
-test = "test/oracles"
+[profile.default.invariant]
+runs = 4
+depth = 256
 
-[profile.legendary-ledger-coverage]
-src = "src/tokens"
-test = "test/legendary-ledger"
+[profile.claim-reform-predeploy.invariant]
+runs = 256
+depth = 500
+fail_on_revert = true
 
-[profile.governance-coverage]
-src = "src/governance"
-test = "test/governance"
+# Deep runs for the pre-existing oracle invariant suites (not fail_on_revert-hardened)
+[profile.deep-invariants.invariant]
+runs = 256
+depth = 500
 
 [rpc_endpoints]
 mainnet = "${MAINNET_RPC}"
 
 [lint]
+ignore = [
+  "script/Imports.sol",
+  "src/leaderboard/ProxyImports.sol",
+]
 exclude_lints = [
   "mixed-case-function",
   "mixed-case-variable",
@@ -37,3 +51,5 @@ exclude_lints = [
   "erc20-unchecked-transfer",
   "unsafe-cheatcode",
 ]
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

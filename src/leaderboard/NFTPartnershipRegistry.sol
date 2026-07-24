@@ -33,9 +33,6 @@ contract NFTPartnershipRegistry is INFTPartnershipRegistry, OwnableUpgradeable {
     /// @notice Maximum static boost (50%)
     uint256 public constant MAX_STATIC_BOOST = 5_000;
 
-    /// @notice Maximum number of partnerships to keep on-chain iteration bounded
-    uint256 public constant MAX_PARTNERSHIPS = 50;
-
     /*//////////////////////////////////////////////////////////////
                           STORAGE VARIABLES
     //////////////////////////////////////////////////////////////*/
@@ -56,10 +53,7 @@ contract NFTPartnershipRegistry is INFTPartnershipRegistry, OwnableUpgradeable {
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @notice Disables initializers on the implementation contract
-     * @custom:oz-upgrades-unsafe-allow constructor
-     */
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
@@ -102,10 +96,6 @@ contract NFTPartnershipRegistry is INFTPartnershipRegistry, OwnableUpgradeable {
     ) external onlyOwner {
         CommonChecksLibrary.revertIfZeroAddress(collection);
 
-        // Keep on-chain iteration bounded for keeper calls.
-        if (allPartnerships.length >= MAX_PARTNERSHIPS) {
-            revert TooManyPartnerships(MAX_PARTNERSHIPS);
-        }
         if (partnerships[collection].collection != address(0)) {
             revert PartnershipAlreadyExists(collection);
         }

@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
+// Required for optimizer-off Forge coverage: the ABI v2 decoder for
+// syncLPPositions' six dynamic calldata arrays overflows the stack.
+// Current external parameters are first-order arrays, so ABI coder v1 is sufficient.
+pragma abicoder v1;
 
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
-import {CommonChecksLibrary} from "../libraries/CommonChecksLibrary.sol";
 import {ILeaderboardKeeper} from "../interfaces/ILeaderboardKeeper.sol";
+
+import {CommonChecksLibrary} from "../libraries/CommonChecksLibrary.sol";
 
 /**
  * @title ILeaderboardKeeperDustLock
@@ -133,9 +138,7 @@ contract LeaderboardKeeper is ILeaderboardKeeper, OwnableUpgradeable {
 
     /// @dev Restrict access to keeper or owner
     modifier onlyKeeper() {
-        if (msg.sender != keeper && msg.sender != owner()) {
-            revert NotKeeper(msg.sender);
-        }
+        _revertIfNotKeeperOrOwner();
         _;
     }
 
@@ -207,21 +210,15 @@ contract LeaderboardKeeper is ILeaderboardKeeper, OwnableUpgradeable {
     ) external onlyKeeper {
         uint256 len = users.length;
 
-        if (
-            pools.length != len || tokenIds.length != len || tickLowers.length != len || tickUppers.length != len
-                || liquidities.length != len
-        ) {
-            revert ArrayLengthMismatch(len, pools.length);
-        }
-
+        _revertIfLPPositionLengthMismatch(
+            len, pools.length, tokenIds.length, tickLowers.length, tickUppers.length, liquidities.length
+        );
         if (len > MAX_BATCH_SIZE) {
             revert BatchTooLarge(len, MAX_BATCH_SIZE);
         }
 
         for (uint256 i = 0; i < len;) {
-            emit LPPositionSynced(
-                users[i], pools[i], tokenIds[i], tickLowers[i], tickUppers[i], liquidities[i], block.timestamp
-            );
+            _emitLPPositionSynced(users[i], pools[i], tokenIds[i], tickLowers[i], tickUppers[i], liquidities[i]);
             unchecked {
                 ++i;
             }
@@ -316,7 +313,64 @@ contract LeaderboardKeeper is ILeaderboardKeeper, OwnableUpgradeable {
 
     /// @notice Disabled to prevent accidental renouncement of ownership
     function renounceOwnership() public view override onlyOwner {
+        // Keep the existing no-data revert surface for deployed LeaderboardKeeper compatibility.
+        // solhint-disable-next-line reason-string, gas-custom-errors
         revert();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            INTERNAL HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Emits one LP position sync row for the off-chain leaderboard indexer.
+     * @param user User address owning the LP position
+     * @param pool LP pool address
+     * @param tokenId Position NFT token ID
+     * @param tickLower Lower tick of the position range
+     * @param tickUpper Upper tick of the position range
+     * @param liquidity Liquidity amount in the position
+     */
+    function _emitLPPositionSynced(
+        address user,
+        address pool,
+        uint256 tokenId,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity
+    ) private {
+        emit LPPositionSynced(user, pool, tokenId, tickLower, tickUpper, liquidity, block.timestamp);
+    }
+
+    /**
+     * @notice Reverts when LP position arrays do not all match the user array length.
+     * @param expectedLen Expected array length from the users array
+     * @param poolsLen Pools array length
+     * @param tokenIdsLen Token IDs array length
+     * @param tickLowersLen Lower ticks array length
+     * @param tickUppersLen Upper ticks array length
+     * @param liquiditiesLen Liquidities array length
+     */
+    function _revertIfLPPositionLengthMismatch(
+        uint256 expectedLen,
+        uint256 poolsLen,
+        uint256 tokenIdsLen,
+        uint256 tickLowersLen,
+        uint256 tickUppersLen,
+        uint256 liquiditiesLen
+    ) private pure {
+        if (poolsLen != expectedLen) revert ArrayLengthMismatch(expectedLen, poolsLen);
+        if (tokenIdsLen != expectedLen) revert ArrayLengthMismatch(expectedLen, tokenIdsLen);
+        if (tickLowersLen != expectedLen) revert ArrayLengthMismatch(expectedLen, tickLowersLen);
+        if (tickUppersLen != expectedLen) revert ArrayLengthMismatch(expectedLen, tickUppersLen);
+        if (liquiditiesLen != expectedLen) revert ArrayLengthMismatch(expectedLen, liquiditiesLen);
+    }
+
+    /// @notice Reverts unless the caller is the configured keeper or owner.
+    function _revertIfNotKeeperOrOwner() private view {
+        if (msg.sender == keeper) return;
+        if (msg.sender == owner()) return;
+        revert NotKeeper(msg.sender);
     }
 
     /*//////////////////////////////////////////////////////////////

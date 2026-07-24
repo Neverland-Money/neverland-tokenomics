@@ -33,6 +33,8 @@ library CommonChecksLibrary {
     error InvalidBasePrice();
     /// @notice Used when an oracle round is stale
     error StaleRound();
+    /// @notice Used when a state-changing action is attempted during an exact epoch boundary.
+    error EpochFinalizationPending();
     /**
      * @notice Used when the oracle price is too old
      * @param currentTime The current time
@@ -113,5 +115,14 @@ library CommonChecksLibrary {
      */
     function revertIfInvalidUserAddress(address user) internal pure {
         if (user == address(0)) revert InvalidUserAddress();
+    }
+
+    /**
+     * @notice Reverts during the exact current epoch boundary.
+     * @dev The boundary timestamp itself becomes safe for state-changing settlement from the next second.
+     * @param epochDuration Duration of the epoch whose boundary must be finalized
+     */
+    function revertIfEpochFinalizationPending(uint256 epochDuration) internal view {
+        if (block.timestamp != 0 && block.timestamp % epochDuration == 0) revert EpochFinalizationPending();
     }
 }

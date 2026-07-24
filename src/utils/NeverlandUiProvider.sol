@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolAddressesProvider} from "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
 import {IPriceOracleGetter} from "@aave/core-v3/contracts/interfaces/IPriceOracleGetter.sol";
-import {IPoolDataProvider} from "@aave/core-v3/contracts/interfaces/IPoolDataProvider.sol";
 
 import {IDustLock} from "../interfaces/IDustLock.sol";
-import {IRevenueReward} from "../interfaces/IRevenueReward.sol";
+import {INeverlandUiRevenueReward as IRevenueReward} from "../interfaces/INeverlandUiRevenueReward.sol";
+import {IUserVaultFactory} from "../interfaces/IUserVaultFactory.sol";
 import {IDustRewardsController} from "../interfaces/IDustRewardsController.sol";
 import {INeverlandUiProvider} from "../interfaces/INeverlandUiProvider.sol";
 import {INeverlandDustHelper} from "../interfaces/INeverlandDustHelper.sol";
 
 import {CommonChecksLibrary} from "../libraries/CommonChecksLibrary.sol";
 import {EpochTimeLibrary} from "../libraries/EpochTimeLibrary.sol";
+import {Erc20BalanceLibrary} from "../libraries/Erc20BalanceLibrary.sol";
+import {NeverlandUiEmissionLibrary} from "./libraries/NeverlandUiEmissionLibrary.sol";
 
 /**
  * @title NeverlandUiProvider
@@ -26,26 +27,38 @@ contract NeverlandUiProvider is INeverlandUiProvider {
                              CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice USD oracle unit (8 decimals)
+    /// @dev USD oracle unit (8 decimals)
     uint256 private constant USD_PRICE_UNIT = 1e8;
+
+    /// @dev Minimum raw DustLock enumeration slots scanned by one paginated call.
+    uint256 private constant MIN_RAW_TOKEN_SCAN_PER_CALL = 32;
+
+    /// @dev Maximum raw DustLock enumeration slots scanned by one paginated call.
+    uint256 private constant MAX_RAW_TOKEN_SCAN_PER_CALL = 1024;
+
+    /// @dev Raw slots scanned per requested valid token before applying the maximum scan cap.
+    uint256 private constant RAW_TOKEN_SCAN_MULTIPLIER = 32;
+
+    /// @dev Deployed isolated Pendle AUSD pool provider. Used only while controller-side asset enumeration is unavailable.
+    address private constant PENDLE_AUSD_POOL_ADDRESSES_PROVIDER = 0xb80397A931FcFdA3aC999a3a5639C328Dc72A58F;
 
     /*//////////////////////////////////////////////////////////////
                           IMMUTABLE CONTRACTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice DustLock contract for veNFT and voting power data
+    /// @dev DustLock contract for veNFT and voting power data
     IDustLock public immutable DUST_LOCK;
 
-    /// @notice RevenueReward contract for revenue distribution data
+    /// @dev RevenueReward contract for revenue distribution data
     IRevenueReward public immutable REVENUE_REWARD;
 
-    /// @notice DustRewardsController contract for emission rewards data
+    /// @dev DustRewardsController contract for emission rewards data
     IDustRewardsController public immutable DUST_REWARDS_CONTROLLER;
 
-    /// @notice DustOracle contract for DUST price data
+    /// @dev DustOracle contract for DUST price data
     INeverlandDustHelper public immutable DUST_HELPER;
 
-    /// @notice Aave Lending Pool Address Provider for protocol integration
+    /// @dev Aave Lending Pool Address Provider for protocol integration
     IPoolAddressesProvider public immutable AAVE_LENDING_POOL_ADDRESS_PROVIDER;
 
     /*//////////////////////////////////////////////////////////////
@@ -87,6 +100,7 @@ contract NeverlandUiProvider is INeverlandUiProvider {
     /// @inheritdoc INeverlandUiProvider
     function getUserTokenCount(address user) external view override returns (uint256 count) {
         CommonChecksLibrary.revertIfZeroAddress(user);
+
         return DUST_LOCK.balanceOf(user);
     }
 
@@ -99,33 +113,14 @@ contract NeverlandUiProvider is INeverlandUiProvider {
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
 
-        uint256 tokenCount = DUST_LOCK.balanceOf(user);
-        uint256 start = offset > tokenCount ? tokenCount : offset;
-        uint256 end = tokenCount;
-        unchecked {
-            // clamp end to start+limit if it doesn't overflow and is smaller than tokenCount
-            uint256 remaining = tokenCount - start;
-            if (limit < remaining) end = start + limit;
-        }
-        uint256 pageLen = end - start;
-
-        uint256[] memory tokenIds = new uint256[](pageLen);
-        for (uint256 i; i < pageLen;) {
-            try DUST_LOCK.ownerToNFTokenIdList(user, start + i) returns (uint256 tokenId) {
-                tokenIds[i] = tokenId;
-            } catch {
-                tokenIds[i] = 0;
-            }
-            unchecked {
-                ++i;
-            }
-        }
+        (uint256[] memory tokenIds, uint256 tokenCount, uint256 nextRawOffset, bool hasMore) =
+            _getValidatedOwnedTokenPage(user, offset, limit);
 
         (LockInfo[] memory locks, RewardSummary[] memory rewardSummaries) = _getBatchTokenDetailsInternal(tokenIds);
 
         uint256 totalVotingPower;
         uint256 totalLockedAmount;
-        for (uint256 i; i < pageLen;) {
+        for (uint256 i; i < tokenIds.length;) {
             totalVotingPower += locks[i].votingPower;
             totalLockedAmount += locks[i].amount;
             unchecked {
@@ -140,6 +135,10 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         dash.rewardSummaries = rewardSummaries;
         dash.totalVotingPower = totalVotingPower;
         dash.totalLockedAmount = totalLockedAmount;
+        dash.rawTokenCount = tokenCount;
+        dash.nextRawOffset = nextRawOffset;
+        dash.hasMore = hasMore;
+
         return dash;
     }
 
@@ -174,6 +173,7 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         returns (UserRewardsSummary memory summary)
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
+
         return _getUserRewardsSummaryInternal(user, rewardTokens);
     }
 
@@ -195,43 +195,23 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         summary.totalRevenue = new uint256[](rewardTokenCount);
         summary.totalEmissions = new uint256[](rewardTokenCount);
 
-        address[] memory revTokens = REVENUE_REWARD.getRewardTokens();
-        if (revTokens.length > 0 && tokenCount > 0) {
-            uint256 maxTokens = REVENUE_REWARD.MAX_TOKENS();
-            uint256 maxTokenIds = REVENUE_REWARD.MAX_TOKENIDS();
-            // Avoid quadratic pre-sorting and revert risk when inputs exceed RevenueReward limits.
-            if (revTokens.length <= maxTokens && tokenCount <= maxTokenIds) {
-                address[] memory sortedRevTokens = _sortAndDedupAddresses(revTokens);
-                uint256[] memory sortedTokenIds = _sortAndDedupUint256(tokenIds);
-                if (sortedRevTokens.length > 0 && sortedTokenIds.length > 0) {
-                    try REVENUE_REWARD.earnedRewardsAll(sortedRevTokens, sortedTokenIds) returns (
-                        uint256[][] memory, uint256[] memory totalsPerToken
-                    ) {
-                        for (uint256 j; j < rewardTokenCount;) {
-                            address t = rewardTokens[j];
-                            for (uint256 r; r < sortedRevTokens.length;) {
-                                if (sortedRevTokens[r] == t) {
-                                    summary.totalRevenue[j] = totalsPerToken[r];
-                                    break;
-                                }
-                                unchecked {
-                                    ++r;
-                                }
-                            }
-                            unchecked {
-                                ++j;
-                            }
-                        }
-                    } catch {
-                        // If earnedRewardsAll fails (e.g., invalid ordering), return zeros.
-                    }
-                }
-            }
+        if (tokenCount > 0 && rewardTokenCount > 0) {
+            _fillUserRevenueRewards(summary, rewardTokens, tokenIds);
         }
+
+        IUserVaultFactory vaultFactory = REVENUE_REWARD.userVaultFactory();
+        address vault = address(vaultFactory) == address(0) ? address(0) : vaultFactory.getUserVault(user);
 
         address[] memory emissionTokens = DUST_REWARDS_CONTROLLER.getRewardsList();
         for (uint256 j; j < rewardTokenCount;) {
             address rewardToken = rewardTokens[j];
+
+            uint256 pending = REVENUE_REWARD.pendingRewards(rewardToken, user);
+            if (vault != address(0)) {
+                pending += REVENUE_REWARD.pendingRewards(rewardToken, vault);
+            }
+            summary.totalRevenue[j] += pending;
+
             for (uint256 k; k < emissionTokens.length;) {
                 if (emissionTokens[k] == rewardToken) {
                     summary.totalEmissions[j] = _getUserEmissionRewards(user, rewardToken);
@@ -253,7 +233,8 @@ contract NeverlandUiProvider is INeverlandUiProvider {
      * @return ids Array of tokenIds
      */
     function _getUserRelatedTokenIds(address user) internal view returns (uint256[] memory ids) {
-        uint256 owned = DUST_LOCK.balanceOf(user);
+        uint256[] memory ownedTokenIds = _getValidatedOwnedTokenIds(user);
+        uint256 owned = ownedTokenIds.length;
         uint256[] memory srl = REVENUE_REWARD.getUserTokensWithSelfRepayingLoan(user);
 
         if (owned == 0 && srl.length == 0) return new uint256[](0);
@@ -264,26 +245,21 @@ contract NeverlandUiProvider is INeverlandUiProvider {
 
         // Add owned tokenIds (unique by ERC721 invariant)
         for (uint256 i; i < owned;) {
-            try DUST_LOCK.ownerToNFTokenIdList(user, i) returns (uint256 tokenId) {
-                tmp[n] = tokenId;
-                unchecked {
-                    ++n;
-                }
-            } catch {
-                // Skip corrupted enumeration entries
+            tmp[n] = ownedTokenIds[i];
+            unchecked {
+                ++n;
             }
             unchecked {
                 ++i;
             }
         }
 
-        // Add SRL tokenIds, dedup only against owned set (SRL itself is an EnumerableSet -> unique)
+        // Add SRL tokenIds, dedup against already added entries (SRL itself is an EnumerableSet -> unique)
         if (srl.length > 0) {
             for (uint256 j; j < srl.length;) {
                 uint256 tokenId = srl[j];
                 bool duplicate = false;
-                // Check only the first `owned` entries (owned set) for duplicates
-                for (uint256 k; k < owned;) {
+                for (uint256 k; k < n;) {
                     if (tmp[k] == tokenId) {
                         duplicate = true;
                         break;
@@ -310,6 +286,242 @@ contract NeverlandUiProvider is INeverlandUiProvider {
             ids[i] = tmp[i];
             unchecked {
                 ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Get currently owned tokenIds from DustLock's enumerable list, skipping stale entries.
+     * @param user The owner address to enumerate.
+     * @return ids Array of tokenIds still owned by `user`.
+     */
+    function _getValidatedOwnedTokenIds(address user) internal view returns (uint256[] memory ids) {
+        uint256 tokenCount = DUST_LOCK.balanceOf(user);
+        uint256 upperBound = _ownedTokenIndexUpperBound(tokenCount);
+        uint256[] memory tmp = new uint256[](tokenCount);
+        uint256 n;
+        for (uint256 i; n < tokenCount && i < upperBound;) {
+            try DUST_LOCK.ownerToNFTokenIdList(user, i) returns (uint256 tokenId) {
+                if (_tokenIsOwnedByUser(user, tokenId)) {
+                    tmp[n] = tokenId;
+                    unchecked {
+                        ++n;
+                    }
+                }
+            } catch {
+                // Skip stale/corrupt enumerable entries and return surviving tokenIds.
+            }
+            unchecked {
+                ++i;
+            }
+        }
+
+        ids = new uint256[](n);
+        for (uint256 i; i < n;) {
+            ids[i] = tmp[i];
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Returns a compacted page of owned token ids, skipping stale raw enumerable slots.
+     * @param user The owner address to enumerate.
+     * @param offset Raw enumerable index to start scanning from.
+     * @param limit Maximum valid token ids to collect.
+     * @return ids Valid token ids for this page.
+     * @return tokenCount Current live balance reported by DustLock.
+     * @return nextRawOffset Raw enumerable index for the next page.
+     * @return hasMore Whether this page left expected live entries or sparse raw slots unscanned.
+     */
+    function _getValidatedOwnedTokenPage(address user, uint256 offset, uint256 limit)
+        internal
+        view
+        returns (uint256[] memory ids, uint256 tokenCount, uint256 nextRawOffset, bool hasMore)
+    {
+        tokenCount = DUST_LOCK.balanceOf(user);
+        uint256 upperBound = _ownedTokenIndexUpperBound(tokenCount);
+        nextRawOffset = offset > upperBound ? upperBound : offset;
+        uint256 scanStart = nextRawOffset;
+        uint256 liveSlotsRemaining = tokenCount;
+        if (scanStart < tokenCount) liveSlotsRemaining = tokenCount - scanStart;
+        uint256 pageLen = limit < liveSlotsRemaining ? limit : liveSlotsRemaining;
+
+        if (pageLen == 0) return (new uint256[](0), tokenCount, nextRawOffset, false);
+
+        uint256 scanEnd = _rawTokenScanEnd(nextRawOffset, upperBound, limit);
+
+        // Clamp the page buffer to the raw-scan budget so a large `limit` can't over-allocate `tmp`.
+        if (scanEnd > nextRawOffset) {
+            uint256 scanRange = scanEnd - nextRawOffset;
+            if (scanRange < pageLen) pageLen = scanRange;
+        } else {
+            pageLen = 0;
+        }
+
+        uint256[] memory tmp = new uint256[](pageLen);
+        uint256 n;
+        while (n < pageLen && nextRawOffset < scanEnd) {
+            try DUST_LOCK.ownerToNFTokenIdList(user, nextRawOffset) returns (uint256 tokenId) {
+                if (_tokenIsOwnedByUser(user, tokenId)) {
+                    tmp[n] = tokenId;
+                    unchecked {
+                        ++n;
+                    }
+                }
+            } catch {
+                // Skip stale/corrupt enumerable entries and continue until the page is filled.
+            }
+            unchecked {
+                ++nextRawOffset;
+            }
+        }
+        bool returnedEveryCompactEntry =
+            scanStart < tokenCount && nextRawOffset >= tokenCount && n == liveSlotsRemaining;
+        hasMore = nextRawOffset < upperBound && !returnedEveryCompactEntry;
+
+        ids = new uint256[](n);
+        for (uint256 i; i < n;) {
+            ids[i] = tmp[i];
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Returns a bounded raw enumerable index limit for owned-token scans.
+     * @dev `balanceOf` counts live tokens, not max raw index; use DustLock.tokenId() as the global bound, falling back to `tokenCount` if unreadable.
+     * @param tokenCount Current live balance reported by DustLock.
+     * @return upperBound Exclusive raw index upper bound.
+     */
+    function _ownedTokenIndexUpperBound(uint256 tokenCount) internal view returns (uint256 upperBound) {
+        if (tokenCount == 0) return 0;
+        try DUST_LOCK.tokenId() returns (uint256 maxTokenId) {
+            upperBound = maxTokenId;
+        } catch {
+            upperBound = tokenCount;
+        }
+        if (upperBound < tokenCount) upperBound = tokenCount;
+    }
+
+    /**
+     * @notice Returns the exclusive raw index boundary for one paginated scan.
+     * @param start Raw enumerable index where the scan starts.
+     * @param upperBound Global exclusive raw index upper bound.
+     * @param limit Requested valid-token page size.
+     * @return scanEnd Exclusive raw index where this call must stop scanning.
+     */
+    function _rawTokenScanEnd(uint256 start, uint256 upperBound, uint256 limit)
+        internal
+        pure
+        returns (uint256 scanEnd)
+    {
+        if (start >= upperBound || limit == 0) return start;
+
+        uint256 scanBudget;
+        unchecked {
+            scanBudget = limit > type(uint256).max / RAW_TOKEN_SCAN_MULTIPLIER
+                ? type(uint256).max
+                : limit * RAW_TOKEN_SCAN_MULTIPLIER;
+        }
+        scanBudget = scanBudget < MIN_RAW_TOKEN_SCAN_PER_CALL ? MIN_RAW_TOKEN_SCAN_PER_CALL : scanBudget;
+        if (scanBudget > MAX_RAW_TOKEN_SCAN_PER_CALL) {
+            scanBudget = MAX_RAW_TOKEN_SCAN_PER_CALL;
+        }
+
+        uint256 remaining = upperBound - start;
+
+        return start + (scanBudget < remaining ? scanBudget : remaining);
+    }
+
+    /**
+     * @notice Returns true only when `tokenId` is nonzero and DustLock still reports `user` as owner.
+     * @param user Expected owner address.
+     * @param tokenId Token id to verify.
+     * @return ownedByUser True when the token currently belongs to `user`.
+     */
+    function _tokenIsOwnedByUser(address user, uint256 tokenId) internal view returns (bool ownedByUser) {
+        if (tokenId == 0) return false;
+        try DUST_LOCK.ownerOf(tokenId) returns (address owner) {
+            return owner == user;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * @notice Accumulates revenue rewards across RevenueReward's bounded preview chunks.
+     * @param summary Summary object whose `totalRevenue` array is updated in memory.
+     * @param rewardTokens User-requested reward-token order.
+     * @param tokenIds User-related veNFT ids to include in the totals.
+     */
+    function _fillUserRevenueRewards(
+        UserRewardsSummary memory summary,
+        address[] memory rewardTokens,
+        uint256[] memory tokenIds
+    ) internal view {
+        address[] memory sortedRevTokens = _sortAndDedupAddresses(REVENUE_REWARD.getRewardTokens());
+        uint256[] memory sortedTokenIds = _sortAndDedupUint256(tokenIds);
+        if (sortedRevTokens.length == 0 || sortedTokenIds.length == 0) return;
+
+        uint256 maxTokens = REVENUE_REWARD.MAX_TOKENS();
+        uint256 maxTokenIds = REVENUE_REWARD.MAX_TOKENIDS();
+        if (maxTokens == 0 || maxTokenIds == 0) return;
+
+        for (uint256 tokenOffset; tokenOffset < sortedTokenIds.length;) {
+            uint256 tokenChunkLen = sortedTokenIds.length - tokenOffset;
+            if (tokenChunkLen > maxTokenIds) tokenChunkLen = maxTokenIds;
+            uint256[] memory tokenChunk = _copyUint256Slice(sortedTokenIds, tokenOffset, tokenChunkLen);
+
+            for (uint256 rewardOffset; rewardOffset < sortedRevTokens.length;) {
+                uint256 rewardChunkLen = sortedRevTokens.length - rewardOffset;
+                if (rewardChunkLen > maxTokens) rewardChunkLen = maxTokens;
+                address[] memory rewardChunk = _copyAddressSlice(sortedRevTokens, rewardOffset, rewardChunkLen);
+
+                try REVENUE_REWARD.earnedRewardsAll(rewardChunk, tokenChunk) returns (
+                    uint256[][] memory, uint256[] memory totalsPerToken
+                ) {
+                    _accumulateRevenueTotals(summary, rewardTokens, rewardChunk, totalsPerToken);
+                } catch {
+                    // Preserve fail-soft summary semantics for chunks that cannot be previewed.
+                }
+
+                rewardOffset += rewardChunkLen;
+            }
+
+            tokenOffset += tokenChunkLen;
+        }
+    }
+
+    /**
+     * @notice Adds a RevenueReward chunk's totals into a user summary in caller-requested token order.
+     * @param summary Summary object whose `totalRevenue` array is updated in memory.
+     * @param rewardTokens User-requested reward-token order.
+     * @param rewardChunk Reward-token chunk returned by the preview call.
+     * @param totalsPerToken Totals parallel to `rewardChunk`.
+     */
+    function _accumulateRevenueTotals(
+        UserRewardsSummary memory summary,
+        address[] memory rewardTokens,
+        address[] memory rewardChunk,
+        uint256[] memory totalsPerToken
+    ) internal pure {
+        for (uint256 r; r < rewardChunk.length;) {
+            address rewardToken = rewardChunk[r];
+            if (r < totalsPerToken.length) {
+                for (uint256 j; j < rewardTokens.length;) {
+                    if (rewardTokens[j] == rewardToken) {
+                        summary.totalRevenue[j] += totalsPerToken[r];
+                    }
+                    unchecked {
+                        ++j;
+                    }
+                }
+            }
+            unchecked {
+                ++r;
             }
         }
     }
@@ -397,18 +609,17 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         public
         view
         override
-        returns (address[] memory assets, uint256[] memory amounts)
+        returns (UserEmissionAsset[] memory breakdown)
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
-        assets = _getAllLendingPoolAssets();
-        uint256 n = assets.length;
-        amounts = new uint256[](n);
-        for (uint256 i; i < n;) {
-            amounts[i] = _tryUserRewardsSingle(user, assets[i], rewardToken);
-            unchecked {
-                ++i;
-            }
-        }
+
+        return NeverlandUiEmissionLibrary.getUserEmissionBreakdown(
+            DUST_REWARDS_CONTROLLER,
+            AAVE_LENDING_POOL_ADDRESS_PROVIDER,
+            PENDLE_AUSD_POOL_ADDRESSES_PROVIDER,
+            user,
+            rewardToken
+        );
     }
 
     /// @inheritdoc INeverlandUiProvider
@@ -420,16 +631,9 @@ contract NeverlandUiProvider is INeverlandUiProvider {
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
 
-        rewardTokens = DUST_REWARDS_CONTROLLER.getRewardsList();
-        uint256 n = rewardTokens.length;
-        totalRewards = new uint256[](n);
-
-        for (uint256 i; i < n;) {
-            totalRewards[i] = _getUserEmissionRewards(user, rewardTokens[i]);
-            unchecked {
-                ++i;
-            }
-        }
+        return NeverlandUiEmissionLibrary.getUserEmissions(
+            DUST_REWARDS_CONTROLLER, AAVE_LENDING_POOL_ADDRESS_PROVIDER, PENDLE_AUSD_POOL_ADDRESSES_PROVIDER, user
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -445,16 +649,13 @@ contract NeverlandUiProvider is INeverlandUiProvider {
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
 
-        uint256 tokenCount = DUST_LOCK.balanceOf(user);
+        uint256[] memory ownedTokenIds = _getValidatedOwnedTokenIds(user);
+        uint256 tokenCount = ownedTokenIds.length;
         uint256 unlockCount = 0;
         for (uint256 i; i < tokenCount;) {
-            try DUST_LOCK.ownerToNFTokenIdList(user, i) returns (uint256 tokenId) {
-                IDustLock.LockedBalance memory locked = DUST_LOCK.locked(tokenId);
-                if (!locked.isPermanent && locked.end > block.timestamp) {
-                    ++unlockCount;
-                }
-            } catch {
-                // Skip corrupted enumeration entries
+            IDustLock.LockedBalance memory locked = DUST_LOCK.locked(ownedTokenIds[i]);
+            if (!locked.isPermanent && locked.end > block.timestamp) {
+                ++unlockCount;
             }
             unchecked {
                 ++i;
@@ -467,17 +668,14 @@ contract NeverlandUiProvider is INeverlandUiProvider {
 
         uint256 index = 0;
         for (uint256 i; i < tokenCount;) {
-            try DUST_LOCK.ownerToNFTokenIdList(user, i) returns (uint256 tokenId) {
-                IDustLock.LockedBalance memory locked = DUST_LOCK.locked(tokenId);
+            uint256 tokenId = ownedTokenIds[i];
+            IDustLock.LockedBalance memory locked = DUST_LOCK.locked(tokenId);
 
-                if (!locked.isPermanent && locked.end > block.timestamp) {
-                    unlockTimes[index] = locked.end;
-                    amounts[index] = uint256(locked.amount);
-                    tokenIds[index] = tokenId;
-                    ++index;
-                }
-            } catch {
-                // Skip corrupted enumeration entries
+            if (!locked.isPermanent && locked.end > block.timestamp) {
+                unlockTimes[index] = locked.end;
+                amounts[index] = uint256(locked.amount);
+                tokenIds[index] = tokenId;
+                ++index;
             }
             unchecked {
                 ++i;
@@ -493,12 +691,8 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         returns (EssentialUserView memory)
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
-        EssentialUserView memory v;
-        v.user = getUserDashboard(user, offset, limit);
-        v.globalStats = getGlobalStats();
-        (v.emissions.rewardTokens, v.emissions.totalRewards) = getUserEmissions(user);
-        v.marketData = getMarketData();
-        return v;
+
+        return _essentialFromDashboard(user, getUserDashboard(user, offset, limit));
     }
 
     /// @inheritdoc INeverlandUiProvider
@@ -506,18 +700,49 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         public
         view
         override
-        returns (ExtendedUserView memory)
+        returns (ExtendedUserView memory ext)
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
-        ExtendedUserView memory ext;
 
-        // Build unlock schedule for the requested page only using dashboard page tokenIds
         UserDashboardData memory pageDash = getUserDashboard(user, offset, limit);
-        uint256 nT = pageDash.tokenIds.length;
+        ext.unlockSchedule = _unlockScheduleFromLocks(pageDash.locks, pageDash.tokenIds);
+        ext.allPrices = getAllPrices();
+    }
+
+    /**
+     * @notice Builds the essential user view from an already-computed dashboard page.
+     * @dev Lets callers (notably the full bundle) page a user's tokens once and reuse the result.
+     * @param user Token owner being viewed
+     * @param dash Pre-computed dashboard page for `user`
+     * @return v Essential user view (dashboard + global stats + emissions + market)
+     */
+    function _essentialFromDashboard(address user, UserDashboardData memory dash)
+        internal
+        view
+        returns (EssentialUserView memory v)
+    {
+        v.user = dash;
+        v.globalStats = getGlobalStats();
+        (v.emissions.rewardTokens, v.emissions.totalRewards) = getUserEmissions(user);
+        v.marketData = getMarketData();
+    }
+
+    /**
+     * @notice Derives the future unlock schedule from an already-fetched dashboard page.
+     * @dev Filters to unexpired non-permanent locks; reuses the dashboard `locks` to avoid re-reading DustLock.
+     * @param locks Per-token lock info (parallel to `tokenIds`)
+     * @param tokenIds Token ids parallel to `locks`
+     * @return schedule Unlock times, amounts, and token ids for unexpired non-permanent locks
+     */
+    function _unlockScheduleFromLocks(LockInfo[] memory locks, uint256[] memory tokenIds)
+        internal
+        view
+        returns (UnlockSchedule memory schedule)
+    {
+        uint256 n = locks.length;
         uint256 count;
-        for (uint256 i; i < nT;) {
-            IDustLock.LockedBalance memory lockInfo = DUST_LOCK.locked(pageDash.tokenIds[i]);
-            if (!lockInfo.isPermanent && lockInfo.end > block.timestamp) {
+        for (uint256 i; i < n;) {
+            if (!locks[i].isPermanent && locks[i].end > block.timestamp) {
                 unchecked {
                     ++count;
                 }
@@ -526,17 +751,16 @@ contract NeverlandUiProvider is INeverlandUiProvider {
                 ++i;
             }
         }
-        uint256[] memory uts = new uint256[](count);
-        uint256[] memory ams = new uint256[](count);
-        uint256[] memory tids = new uint256[](count);
+
+        schedule.unlockTimes = new uint256[](count);
+        schedule.amounts = new uint256[](count);
+        schedule.tokenIds = new uint256[](count);
         uint256 idx;
-        for (uint256 i; i < nT;) {
-            uint256 tid = pageDash.tokenIds[i];
-            IDustLock.LockedBalance memory lockInfo2 = DUST_LOCK.locked(tid);
-            if (!lockInfo2.isPermanent && lockInfo2.end > block.timestamp) {
-                uts[idx] = lockInfo2.end;
-                ams[idx] = uint256(lockInfo2.amount);
-                tids[idx] = tid;
+        for (uint256 i; i < n;) {
+            if (!locks[i].isPermanent && locks[i].end > block.timestamp) {
+                schedule.unlockTimes[idx] = locks[i].end;
+                schedule.amounts[idx] = locks[i].amount;
+                schedule.tokenIds[idx] = tokenIds[i];
                 unchecked {
                     ++idx;
                 }
@@ -545,10 +769,6 @@ contract NeverlandUiProvider is INeverlandUiProvider {
                 ++i;
             }
         }
-        ext.unlockSchedule = UnlockSchedule({unlockTimes: uts, amounts: ams, tokenIds: tids});
-        ext.allPrices = getAllPrices();
-
-        return ext;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -564,17 +784,24 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         uint256[] memory rates = new uint256[](length);
         uint256[] memory epochRewards = new uint256[](length);
         uint256[] memory nextEpochRewards = new uint256[](length);
+        uint256[] memory followingEpochRewards = new uint256[](length);
 
         uint256 currentEpoch = EpochTimeLibrary.epochStart(block.timestamp);
         uint256 nextEpoch = EpochTimeLibrary.epochNext(block.timestamp);
+        // DURATION == WEEK, so this is the epoch-after-next bucket funded by notifyRewardAmountForFollowingEpoch.
+        uint256 followingEpoch = EpochTimeLibrary.epochNext(nextEpoch);
 
         for (uint256 i; i < length;) {
             address token = rewardTokens[i];
-            balances[i] = IERC20(token).balanceOf(address(REVENUE_REWARD));
+            (bool ok, uint256 bal) = Erc20BalanceLibrary.tryBalanceOf(token, address(REVENUE_REWARD));
+            if (!ok) revert BalanceUnreadable(token, address(REVENUE_REWARD));
+            balances[i] = bal;
+
             uint256 perEpoch = REVENUE_REWARD.tokenRewardsPerEpoch(token, currentEpoch);
             rates[i] = perEpoch;
             epochRewards[i] = perEpoch;
             nextEpochRewards[i] = REVENUE_REWARD.tokenRewardsPerEpoch(token, nextEpoch);
+            followingEpochRewards[i] = REVENUE_REWARD.tokenRewardsPerEpoch(token, followingEpoch);
             unchecked {
                 ++i;
             }
@@ -588,7 +815,9 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         m.currentEpoch = DUST_LOCK.epoch();
         m.epochRewards = epochRewards;
         m.nextEpochRewards = nextEpochRewards;
-        m.totalValueLockedUSD = DUST_HELPER.getDustValueInUSD(DUST_LOCK.supply());
+        m.totalValueLockedUSD = _getDustValueInUSDOrZero(DUST_LOCK.supply());
+        m.followingEpochRewards = followingEpochRewards;
+
         return m;
     }
 
@@ -603,18 +832,22 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         p.lastUpdated = new uint256[](length);
 
         p.tokens[0] = DUST_LOCK.token();
-        (p.prices[0],) = DUST_HELPER.getPrice();
-        p.lastUpdated[0] = DUST_HELPER.latestTimestamp();
+        p.prices[0] = _getDustPriceOrZero();
+        p.lastUpdated[0] = _getDustLatestTimestampOrZero();
         for (uint256 i; i < rewardTokens.length;) {
             uint256 idx = i + 1;
             address t = rewardTokens[i];
+            uint256 price = _getTokenPriceInUSD(t);
             p.tokens[idx] = t;
-            p.prices[idx] = _getTokenPriceInUSD(t);
-            p.lastUpdated[idx] = block.timestamp;
+            p.prices[idx] = price;
+            if (price != 0) {
+                p.lastUpdated[idx] = t == DUST_LOCK.token() ? _getDustLatestTimestampOrZero() : block.timestamp;
+            }
             unchecked {
                 ++i;
             }
         }
+
         return p;
     }
 
@@ -694,15 +927,35 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         uint256 length = rewardTokens.length;
         uint256[] memory revenueRewardsResult = new uint256[](length);
 
-        // Only call earnedRewardsAll if there are reward tokens
         if (rewardTokens.length > 0) {
-            try REVENUE_REWARD.earnedRewardsAll(rewardTokens, tokenIds) returns (
-                uint256[][] memory matrix, uint256[] memory
-            ) {
-                revenueRewardsResult = matrix.length > 0 ? matrix[0] : new uint256[](length);
-            } catch {
-                // If earnedRewardsAll fails (e.g., UnknownRewardToken), return zeros
-                revenueRewardsResult = new uint256[](length);
+            address[] memory sortedRewardTokens = _sortAndDedupAddresses(_copyAddressArray(rewardTokens));
+            uint256 maxTokens = REVENUE_REWARD.MAX_TOKENS();
+            for (uint256 offset; offset < sortedRewardTokens.length;) {
+                uint256 chunkLen = sortedRewardTokens.length - offset;
+                if (chunkLen > maxTokens) chunkLen = maxTokens;
+
+                address[] memory chunk = _copyAddressSlice(sortedRewardTokens, offset, chunkLen);
+                try REVENUE_REWARD.earnedRewardsAll(chunk, tokenIds) returns (
+                    uint256[][] memory matrix, uint256[] memory
+                ) {
+                    if (matrix.length > 0) {
+                        for (uint256 c; c < chunkLen;) {
+                            for (uint256 j; j < length;) {
+                                if (rewardTokens[j] == chunk[c]) {
+                                    revenueRewardsResult[j] = matrix[0][c];
+                                }
+                                unchecked {
+                                    ++j;
+                                }
+                            }
+                            unchecked {
+                                ++c;
+                            }
+                        }
+                    }
+                } catch {}
+
+                offset += chunkLen;
             }
         }
 
@@ -713,8 +966,69 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         return summary;
     }
 
+    /**
+     * @notice Returns a fresh in-memory copy of `arr` so callers can mutate without aliasing.
+     * @dev Used to detach paginated view results from cached arrays returned by upstream contracts.
+     * @param arr Source array to copy.
+     * @return copy Newly-allocated array with the same length and elements as `arr`.
+     */
+    function _copyAddressArray(address[] memory arr) internal pure returns (address[] memory copy) {
+        uint256 len = arr.length;
+        copy = new address[](len);
+        for (uint256 i; i < len;) {
+            copy[i] = arr[i];
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Returns a fresh in-memory `len`-element slice of `arr` starting at `offset`.
+     * @dev Caller is responsible for ensuring `offset + len <= arr.length`; out-of-bounds reads
+     *      revert via the memory access check.
+     * @param arr Source array to slice.
+     * @param offset Index of the first element to copy.
+     * @param len Number of elements to copy.
+     * @return slice Newly-allocated array containing `arr[offset..offset+len)`.
+     */
+    function _copyAddressSlice(address[] memory arr, uint256 offset, uint256 len)
+        internal
+        pure
+        returns (address[] memory slice)
+    {
+        slice = new address[](len);
+        for (uint256 i; i < len;) {
+            slice[i] = arr[offset + i];
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Returns a fresh in-memory `len`-element slice of `arr` starting at `offset`.
+     * @param arr Source array to slice.
+     * @param offset Index of the first element to copy.
+     * @param len Number of elements to copy.
+     * @return slice Newly-allocated array containing `arr[offset..offset+len)`.
+     */
+    function _copyUint256Slice(uint256[] memory arr, uint256 offset, uint256 len)
+        internal
+        pure
+        returns (uint256[] memory slice)
+    {
+        slice = new uint256[](len);
+        for (uint256 i; i < len;) {
+            slice[i] = arr[offset + i];
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
     /// @inheritdoc INeverlandUiProvider
-    function getProtocolMeta() public view returns (ProtocolMeta memory meta) {
+    function getProtocolMeta() public view override returns (ProtocolMeta memory meta) {
         meta.dustLock = address(DUST_LOCK);
         meta.revenueReward = address(REVENUE_REWARD);
         meta.dustRewardsController = address(DUST_REWARDS_CONTROLLER);
@@ -758,9 +1072,12 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         returns (UiFullBundle memory bundle)
     {
         CommonChecksLibrary.revertIfZeroAddress(user);
+
+        UserDashboardData memory dash = getUserDashboard(user, offset, limit);
         bundle.meta = getProtocolMeta();
-        bundle.essential = getEssentialUserView(user, offset, limit);
-        bundle.extended = getExtendedUserView(user, offset, limit);
+        bundle.essential = _essentialFromDashboard(user, dash);
+        bundle.extended.unlockSchedule = _unlockScheduleFromLocks(dash.locks, dash.tokenIds);
+        bundle.extended.allPrices = getAllPrices();
         bundle.network = getNetworkData();
     }
 
@@ -775,108 +1092,30 @@ contract NeverlandUiProvider is INeverlandUiProvider {
      * @return totalRewards Total emission rewards for the user
      */
     function _getUserEmissionRewards(address user, address rewardToken) internal view returns (uint256 totalRewards) {
-        address[] memory assets = _getAllLendingPoolAssets();
-
-        for (uint256 i = 0; i < assets.length; ++i) {
-            address asset = assets[i];
-            totalRewards += _tryUserRewardsSingle(user, asset, rewardToken);
-        }
+        return NeverlandUiEmissionLibrary.getUserEmissionRewards(
+            DUST_REWARDS_CONTROLLER,
+            AAVE_LENDING_POOL_ADDRESS_PROVIDER,
+            PENDLE_AUSD_POOL_ADDRESSES_PROVIDER,
+            user,
+            rewardToken
+        );
     }
 
     /**
-     * @notice Get all lending pool assets from Aave Protocol Data Provider
-     * @return assets Array of lending pool asset addresses (ATokens + Variable Debt Tokens)
+     * @notice Returns token USD price (8 decimals) using DustHelper for DUST and Aave Oracle for pool assets
+     * @dev Returns 0 if price is unavailable (graceful degradation) to prevent UI DoS from missing oracle prices
+     * @param token The token address
+     * @return price USD price (8 decimals), or 0 if unavailable
      */
-    function _getAllLendingPoolAssets() internal view returns (address[] memory assets) {
-        address dataProviderAddr = AAVE_LENDING_POOL_ADDRESS_PROVIDER.getPoolDataProvider();
-        if (dataProviderAddr == address(0)) {
-            return new address[](0);
-        }
+    function _getTokenPriceInUSD(address token) internal view returns (uint256 price) {
+        if (token == DUST_LOCK.token()) return _getDustPriceOrZero();
 
-        IPoolDataProvider dp = IPoolDataProvider(dataProviderAddr);
-        IPoolDataProvider.TokenData[] memory reserveTokens = dp.getAllReservesTokens();
-
-        uint256 reserveTokensLen = reserveTokens.length;
-        if (reserveTokensLen == 0) return new address[](0);
-
-        assets = new address[](reserveTokensLen * 2);
-        uint256 assetCount = 0;
-
-        for (uint256 i = 0; i < reserveTokensLen; ++i) {
-            try dp.getReserveTokensAddresses(reserveTokens[i].tokenAddress) returns (
-                address aTokenAddr, address, /*stableDebt*/ address variableDebtTokenAddr
-            ) {
-                if (aTokenAddr != address(0)) {
-                    assets[assetCount] = aTokenAddr;
-                    unchecked {
-                        ++assetCount;
-                    }
-                }
-
-                if (variableDebtTokenAddr != address(0)) {
-                    assets[assetCount] = variableDebtTokenAddr;
-                    unchecked {
-                        ++assetCount;
-                    }
-                }
-            } catch {
-                continue;
-            }
-        }
-
-        if (assetCount != reserveTokensLen * 2) {
-            address[] memory resizedAssets = new address[](assetCount);
-            for (uint256 i = 0; i < assetCount; ++i) {
-                resizedAssets[i] = assets[i];
-            }
-            assets = resizedAssets;
-        }
-    }
-
-    /**
-     * @notice Get user's balance in a specific lending pool asset
-     * @param user User address
-     * @param asset Asset address (aToken)
-     * @return balance User's balance in the asset
-     */
-    function _getUserAssetBalance(address user, address asset) internal view returns (uint256 balance) {
-        try IERC20(asset).balanceOf(user) returns (uint256 userBalance) {
-            balance = userBalance;
-        } catch {
-            balance = 0;
-        }
-    }
-
-    /// @notice Tries to read user rewards via controller for a single asset
-    /// @param user The user address
-    /// @param asset The asset address
-    /// @param rewardToken The reward token address
-    /// @return amount Rewards amount (0 on failure)
-    function _tryUserRewardsSingle(address user, address asset, address rewardToken)
-        internal
-        view
-        returns (uint256 amount)
-    {
-        address[] memory singleAsset = new address[](1);
-        singleAsset[0] = asset;
-        try DUST_REWARDS_CONTROLLER.getUserRewards(singleAsset, user, rewardToken) returns (uint256 userRewards) {
-            return userRewards;
+        address oracleAddr;
+        try AAVE_LENDING_POOL_ADDRESS_PROVIDER.getPriceOracle() returns (address resolvedOracle) {
+            oracleAddr = resolvedOracle;
         } catch {
             return 0;
         }
-    }
-
-    /// @notice Returns token USD price (8 decimals) using DustHelper for DUST and Aave Oracle for pool assets
-    /// @dev Returns 0 if price is unavailable (graceful degradation) to prevent UI DoS from missing oracle prices
-    /// @param token The token address
-    /// @return price USD price (8 decimals), or 0 if unavailable
-    function _getTokenPriceInUSD(address token) internal view returns (uint256 price) {
-        if (token == DUST_LOCK.token()) {
-            (price,) = DUST_HELPER.getPrice();
-            return price;
-        }
-
-        address oracleAddr = AAVE_LENDING_POOL_ADDRESS_PROVIDER.getPriceOracle();
         if (oracleAddr == address(0)) return 0;
 
         IPriceOracleGetter oracle = IPriceOracleGetter(oracleAddr);
@@ -897,6 +1136,47 @@ contract NeverlandUiProvider is INeverlandUiProvider {
         if (p < 1) return 0;
 
         if (unit == USD_PRICE_UNIT) return p;
+        if (p > type(uint256).max / USD_PRICE_UNIT) return 0;
         return (p * USD_PRICE_UNIT) / unit;
+    }
+
+    /**
+     * @notice Reads the DUST helper price without letting helper/oracle failures revert UI bundles.
+     * @return price DUST USD price in 8 decimals, or zero when unavailable.
+     */
+    function _getDustPriceOrZero() internal view returns (uint256 price) {
+        try DUST_HELPER.getPrice() returns (
+            uint256 dustPrice,
+            bool /* fromOracle */
+        ) {
+            return dustPrice;
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * @notice Reads the DUST helper timestamp without letting helper/oracle failures revert UI bundles.
+     * @return timestamp Latest DUST helper timestamp, or zero when unavailable.
+     */
+    function _getDustLatestTimestampOrZero() internal view returns (uint256 timestamp) {
+        try DUST_HELPER.latestTimestamp() returns (uint256 latestTimestamp) {
+            return latestTimestamp;
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * @notice Converts DUST amount to USD without letting helper/oracle failures revert UI bundles.
+     * @param dustAmount DUST amount to value.
+     * @return valueUsd USD value in helper decimals, or zero when unavailable.
+     */
+    function _getDustValueInUSDOrZero(uint256 dustAmount) internal view returns (uint256 valueUsd) {
+        try DUST_HELPER.getDustValueInUSD(dustAmount) returns (uint256 value) {
+            return value;
+        } catch {
+            return 0;
+        }
     }
 }

@@ -8,24 +8,31 @@ pragma solidity 0.8.30;
  * @dev Aggregates data from multiple contracts for efficient frontend queries
  */
 interface INeverlandUiProvider {
-    /// @notice Thrown when the price oracle for non-DUST assets is not configured or inaccessible
-    error PriceOracleUnavailable();
-
     /// @notice Thrown when a non-DUST asset price cannot be retrieved or is zero
     error AssetPriceUnavailable(address token);
+
+    /// @notice Thrown when an account's token balance cannot be read (no code, revert, or short return)
+    error BalanceUnreadable(address token, address account);
+
+    /// @notice Thrown when the price oracle for non-DUST assets is not configured or inaccessible
+    error PriceOracleUnavailable();
 
     /*//////////////////////////////////////////////////////////////
                                STRUCTS
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Complete dashboard data for a user
+     * @notice Dashboard data for a user over one raw DustLock enumeration page
+     * @dev Arrays are compacted to valid veNFTs, so `tokenIds.length` is not a pagination cursor; advance `offset` to `nextRawOffset` and stop when `hasMore` is false.
      * @param user The user address
-     * @param tokenIds Array of all veNFT token IDs owned by the user
-     * @param locks Array of lock information for each token
-     * @param rewardSummaries Array of reward summaries for each token
-     * @param totalVotingPower User's total current voting power across all tokens
-     * @param totalLockedAmount Total DUST locked across all user's tokens
+     * @param tokenIds Compacted array of valid veNFT token IDs from the page
+     * @param locks Lock information for each returned token
+     * @param rewardSummaries Reward summaries for each returned token
+     * @param totalVotingPower Current voting power across returned tokens
+     * @param totalLockedAmount Total DUST locked across returned tokens
+     * @param rawTokenCount Raw `DustLock.balanceOf(user)` enumeration length at query time
+     * @param nextRawOffset Raw offset to pass as the next call's `offset` after skipped entries are scanned
+     * @param hasMore True when the page left expected live entries or sparse raw slots unscanned
      */
     struct UserDashboardData {
         address user;
@@ -34,6 +41,9 @@ interface INeverlandUiProvider {
         RewardSummary[] rewardSummaries;
         uint256 totalVotingPower;
         uint256 totalLockedAmount;
+        uint256 rawTokenCount;
+        uint256 nextRawOffset;
+        bool hasMore;
     }
 
     /**
@@ -41,10 +51,10 @@ interface INeverlandUiProvider {
      * @param tokenId The veNFT token ID
      * @param amount Amount of DUST locked
      * @param end Unlock timestamp (0 for permanent locks)
-     * @param effectiveStart Effective start time for weighted calculations
+     * @param effectiveStart Synthetic early-withdraw penalty anchor, not creation or served time
      * @param isPermanent Whether this is a permanent lock
      * @param votingPower Current voting power of this token
-     * @param rewardReceiver Address that receives rewards (for self-repaying loans)
+     * @param rewardReceiver Address that receives rewards (for auto modes)
      * @param owner Current owner of the token
      */
     struct LockInfo {
@@ -61,7 +71,7 @@ interface INeverlandUiProvider {
     /**
      * @notice Summary of rewards for a specific veNFT token
      * @param tokenId The veNFT token ID
-     * @param revenueRewards Array of pending revenue rewards per reward token
+     * @param revenueRewards Live token-accrued revenue rewards per reward token; excludes receiver-level deferred rewards
      * @param rewardTokens Array of reward token addresses
      * @dev Emission rewards are per-user (not per-token), use getUserEmissions() instead
      */
@@ -96,11 +106,13 @@ interface INeverlandUiProvider {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Get user dashboard with all veNFT positions and rewards
+     * @notice Get one raw DustLock enumeration page of user veNFT positions and rewards
+     * @dev Scans DustLock's raw owner-token enumeration from `offset`, skipping stale/zero/reverting slots, until `limit` valid veNFTs or the per-call scan budget is hit. Paginate off `nextRawOffset`/`hasMore`, never off `tokenIds.length`.
      * @param user The user address to get data for
      * @param offset Start index for paginated token list
      * @param limit Maximum number of tokens to include
-     * @return Complete user dashboard information
+     * @return Compacted dashboard information for the requested raw page, including
+     *         `rawTokenCount`, `nextRawOffset`, and `hasMore` pagination metadata
      */
     function getUserDashboard(address user, uint256 offset, uint256 limit)
         external
@@ -131,9 +143,22 @@ interface INeverlandUiProvider {
     }
 
     /**
+     * @notice Per-asset emission reward row for a specific reward token
+     * @param asset Emission asset address, usually an aToken or variable debt token
+     * @param amount Accrued reward amount for the asset and queried reward token
+     * @param symbol Asset ERC20 symbol returned by the asset contract
+     * @param isDebt True when the asset is a variable debt token
+     */
+    struct UserEmissionAsset {
+        address asset;
+        uint256 amount;
+        string symbol;
+        bool isDebt;
+    }
+
+    /**
      * @notice Returns comprehensive reward summary for a user across specified reward tokens
-     * @dev Aggregates all rewards earned by user's veNFTs for the given tokens
-     *      Provides separate totals for revenue rewards and emission rewards
+     * @dev Unpaginated aggregate over owned veNFTs plus the auto-mode token set; prefer `getUserDashboard`/`getUiFullBundle` for large collections. Totals are RevenueReward-side accruals only (UserVault-realized and RevenueLending lender tabs are excluded by design).
      * @param user The address to query rewards for
      * @param rewardTokens Array of reward token addresses to check
      * @return summary User rewards summary containing all reward arrays
@@ -144,21 +169,22 @@ interface INeverlandUiProvider {
         returns (UserRewardsSummary memory summary);
 
     /**
-     * @notice Returns per-asset emission rewards for a specific reward token
-     * @dev Lists Aave assets (aTokens and variable debt tokens) that contribute to the user's emissions
-     *      and the corresponding reward amounts per asset for the given reward token
+     * @notice Returns per-asset emission rewards and labels for a specific reward token
+     * @dev Lists Aave assets that contribute to the user's emissions with the asset token symbol and side.
      * @param user The address to query rewards for
      * @param rewardToken The reward token address to break down
-     * @return assets Array of asset addresses contributing to emissions
-     * @return amounts Array of rewards per asset (parallel to `assets`)
+     * @return breakdown Array of per-asset emission rows
      */
     function getUserEmissionBreakdown(address user, address rewardToken)
         external
         view
-        returns (address[] memory assets, uint256[] memory amounts);
+        returns (UserEmissionAsset[] memory breakdown);
 
     /**
      * @notice Get unlock schedule for user's tokens
+     * @dev Unpaginated over all currently owned veNFTs. Prefer
+     *      `getUserDashboard` or `getExtendedUserView` for bounded UI reads,
+     *      especially for accounts with many veNFTs.
      * @param user The user address
      * @return unlockTimes Array of unlock timestamps
      * @return amounts Array of amounts unlocking at each timestamp
@@ -176,13 +202,14 @@ interface INeverlandUiProvider {
     /**
      * @notice Market and economic data
      * @param rewardTokens Array of reward token addresses
-     * @param rewardTokenBalances Available reward balances in contracts
+     * @param rewardTokenBalances Raw reward token balances held by RevenueReward
      * @param distributionRates Rewards distributed per epoch (current epoch)
      * @param nextEpochTimestamp When next reward epoch starts
      * @param currentEpoch Current epoch number
      * @param epochRewards Total rewards for current epoch per token
      * @param nextEpochRewards Total rewards already scheduled for the next epoch per token
      * @param totalValueLockedUSD Total protocol TVL in USD (8 decimals)
+     * @param followingEpochRewards Total rewards already scheduled for the epoch after next per token
      */
     struct MarketData {
         address[] rewardTokens;
@@ -193,6 +220,7 @@ interface INeverlandUiProvider {
         uint256[] epochRewards;
         uint256[] nextEpochRewards;
         uint256 totalValueLockedUSD;
+        uint256[] followingEpochRewards;
     }
 
     /**
@@ -225,7 +253,7 @@ interface INeverlandUiProvider {
      * @notice Price information for all tokens
      * @param tokens Token addresses
      * @param prices Token prices in USD (8 decimals)
-     * @param lastUpdated Price update timestamps
+     * @param lastUpdated Price timestamps. DUST uses DustHelper's latest timestamp; non-DUST uses read time when price is available and zero when unavailable.
      */
     struct PriceData {
         address[] tokens;
@@ -328,13 +356,11 @@ interface INeverlandUiProvider {
     /**
      * @notice Per-asset emission breakdown for a given reward token
      * @param rewardToken Emission reward token address
-     * @param assets List of contributing assets (aTokens and variable debt tokens)
-     * @param amounts Parallel list of rewards per asset
+     * @param assets List of contributing asset rows
      */
     struct EmissionAssetBreakdown {
         address rewardToken;
-        address[] assets;
-        uint256[] amounts;
+        UserEmissionAsset[] assets;
     }
 
     /*//////////////////////////////////////////////////////////////

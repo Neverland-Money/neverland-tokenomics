@@ -32,7 +32,7 @@ interface IUserVault {
      * @param userVault The UserVault that executed the repayment
      * @param poolAddressesProvider The Aave pool addresses provider used
      * @param debtToken The repaid debt token address
-     * @param amount The repaid amount
+     * @param amount The requested amount passed to the lending pool repayment call
      */
     event LoanSelfRepaid(
         address indexed user,

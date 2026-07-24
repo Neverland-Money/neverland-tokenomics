@@ -130,6 +130,20 @@ const MAINNET_FEEDS: Record<string, OracleFeedConfig> = {
     decimals: 8,
     description: "RedStone AZND / USD",
   },
+  YZUSD_USD: {
+    id: "YZUSD_USD",
+    symbol: "yzUSD/USD",
+    address: "0xA0E2bEC2B69dAf7e1037bb9999110CAfBd779Ab5",
+    decimals: 18,
+    description: "Chainlink yzUSD / USD",
+  },
+  SYZUSD_YZUSD: {
+    id: "SYZUSD_YZUSD",
+    symbol: "syzUSD/yzUSD",
+    address: "0x1Bd7e3865Bba838524bCCAe84A7a0cA635D65071",
+    decimals: 18,
+    description: "Chainlink syzUSD / yzUSD",
+  },
 };
 
 const MAINNET_RESERVES: Record<string, OracleReserveConfig> = {
@@ -162,6 +176,11 @@ const MAINNET_RESERVES: Record<string, OracleReserveConfig> = {
     symbol: "earnAUSD",
     reserveAddress: "0x103222f020e98Bba0AD9809A011FDF8e6F067496",
     reserveDecimals: 6,
+  },
+  SYZUSD: {
+    symbol: "syzUSD",
+    reserveAddress: "0x484be0540aD49f351eaa04eeB35dF0f937D4E73f",
+    reserveDecimals: 18,
   },
   LOAZND: {
     symbol: "loAZND",
@@ -208,6 +227,15 @@ const MAINNET_ORACLE_CONFIG: OracleNetworkConfig = {
       reserveSymbol: "EARNAUSD",
       ratioFeed: MAINNET_FEEDS.EARNAUSD_AUSD,
       baseFeed: MAINNET_FEEDS.AUSD_USD,
+      source: "aave-v3-neverland",
+      maxDelay: ORACLE_MAX_DELAY,
+    },
+    {
+      id: "syzusd-usd",
+      label: "SYZUSD/USD via SYZUSD/YZUSD * YZUSD/USD",
+      reserveSymbol: "SYZUSD",
+      ratioFeed: MAINNET_FEEDS.SYZUSD_YZUSD,
+      baseFeed: MAINNET_FEEDS.YZUSD_USD,
       source: "aave-v3-neverland",
       maxDelay: ORACLE_MAX_DELAY,
     },
