@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: en-US
+
+reviews:
+  auto_review:
+    auto_pause_after_reviewed_commits: 0
+  path_filters:
+    # Generated outputs, installed dependencies, and local agent metadata.
+    - "!artifacts/**"
+    - "!out/**"
+    - "!cache/**"
+    - "!cache_hardhat/**"
+    - "!dist/**"
+    - "!generated/**"
+    - "!vendor/**"
+    - "!node_modules/**"
+    - "!.yarn/**"
+    - "!.remember/**"
+    - "!typechain/**"
+    - "!typechain-v5/**"
+    - "!typechain-v6/**"
+    - "!remappings.package.txt"
+    - "!**/*.tgz"
+
+    # Root coverage output; test/**/coverage/ contains maintained Solidity tests.
+    - "!coverage/**"
+    - "!lcov.info"
+    - "!.gas-snapshot"
+
+    # Socket handles the npm lockfile; manifests and Foundry pins stay reviewed.
+    - "!yarn.lock"
