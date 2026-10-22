@@ -89,6 +89,26 @@ const abis = Object.values(publicExports).filter(Array.isArray);
 for (const abi of abis) {
   assert.equal(new Interface(abi).fragments.length, abi.length);
 }
+const legacyRemappings = readFileSync(
+  require.resolve("@neverland-money/tokenomics-core/remappings"),
+  "utf8"
+)
+  .trim()
+  .split("\n")
+  .map((line) => line.split("="));
+const legacySourceName = (source) => {
+  assert(
+    source.startsWith("project/"),
+    `unexpected compiler source: ${source}`
+  );
+  const local = source.slice("project/".length);
+  const mapping = legacyRemappings.find(([, destination]) =>
+    local.startsWith(destination.replace(/^vendor\//, "lib/"))
+  );
+  return mapping
+    ? mapping[0] + local.slice(mapping[1].replace(/^vendor\//, "lib/").length)
+    : local;
+};
 let checkedFactories = 0;
 let checkedLinks = 0;
 for (const file of files(join(packageRoot, "artifacts/src"))) {
@@ -122,17 +142,29 @@ for (const file of files(join(packageRoot, "artifacts/src"))) {
   }
   if (current.bytecode !== "0x") {
     assert.equal(candidate.bytecode, current.bytecode);
-    const links = Object.entries(current.linkReferences).flatMap(
-      ([source, libraries]) =>
-        Object.keys(libraries).map((name) => [
-          `${source}:${name}`,
-          addresses.addresses.Dust,
-        ])
-    );
+    const links = [];
+    let directlyLinked = current.bytecode;
+    for (const [source, libraries] of Object.entries(current.linkReferences)) {
+      for (const [name, references] of Object.entries(libraries)) {
+        const address = `0x${(4096 + links.length).toString(16).padStart(40, "0")}`;
+        links.push([`${legacySourceName(source)}:${name}`, address]);
+        for (const { start, length } of references) {
+          assert.equal(length, 20);
+          const position = 2 + start * 2;
+          directlyLinked =
+            directlyLinked.slice(0, position) +
+            address.slice(2) +
+            directlyLinked.slice(position + 40);
+        }
+      }
+    }
     if (links.length) {
-      assert.match(
-        candidate.linkBytecode(Object.fromEntries(links)),
-        /^0x[0-9a-f]+$/i
+      const linked = candidate.linkBytecode(Object.fromEntries(links));
+      assert.match(linked, /^0x[0-9a-f]+$/i);
+      assert.equal(
+        linked,
+        directlyLinked,
+        `factory link semantics differ from native artifact: ${current.sourceName}`
       );
       if (!isLibrary) new candidate(Object.fromEntries(links));
       checkedLinks++;

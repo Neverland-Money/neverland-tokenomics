@@ -217,17 +217,17 @@ function prepare() {
       )
       .join("\n") + "\n"
   );
-  // Debug pointers refer to local compiler build-info, which is excluded from the tarball.
+  // Debug pointers and Hardhat-only declarations are local compiler tooling.
   fs.writeFileSync(
     path.join(root, "artifacts/src/.npmignore"),
-    "**/*.dbg.json\n"
+    "**/*.dbg.json\n**/*.d.ts\n"
   );
   console.log(
     `Prepared ${dependencies.length} pinned dependency sources from ${libraries.size} libraries.`
   );
 }
 
-function verify() {
+async function verify() {
   const manifest = readJson("package.json");
   assert.equal(manifest.name, "@neverland-money/tokenomics-core");
   assert(
@@ -270,53 +270,127 @@ function verify() {
     }
   }
 
-  const { sources, remappings } = productionSources();
+  const { sources } = productionSources();
   const sourceSet = new Set(sources);
-  require("hardhat/register");
-  const { compilers, overrides } = require("hardhat").config.solidity;
+  const { solidity } = await import("hardhat");
+  const rootFiles = await solidity.getRootFilePaths({ scope: "contracts" });
+  const result = await solidity.getCompilationJobs(rootFiles, {
+    force: true,
+    quiet: true,
+    scope: "contracts",
+    buildProfile: "default",
+  });
+  assert(result.success, "unable to reconstruct current compiler inputs");
+  const expectedBuilds = new Map();
+  for (const job of new Set(result.compilationJobsPerFile.values())) {
+    const input = await job.getSolcInput();
+    for (const resolved of job.dependencyGraph.getAllFiles()) {
+      assert(
+        sourceSet.has(resolved.fsPath),
+        `unexpected compiled source: ${resolved.inputSourceName}`
+      );
+      assert.equal(
+        input.sources[resolved.inputSourceName].content,
+        fs.readFileSync(resolved.fsPath, "utf8"),
+        `stale compiled source: ${resolved.inputSourceName}`
+      );
+    }
+    expectedBuilds.set(await job.getBuildId(), {
+      input,
+      mapping: job.dependencyGraph.getRootsUserSourceNameMap(),
+      version: job.solcConfig.version,
+      longVersion: job.solcLongVersion,
+    });
+  }
   let contracts = 0;
   const builds = new Map();
+  const identities = new Set();
   for (const file of files(path.join(root, "artifacts/src"))) {
     if (!file.endsWith(".json") || file.endsWith(".dbg.json")) continue;
     const artifact = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(
+      artifact._format,
+      "hh3-artifact-1",
+      `invalid artifact: ${file}`
+    );
     assert(Array.isArray(artifact.abi), `missing ABI: ${file}`);
     assert(
-      fs.existsSync(path.join(root, artifact.sourceName)),
+      sourceSet.has(path.resolve(root, artifact.sourceName)),
       `missing artifact source: ${artifact.sourceName}`
     );
-    const debug = JSON.parse(
-      fs.readFileSync(file.replace(/\.json$/, ".dbg.json"), "utf8")
+    assert.equal(
+      file,
+      path.join(
+        root,
+        "artifacts",
+        artifact.sourceName,
+        `${artifact.contractName}.json`
+      ),
+      "artifact path does not match its contract identity"
     );
-    const buildPath = path.resolve(path.dirname(file), debug.buildInfo);
-    if (!builds.has(buildPath)) {
-      const build = JSON.parse(fs.readFileSync(buildPath, "utf8"));
-      for (const [name, source] of Object.entries(build.input.sources)) {
-        const mapping = remappings.find(([prefix]) => name.startsWith(prefix));
-        const local = mapping
-          ? path.resolve(root, mapping[1], name.slice(mapping[0].length))
-          : path.resolve(root, name);
-        assert(sourceSet.has(local), `unexpected compiled source: ${name}`);
-        assert.equal(
-          source.content,
-          fs.readFileSync(local, "utf8"),
-          `stale compiled source: ${name}`
-        );
-      }
-      builds.set(buildPath, build);
+    const expected = expectedBuilds.get(artifact.buildInfoId);
+    assert(
+      expected,
+      `stale or unknown compiler build: ${artifact.buildInfoId}`
+    );
+    assert.equal(
+      artifact.inputSourceName,
+      expected.mapping[artifact.sourceName],
+      `invalid compiler source mapping: ${artifact.sourceName}`
+    );
+    assert(artifact.inputSourceName, "missing compiler source name");
+    if (!builds.has(artifact.buildInfoId)) {
+      // Hardhat 3 stores the compiler input and output in separate paired files.
+      const build = readJson(
+        `artifacts/build-info/${artifact.buildInfoId}.json`
+      );
+      const output = readJson(
+        `artifacts/build-info/${artifact.buildInfoId}.output.json`
+      );
+      assert.equal(build._format, "hh3-sol-build-info-1");
+      assert.equal(output._format, "hh3-sol-build-info-output-1");
+      assert.equal(build.id, artifact.buildInfoId, "mismatched build input id");
+      assert.equal(output.id, build.id, "mismatched build output id");
+      assert.equal(
+        build.compilerType ?? "solc",
+        "solc",
+        "unexpected compiler type"
+      );
+      assert.equal(
+        build.solcVersion,
+        expected.version,
+        "stale compiler version"
+      );
+      assert.equal(
+        build.solcLongVersion,
+        expected.longVersion,
+        "stale compiler long version"
+      );
+      assert.deepEqual(
+        build.input,
+        expected.input,
+        "stale compiler sources or settings"
+      );
+      assert.deepEqual(
+        build.userSourceNameMap,
+        expected.mapping,
+        "stale compiler source map"
+      );
+      assert(
+        !(output.output.errors ?? []).some(
+          ({ severity }) => severity === "error"
+        ),
+        "compiler output contains errors"
+      );
+      builds.set(build.id, output.output);
     }
-    const build = builds.get(buildPath);
-    const compiler =
-      overrides[artifact.sourceName] ??
-      compilers.find(({ version }) => version === build.solcVersion);
-    assert(compiler, `unconfigured compiler: ${build.solcVersion}`);
-    assert.equal(build.solcVersion, compiler.version, "stale compiler version");
-    assert.deepEqual(
-      build.input.settings,
-      compiler.settings,
-      `stale compiler settings: ${artifact.sourceName}`
+    const compiled = builds.get(artifact.buildInfoId).contracts[
+      artifact.inputSourceName
+    ]?.[artifact.contractName];
+    assert(
+      compiled,
+      `missing compiler output: ${artifact.sourceName}:${artifact.contractName}`
     );
-    const compiled =
-      build.output.contracts[artifact.sourceName][artifact.contractName];
     assert.deepEqual(
       artifact.abi,
       compiled.abi,
@@ -342,9 +416,27 @@ function verify() {
       compiled.evm.deployedBytecode.linkReferences,
       `stale runtime link references: ${artifact.contractName}`
     );
+    assert.deepEqual(
+      artifact.immutableReferences,
+      compiled.evm.deployedBytecode.immutableReferences ?? {},
+      `stale immutable references: ${artifact.contractName}`
+    );
+    identities.add(`${artifact.sourceName}:${artifact.contractName}`);
     contracts++;
   }
   assert(contracts > 0, "no first-party artifacts found");
+  for (const [buildId, expected] of expectedBuilds) {
+    const output = builds.get(buildId);
+    assert(output, `missing artifacts for compiler build: ${buildId}`);
+    for (const [source, inputSource] of Object.entries(expected.mapping)) {
+      for (const name of Object.keys(output.contracts[inputSource] ?? {})) {
+        assert(
+          identities.has(`${source}:${name}`),
+          `missing artifact: ${source}:${name}`
+        );
+      }
+    }
+  }
 
   for (const file of sources.filter((file) =>
     file.startsWith(path.join(root, "lib") + path.sep)
@@ -370,8 +462,20 @@ if (require.main === module) {
   const command = process.argv[2];
   if (command === "prepare") prepare();
   else if (command === "addresses") prepareAddresses();
-  else if (command === "verify") verify();
-  else if (command === "hash") console.log(sourceHash());
+  else if (command === "verify")
+    verify().catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  else if (command === "dist") {
+    // Keep published JavaScript and declarations CommonJS under the ESM toolchain root.
+    fs.writeFileSync(
+      path.join(root, "dist/package.json"),
+      '{"type":"commonjs"}\n'
+    );
+  } else if (command === "hash") console.log(sourceHash());
+  else if (command === "clean-dist")
+    fs.rmSync(path.join(root, "dist"), { recursive: true, force: true });
   else if (command === "clean") {
     for (const entry of [
       "dist",

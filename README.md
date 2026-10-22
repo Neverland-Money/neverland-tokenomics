@@ -57,9 +57,10 @@ The Markdown tables are the maintained address source. The build generates the m
 
 ## Build from source
 
-To build the package from a source checkout, use Node `24.22.1` (pinned in `.nvmrc`) and Yarn `4.18.1`. The contracts compile with Solidity `0.8.30`; the compiler and dependency versions are pinned for reproducibility.
+To build the package from a source checkout, use Node `24.22.1` (pinned in `.nvmrc`), Yarn `4.18.1`, and Foundry `1.5.1`. Install [Foundry's `foundryup`](https://getfoundry.sh/introduction/installation/) first and make sure it is on your `PATH`. The contracts compile with Solidity `0.8.30`; the compiler and dependency versions are pinned for reproducibility.
 
 ```bash
+foundryup --install v1.5.1
 git submodule update --init --recursive
 corepack enable
 yarn install --immutable

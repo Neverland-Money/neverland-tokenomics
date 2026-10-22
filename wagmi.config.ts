@@ -6,8 +6,13 @@ export default defineConfig({
   contracts: [],
   plugins: [
     hardhat({
-      artifacts: "./artifacts",
+      artifacts: "./generated/artifacts",
       project: ".",
+      sources: "src",
+      commands: {
+        build: "yarn hardhat build --no-tests && node tools/bindings.mjs",
+        rebuild: "yarn hardhat build --no-tests && node tools/bindings.mjs",
+      },
       include: ["src/**/*.json"],
       exclude: ["**/*.dbg.json", "src/libraries/**", "src/utils/libraries/**"],
     }),

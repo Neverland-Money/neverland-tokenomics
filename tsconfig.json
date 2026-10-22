@@ -1,13 +1,14 @@
 {
   "compilerOptions": {
     "target": "es2022",
-    "module": "commonjs",
+    "module": "esnext",
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "strict": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "types": ["node"],
+    "moduleResolution": "bundler"
   },
   "include": [
     "hardhat.config.ts",

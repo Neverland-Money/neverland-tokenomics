@@ -88,9 +88,12 @@ test("the installed release supports JS, TypeScript, and every Solidity source",
     );
     assert(
       !paths.some(
-        (path) => path.endsWith(".dbg.json") || path.includes("/build-info/")
+        (path) =>
+          path.endsWith(".dbg.json") ||
+          (path.startsWith("artifacts/") && path.endsWith(".d.ts")) ||
+          path.includes("/build-info/")
       ),
-      "local compiler debug output leaked into the release tarball"
+      "local compiler tooling leaked into the release tarball"
     );
     assert.equal(packed.name, "@neverland-money/tokenomics-core");
     assert.equal(
@@ -137,6 +140,23 @@ test("the installed release supports JS, TypeScript, and every Solidity source",
       "es2022",
       "--strict",
       "consumer.mts",
+    ]);
+
+    copyFileSync(
+      join(directory, "consumer.mts"),
+      join(directory, "consumer.cts")
+    );
+    run(process.execPath, [
+      resolve("node_modules/typescript/bin/tsc"),
+      "--noEmit",
+      "--module",
+      "node16",
+      "--moduleResolution",
+      "node16",
+      "--target",
+      "es2022",
+      "--strict",
+      "consumer.cts",
     ]);
 
     const packageRoot = join(

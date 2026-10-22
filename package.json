@@ -17,36 +17,35 @@
     "build": "yarn build:foundry && yarn build:hardhat && yarn build:wagmi && yarn build:types && yarn build:package",
     "rebuild": "yarn clean && yarn build",
     "build:foundry": "forge build src/",
-    "build:hardhat": "hardhat compile --force --no-typechain && hardhat typechain",
+    "build:hardhat": "hardhat build --force --no-tests && node tools/bindings.mjs",
     "build:wagmi": "wagmi generate",
     "build:addresses": "node tools/package.cjs addresses",
-    "build:types": "yarn build:addresses && tsc --project tsconfig.build.json",
+    "build:types": "yarn build:addresses && node tools/package.cjs clean-dist && tsc --project tsconfig.build.json && node tools/package.cjs dist",
     "build:package": "node tools/package.cjs prepare",
     "check:sizes": "forge build --sizes src/",
     "source:hash": "node tools/package.cjs hash",
-    "test": "yarn build && yarn tests:foundry && yarn test:release && yarn test:package",
+    "test": "yarn build && yarn tests:foundry && yarn test:release && yarn test:package-verifier && yarn test:package",
     "tests": "yarn test",
     "tests:foundry": "forge test -v",
     "test:package": "node --test test/package/*.test.cjs",
     "test:release": "node --test test/release/*.test.cjs",
     "verify:package": "node tools/package.cjs verify",
-    "check": "yarn format:check && yarn lint && yarn test:release && yarn build && yarn typecheck && yarn check:sizes && yarn tests:foundry && yarn verify:package && yarn test:package",
+    "check": "yarn format:check && yarn lint && yarn test:release && yarn build && yarn typecheck && yarn check:sizes && yarn tests:foundry && yarn test:package-verifier && yarn verify:package && yarn test:package",
     "prepack": "yarn build && yarn verify:package",
     "prepublishOnly": "yarn verify:package",
     "format": "forge fmt && yarn prettier --write .",
-    "format:check": "forge fmt --check && yarn prettier --check ."
+    "format:check": "forge fmt --check && yarn prettier --check .",
+    "test:package-verifier": "node --test test/package-verifier/*.test.cjs"
   },
   "devDependencies": {
-    "@nomicfoundation/hardhat-ethers": "^3.1.0",
-    "@nomicfoundation/hardhat-foundry": "^1.2.0",
+    "@nomicfoundation/hardhat-ethers": "^4.2.1",
+    "@nomicfoundation/hardhat-foundry": "^3.0.5",
     "@typechain/ethers-v6": "^0.5.1",
-    "@typechain/hardhat": "^9.1.0",
     "@types/node": ">=20.0.0",
-    "@wagmi/cli": "^2.6.0",
-    "hardhat": "^2.26.3",
-    "prettier": "^3.6.2",
-    "solhint": "^6.0.1",
-    "ts-node": ">=8.0.0",
+    "@wagmi/cli": "^2.10.0",
+    "hardhat": "^3.21.0",
+    "prettier": "3.6.2",
+    "solhint": "^6.2.5",
     "typechain": "^8.3.2",
     "typescript": "^5.9.3"
   },
@@ -107,6 +106,7 @@
     "sourceHash": "sha256:7661b070f4d34ff11edf7ea05a0f7825d961db3c624a2f4669eb5f63951dad4b"
   },
   "dependencies": {
-    "ethers": "^6.15.0"
-  }
+    "ethers": "^6.17.0"
+  },
+  "type": "module"
 }

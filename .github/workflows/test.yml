@@ -66,6 +66,9 @@ jobs:
       - name: Run local contract tests
         run: yarn tests:foundry
 
+      - name: Test package artifact verification
+        run: yarn test:package-verifier
+
       - name: Verify package artifacts and sources
         run: yarn verify:package
 
