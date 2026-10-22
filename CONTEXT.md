@@ -2,6 +2,8 @@
 
 This file describes the public release repository, contract behavior, and trust boundaries for humans, auditors, security scanners, and code reviewers. [ARCHITECTURE.md](./ARCHITECTURE.md) maps the components and their connections.
 
+[threat-model.yaml](./threat-model.yaml) records known limitations and security assumptions. Apply a known-issue exclusion only when its mechanism, preconditions, and impact match the finding; current source remains authoritative.
+
 ## Repository and package scope
 
 This repository contains Neverland-authored Solidity contracts and interfaces under [src/](./src/), a focused public test suite under [test/](./test/), and the recorded Monad mainnet address book. It prepares the first `@neverland-money/tokenomics-core` package release as version `1.2.0`.
