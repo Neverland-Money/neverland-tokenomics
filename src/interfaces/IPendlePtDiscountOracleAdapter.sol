@@ -13,9 +13,11 @@ import {IPendlePrincipalToken} from "./IPendlePrincipalToken.sol";
  * @dev Prices a PT in USD as the discounted value of its accounting asset's USD feed, using a
  *      governed linear-discount-to-maturity model with no dependency on a Pendle AMM/TWAP.
  *      AaveOracle consumes the legacy AggregatorInterface path (`latestAnswer`), which returns 0 on
- *      invalid data so Aave can route to its fallback oracle. AggregatorV3Interface reads are strict
- *      diagnostic reads and revert on invalid data. Historical rounds are not supported: getRoundData
- *      returns the latest round only and reverts for non-latest roundIds.
+ *      invalid data so Aave can route to its fallback oracle. With AaveOracle's fallback unset (address
+ *      zero, the current live configuration), a 0 answer makes getAssetPrice revert (fail-closed) rather
+ *      than serving a fallback price. AggregatorV3Interface reads are strict diagnostic reads and revert
+ *      on invalid data. Historical rounds are not supported: getRoundData returns the latest round only
+ *      and reverts for non-latest roundIds.
  */
 interface IPendlePtDiscountOracleAdapter is AggregatorInterface, AggregatorV3Interface {
     /*//////////////////////////////////////////////////////////////
@@ -28,10 +30,10 @@ interface IPendlePtDiscountOracleAdapter is AggregatorInterface, AggregatorV3Int
     /// @notice Reverts when a discount rate (or the immutable ceiling) is zero or out of range
     error InvalidDiscountRate();
 
-    /// @notice Reverts when the base-feed staleness limit is zero
-    error InvalidMaxDelay();
-
-    /// @notice Reverts when the discounted PT price could not be computed
+    /**
+     * @notice Reverts when the discounted PT price could not be computed, or when the current base round
+     *         is unavailable, stale, or invalid during construction and rate updates
+     */
     error InvalidPtPrice();
 
     /// @notice Reverts when the principal token has already matured at deployment time
@@ -58,7 +60,9 @@ interface IPendlePtDiscountOracleAdapter is AggregatorInterface, AggregatorV3Int
     /**
      * @notice Updates the annual discount rate (owner only)
      * @dev Must be greater than zero and at most maxDiscountRatePerYear; the immutable ceiling can
-     *      never be exceeded. Intended to be held by the market's risk admin (Safe/timelock).
+     *      never be exceeded. The proposed rate must also produce a positive normalized price from the
+     *      current valid base round before state changes. Intended to be held by the market's risk admin
+     *      (Safe/timelock).
      * @param newRatePerYear The new annual discount rate in basis points
      */
     function setDiscountRatePerYear(uint16 newRatePerYear) external;
@@ -97,8 +101,9 @@ interface IPendlePtDiscountOracleAdapter is AggregatorInterface, AggregatorV3Int
 
     /**
      * @notice Returns the maximum allowed staleness for the base feed in seconds
-     * @dev Must be nonzero; the adapter is not deployable with disabled freshness checks.
-     * @return The maximum staleness delay in seconds
+     * @dev A zero value disables the staleness check; freshness is then owned by the base feed operator
+     *      and off-chain monitoring. Zero and future-dated round timestamps stay rejected.
+     * @return The maximum staleness delay in seconds (0 = staleness check disabled)
      */
     function maxDelay() external view returns (uint256);
 
@@ -139,7 +144,9 @@ interface IPendlePtDiscountOracleAdapter is AggregatorInterface, AggregatorV3Int
 
     /**
      * @notice Returns the oracle interface version
-     * @return The version number (1)
+     * @dev Version 2: raw-staticcall returndata guard on the legacy reads, `answeredInRound == 0`
+     *      tolerated as informational, and `maxDelay == 0` disables the staleness check.
+     * @return The version number (2)
      */
     function version() external view override returns (uint256);
 
@@ -148,7 +155,9 @@ interface IPendlePtDiscountOracleAdapter is AggregatorInterface, AggregatorV3Int
      * @dev Reads the base feed's latest round, validates it, and returns the discounted PT price as `answer`
      *      alongside the base round's roundId/startedAt/updatedAt/answeredInRound. Unlike the legacy reads,
      *      this REVERTS (does not return 0) on invalid, stale, zero, future-dated, or metadata-inconsistent
-     *      base data.
+     *      base data. It also reverts InvalidPtPrice when the discounted price cannot be computed (overflow,
+     *      scaling failure, or full discount). `answeredInRound` is informational/deprecated: zero is accepted,
+     *      while a nonzero value behind `roundId` is rejected.
      * @return roundId The base feed round ID
      * @return answer The discounted PT/USD price in target (8) decimals
      * @return startedAt The base round start timestamp

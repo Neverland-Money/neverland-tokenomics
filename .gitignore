@@ -2,6 +2,11 @@
 cache/
 out/
 artifacts/
+dist/
+generated/
+vendor/
+remappings.package.txt
+*.tgz
 typechain-v5/
 typechain-v6/
 cache_hardhat/
@@ -14,7 +19,7 @@ node_modules/
 !.env.example
 
 # Reports and generated files
-coverage/
+/coverage/
 lcov.info
 slither.md
 solhint.txt

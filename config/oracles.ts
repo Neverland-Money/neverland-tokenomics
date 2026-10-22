@@ -72,12 +72,22 @@ export interface YieldOraclePreset {
   initialRejectionGraceBps?: number;
 }
 
+/** A recorded deployed governed source; its mutable price is read from the oracle. */
+export interface GovernedOracleSource {
+  id: string;
+  label: string;
+  reserveSymbol: string;
+  feed: OracleFeedConfig;
+  source: "aave-v3-neverland";
+}
+
 export interface OracleNetworkConfig {
   poolAddressesProvider: string;
   feeds: Record<string, OracleFeedConfig>;
   reserves: Record<string, OracleReserveConfig>;
   ratioPresets: RatioOraclePreset[];
   yieldPresets: YieldOraclePreset[];
+  governedSources: GovernedOracleSource[];
 }
 
 const MAINNET_FEEDS: Record<string, OracleFeedConfig> = {
@@ -123,12 +133,12 @@ const MAINNET_FEEDS: Record<string, OracleFeedConfig> = {
     decimals: 18,
     description: "Chainlink gMON / MON",
   },
-  AZND_USD: {
-    id: "AZND_USD",
-    symbol: "AZND/USD",
-    address: "0x63Bb491346fCC8695244D811F0c3501E6C2e8d25",
+  LOAZND_USD: {
+    id: "LOAZND_USD",
+    symbol: "loAZND/USD",
+    address: "0x9eF202F1A9962138a5918721Aa36b4665634975F",
     decimals: 8,
-    description: "RedStone AZND / USD",
+    description: "Governed loAZND / USD settlement price",
   },
   YZUSD_USD: {
     id: "YZUSD_USD",
@@ -172,6 +182,14 @@ const MAINNET_RESERVES: Record<string, OracleReserveConfig> = {
     reserveAddress: "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a",
     reserveDecimals: 6,
   },
+  SUSDE: {
+    // Accounting asset of SY-sUSDE (0x06fC2568fa3C8A9862D8f35bc6758355b3A32F51): assetInfo()
+    // reports USDe, not sUSDe, so PT-sUSDE prices off the USDe reserve. Consumed by the
+    // Pendle PT deploy gate (resolvePendlePtExpectedAccountingAsset).
+    symbol: "sUSDE",
+    reserveAddress: "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34",
+    reserveDecimals: 18,
+  },
   EARNAUSD: {
     symbol: "earnAUSD",
     reserveAddress: "0x103222f020e98Bba0AD9809A011FDF8e6F067496",
@@ -189,6 +207,9 @@ const MAINNET_RESERVES: Record<string, OracleReserveConfig> = {
   },
 };
 
+// Addresses are recorded configuration, not a live chain check. The governed loAZND
+// source matches the deployment manifest and lending market configuration; no historical
+// posted answer is copied because governance can update it without changing the address.
 const MAINNET_ORACLE_CONFIG: OracleNetworkConfig = {
   poolAddressesProvider: "0x49D75170F55C964dfdd6726c74fdEDEe75553A0f",
   feeds: MAINNET_FEEDS,
@@ -240,22 +261,16 @@ const MAINNET_ORACLE_CONFIG: OracleNetworkConfig = {
       maxDelay: ORACLE_MAX_DELAY,
     },
   ],
-  yieldPresets: [
+  // loAZND no longer uses vault-share conversion. The historical yield adapter and
+  // hardcoded feed are retired sources, not deployment presets for the current market.
+  yieldPresets: [],
+  governedSources: [
     {
       id: "loaznd-usd",
-      label: "loAZND/USD via YieldBearingOracleAdapter",
+      label: "loAZND/USD via GovernedPriceOracle",
       reserveSymbol: "LOAZND",
-      baseFeed: MAINNET_FEEDS.AZND_USD,
-      sharesContract: "0x9c82eB49B51F7Dc61e22Ff347931CA32aDc6cd90",
-      sharesDecimals: 18,
-      assetDecimals: 18,
+      feed: MAINNET_FEEDS.LOAZND_USD,
       source: "aave-v3-neverland",
-      maxDelay: ORACLE_MAX_DELAY,
-      minimumSnapshotDelay: HOUR,
-      maximumSnapshotAge: 30 * DAY,
-      description: "loAZND / USD via vault shares",
-      initialGrowthCapBps: 2000,
-      initialRejectionGraceBps: 100,
     },
   ],
 };
@@ -268,12 +283,8 @@ export const ORACLE_CONFIG_BY_NETWORK: Record<
   fork: MAINNET_ORACLE_CONFIG,
 };
 
-export const resolveOracleConfig = (
-  networkName: string
-): OracleNetworkConfig => {
-  const resolvedNetwork = resolveNetwork(networkName);
-  return ORACLE_CONFIG_BY_NETWORK[resolvedNetwork] ?? MAINNET_ORACLE_CONFIG;
-};
+export const resolveOracleConfig = (networkName: string): OracleNetworkConfig =>
+  ORACLE_CONFIG_BY_NETWORK[resolveNetwork(networkName)];
 
 export const getRatioPresetById = (
   networkName: string,
@@ -289,4 +300,12 @@ export const getYieldPresetById = (
 ): YieldOraclePreset | undefined =>
   resolveOracleConfig(networkName).yieldPresets.find(
     (preset) => preset.id === id
+  );
+
+export const getGovernedSourceById = (
+  networkName: string,
+  id: string
+): GovernedOracleSource | undefined =>
+  resolveOracleConfig(networkName).governedSources.find(
+    (source) => source.id === id
   );

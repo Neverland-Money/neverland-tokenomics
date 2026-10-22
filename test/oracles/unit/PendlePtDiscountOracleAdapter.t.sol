@@ -61,6 +61,70 @@ contract RevertingAggregator {
 }
 
 /**
+ * @title ConfigurableReturnDataFeed
+ * @author Neverland
+ * @notice Chainlink-style feed whose raw latestRoundData reply can be corrupted after deployment
+ * @dev Starts with a valid five-word reply so constructor checks exercise the real adapter. Tests then change
+ *      the byte length or uint80 words to exercise caller-side decoding failures.
+ */
+contract ConfigurableReturnDataFeed {
+    bool public revertResponse;
+    uint256 public returnSize;
+    uint256 public rawRoundId;
+    int256 public rawAnswer;
+    uint256 public rawStartedAt;
+    uint256 public rawUpdatedAt;
+    uint256 public rawAnsweredInRound;
+
+    constructor(int256 answer_) {
+        returnSize = 160;
+        rawRoundId = 1;
+        rawAnswer = answer_;
+        rawStartedAt = block.timestamp;
+        rawUpdatedAt = block.timestamp;
+        rawAnsweredInRound = 1;
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function setReturnSize(uint256 returnSize_) external {
+        returnSize = returnSize_;
+    }
+
+    function setRevertResponse(bool revertResponse_) external {
+        revertResponse = revertResponse_;
+    }
+
+    function setRawRoundIds(uint256 rawRoundId_, uint256 rawAnsweredInRound_) external {
+        rawRoundId = rawRoundId_;
+        rawAnsweredInRound = rawAnsweredInRound_;
+    }
+
+    fallback() external {
+        uint256 size = returnSize;
+        uint256 roundId_ = rawRoundId;
+        int256 answer_ = rawAnswer;
+        uint256 startedAt_ = rawStartedAt;
+        uint256 updatedAt_ = rawUpdatedAt;
+        uint256 answeredInRound_ = rawAnsweredInRound;
+        uint256 revertResponse_ = revertResponse ? 1 : 0;
+
+        assembly {
+            mstore(0, roundId_)
+            mstore(32, answer_)
+            mstore(64, startedAt_)
+            mstore(96, updatedAt_)
+            mstore(128, answeredInRound_)
+            switch revertResponse_
+            case 0 { return(0, size) }
+            default { revert(0, size) }
+        }
+    }
+}
+
+/**
  * @title PendlePtDiscountOracleAdapterTest
  * @author Neverland
  * @notice Unit, fuzz, and full lifecycle tests for the PT-AUSD discount oracle
@@ -183,7 +247,7 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         assertEq(adapter.maxDiscountRatePerYear(), MAX_RATE);
         assertEq(adapter.description(), "PT-AUSD / USD");
         assertEq(adapter.decimals(), 8);
-        assertEq(adapter.version(), 1);
+        assertEq(adapter.version(), 2);
         assertEq(adapter.owner(), address(this));
     }
 
@@ -198,10 +262,38 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         new PendlePtDiscountOracleAdapter(address(feed), address(0), MAX_DELAY, MAX_RATE, RATE, "x");
     }
 
-    function test_constructor_revertsOnZeroMaxDelay() public {
+    function test_constructor_acceptsZeroMaxDelayAndSkipsStaleness() public {
         MockAusdPt token = new MockAusdPt(maturity);
-        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidMaxDelay.selector);
-        new PendlePtDiscountOracleAdapter(address(feed), address(token), 0, MAX_RATE, RATE, "x");
+        feed.setStale(300 days);
+        PendlePtDiscountOracleAdapter zeroDelay =
+            new PendlePtDiscountOracleAdapter(address(feed), address(token), 0, MAX_RATE, RATE, "x");
+
+        assertEq(zeroDelay.maxDelay(), 0);
+
+        // A months-stale round is still served on both paths: zero maxDelay disables the staleness bound.
+        assertEq(zeroDelay.latestAnswer(), 75_000_000);
+        (, int256 answer,,,) = zeroDelay.latestRoundData();
+        assertEq(answer, 75_000_000);
+
+        // Validity checks stay live: a zero updatedAt is still rejected in both regimes.
+        feed.set(AUSD_PRICE, 1, 0, 0, 1);
+        assertEq(zeroDelay.latestAnswer(), 0);
+        vm.expectRevert(CommonChecksLibrary.StaleRound.selector);
+        zeroDelay.latestRoundData();
+
+        // Future-dated rounds are still rejected.
+        feed.setFuture(1);
+        assertEq(zeroDelay.latestAnswer(), 0);
+    }
+
+    function test_constructor_acceptsAnsweredInRoundZero() public {
+        feed.set(AUSD_PRICE, 2, block.timestamp, block.timestamp, 0);
+        MockAusdPt token = new MockAusdPt(maturity);
+
+        PendlePtDiscountOracleAdapter zeroAnsweredInRound =
+            new PendlePtDiscountOracleAdapter(address(feed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+
+        assertEq(zeroAnsweredInRound.latestAnswer(), 75_000_000);
     }
 
     function test_constructor_revertsOnZeroMaxDiscount() public {
@@ -245,6 +337,51 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         // 4-year PT at 25%/yr implies an exact 100% discount today and must be rejected.
         MockAusdPt token = new MockAusdPt(block.timestamp + 4 * 365 days);
         vm.expectRevert(IPendlePtDiscountOracleAdapter.DiscountExceedsHundredPercent.selector);
+        new PendlePtDiscountOracleAdapter(address(feed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+    }
+
+    function test_constructor_revertsWhenDiscountMathOverflows() public {
+        MockAusdPt token = new MockAusdPt(type(uint256).max);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.DiscountExceedsHundredPercent.selector);
+        new PendlePtDiscountOracleAdapter(address(feed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+    }
+
+    function test_constructor_revertsWhenSubHundredPercentDiscountNormalizesPriceToZero() public {
+        /*
+         * One second below a nominal 100% discount leaves a nonzero WAD factor, but an 8-decimal $1 answer
+         * still rounds to zero. A zero-valued source must never be deployable.
+         */
+        MockAusdPt token = new MockAusdPt(block.timestamp + 4 * 365 days - 1);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
+        new PendlePtDiscountOracleAdapter(address(feed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+    }
+
+    function test_constructor_acceptsMinimumPositiveNormalizedPrice() public {
+        MockChainlinkAggregator minimumFeed = new MockChainlinkAggregator(2, FEED_DECIMALS, "minimum");
+        MockAusdPt token = new MockAusdPt(maturity);
+
+        PendlePtDiscountOracleAdapter minimumPriceAdapter =
+            new PendlePtDiscountOracleAdapter(address(minimumFeed), address(token), MAX_DELAY, RATE, RATE, "x");
+
+        assertEq(minimumPriceAdapter.latestAnswer(), 1);
+    }
+
+    function test_constructor_revertsWhenBaseRoundReturndataIsMalformed() public {
+        ConfigurableReturnDataFeed malformedFeed = new ConfigurableReturnDataFeed(AUSD_PRICE);
+        malformedFeed.setReturnSize(32);
+        MockAusdPt token = new MockAusdPt(maturity);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
+        new PendlePtDiscountOracleAdapter(address(malformedFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+    }
+
+    function test_constructor_revertsWhenBaseRoundIsStaleWithNonzeroMaxDelay() public {
+        MockAusdPt token = new MockAusdPt(maturity);
+        feed.setStale(MAX_DELAY + 1);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
         new PendlePtDiscountOracleAdapter(address(feed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
     }
 
@@ -326,10 +463,12 @@ contract PendlePtDiscountOracleAdapterTest is Test {
 
     function test_normalization_6DecimalFeed_rejectsResultAboveInt256() public {
         int256 largeButMultipliablePrice = type(int256).max / 50;
-        MockChainlinkAggregator feed6 = new MockChainlinkAggregator(largeButMultipliablePrice, 6, "AUSD/USD 6d");
+        MockChainlinkAggregator feed6 = new MockChainlinkAggregator(1e6, 6, "AUSD/USD 6d");
         MockAusdPt token = new MockAusdPt(maturity);
         PendlePtDiscountOracleAdapter a =
             new PendlePtDiscountOracleAdapter(address(feed6), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+
+        feed6.setAnswer(largeButMultipliablePrice);
 
         assertEq(a.latestAnswer(), 0, "legacy read must reject a normalized value above int256");
         vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
@@ -363,6 +502,17 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         assertEq(adapter.latestAnswer(), 0);
     }
 
+    function test_latestAnswer_acceptsExactMaxDelayBoundary() public {
+        // Inclusive boundary: exactly maxDelay old is still fresh for the lenient read.
+        feed.setStale(MAX_DELAY);
+        assertGt(adapter.latestAnswer(), 0);
+        assertEq(adapter.latestAnswer(), 75_000_000);
+
+        // One second past the boundary fails closed to zero.
+        feed.setStale(MAX_DELAY + 1);
+        assertEq(adapter.latestAnswer(), 0);
+    }
+
     function test_latestAnswer_zeroOnZeroUpdatedAt() public {
         feed.set(AUSD_PRICE, 1, 0, 0, 1);
         assertEq(adapter.latestAnswer(), 0);
@@ -385,11 +535,12 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         assertEq(adapter.latestAnswer(), 0);
     }
 
-    function test_latestAnswer_zeroOnAnsweredInRoundZero() public {
+    function test_latestAnswer_acceptsAnsweredInRoundZero() public {
+        // answeredInRound is deprecated by Chainlink; zero is informational, freshness comes from updatedAt.
         feed.set(AUSD_PRICE, 2, block.timestamp, block.timestamp, 0);
-        assertEq(adapter.latestAnswer(), 0);
-        assertEq(adapter.latestTimestamp(), 0);
-        assertEq(adapter.latestRound(), 0);
+        assertEq(adapter.latestAnswer(), 75_000_000);
+        assertEq(adapter.latestTimestamp(), block.timestamp);
+        assertEq(adapter.latestRound(), 2);
     }
 
     function test_latestAnswer_zeroOnStartedAtAfterUpdatedAt() public {
@@ -397,18 +548,156 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         assertEq(adapter.latestAnswer(), 0);
     }
 
+    function test_latestAnswer_zeroOnShortReturnData() public {
+        ConfigurableReturnDataFeed shortFeed = new ConfigurableReturnDataFeed(AUSD_PRICE);
+        MockAusdPt token = new MockAusdPt(maturity);
+        PendlePtDiscountOracleAdapter a =
+            new PendlePtDiscountOracleAdapter(address(shortFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+        shortFeed.setReturnSize(32);
+
+        // Pre-v2 the caller-side decode of the short reply reverted the legacy reads; the size guard fails soft.
+        assertEq(a.latestAnswer(), 0);
+        assertEq(a.latestTimestamp(), 0);
+        assertEq(a.latestRound(), 0);
+
+        // The strict diagnostic path still reverts loudly on the malformed reply.
+        vm.expectRevert();
+        a.latestRoundData();
+    }
+
+    function test_latestAnswer_zeroOnOversizedReturnData() public {
+        ConfigurableReturnDataFeed wideFeed = new ConfigurableReturnDataFeed(AUSD_PRICE);
+        MockAusdPt token = new MockAusdPt(maturity);
+        PendlePtDiscountOracleAdapter a =
+            new PendlePtDiscountOracleAdapter(address(wideFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+        wideFeed.setReturnSize(192);
+
+        assertEq(a.latestAnswer(), 0);
+
+        /*
+         * Intended divergence: solc's strict ABI decoder tolerates trailing bytes, while the bounded
+         * fail-soft reader requires the exact five-word reply. Monitor latestAnswer (the production
+         * read), not latestRoundData, as the health signal.
+         */
+        (, int256 answer,,,) = a.latestRoundData();
+        assertEq(answer, 75_000_000);
+    }
+
+    function test_latestAnswer_boundsCopyOfVeryLargeReturnData() public {
+        ConfigurableReturnDataFeed returnBomb = new ConfigurableReturnDataFeed(AUSD_PRICE);
+        MockAusdPt token = new MockAusdPt(maturity);
+        PendlePtDiscountOracleAdapter a =
+            new PendlePtDiscountOracleAdapter(address(returnBomb), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+        returnBomb.setReturnSize(256 * 1024);
+
+        (bool success, bytes memory result) =
+            address(a).staticcall{gas: 300_000}(abi.encodeCall(PendlePtDiscountOracleAdapter.latestAnswer, ()));
+
+        assertTrue(success, "oversized returndata must not exhaust the adapter's bounded read budget");
+        assertEq(abi.decode(result, (int256)), 0);
+    }
+
+    function test_latestAnswer_zeroOnDirtyRoundIdHighBits() public {
+        ConfigurableReturnDataFeed dirtyFeed = new ConfigurableReturnDataFeed(AUSD_PRICE);
+        MockAusdPt token = new MockAusdPt(maturity);
+        PendlePtDiscountOracleAdapter a =
+            new PendlePtDiscountOracleAdapter(address(dirtyFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+        dirtyFeed.setRawRoundIds((uint256(1) << 80) | 1, 1);
+
+        assertEq(a.latestAnswer(), 0, "dirty uint80 roundId must fail soft");
+        assertEq(a.latestTimestamp(), 0);
+        assertEq(a.latestRound(), 0);
+
+        // The strict diagnostic path reverts on the same dirty word (solc decoder validates uint80 cleanup).
+        vm.expectRevert();
+        a.latestRoundData();
+    }
+
+    function test_latestAnswer_zeroOnDirtyAnsweredInRoundHighBits() public {
+        ConfigurableReturnDataFeed dirtyFeed = new ConfigurableReturnDataFeed(AUSD_PRICE);
+        MockAusdPt token = new MockAusdPt(maturity);
+        PendlePtDiscountOracleAdapter a =
+            new PendlePtDiscountOracleAdapter(address(dirtyFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+        dirtyFeed.setRawRoundIds(1, (uint256(1) << 80) | 1);
+
+        assertEq(a.latestAnswer(), 0, "dirty uint80 answeredInRound must fail soft");
+        assertEq(a.latestTimestamp(), 0);
+        assertEq(a.latestRound(), 0);
+
+        // The strict diagnostic path reverts on the same dirty word (solc decoder validates uint80 cleanup).
+        vm.expectRevert();
+        a.latestRoundData();
+    }
+
+    function test_latestAnswer_acceptsCanonicalBoundaryAndAheadMetadata() public {
+        // Exactly type(uint80).max is canonical, not dirty; the exact-160 positive path is pinned first.
+        ConfigurableReturnDataFeed boundaryFeed = new ConfigurableReturnDataFeed(AUSD_PRICE);
+        MockAusdPt token = new MockAusdPt(maturity);
+        PendlePtDiscountOracleAdapter a =
+            new PendlePtDiscountOracleAdapter(address(boundaryFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+
+        assertEq(a.latestAnswer(), 75_000_000);
+
+        boundaryFeed.setRawRoundIds(type(uint80).max, type(uint80).max);
+        assertEq(a.latestAnswer(), 75_000_000);
+        assertEq(a.latestRound(), uint256(type(uint80).max));
+        assertEq(a.getAnswer(type(uint80).max), 75_000_000);
+        assertEq(a.getTimestamp(type(uint80).max), block.timestamp);
+
+        // answeredInRound ahead of roundId is accepted on both paths (rejected only when nonzero and behind).
+        feed.set(AUSD_PRICE, 2, block.timestamp, block.timestamp, 3);
+        assertEq(adapter.latestAnswer(), 75_000_000);
+        (, int256 answer,,,) = adapter.latestRoundData();
+        assertEq(answer, 75_000_000);
+    }
+
+    function test_latestAnswer_zeroWhenBaseAggregatorHasNoCode() public {
+        vm.etch(address(feed), "");
+
+        assertEq(adapter.latestAnswer(), 0);
+        assertEq(adapter.latestTimestamp(), 0);
+        assertEq(adapter.latestRound(), 0);
+
+        // The strict path keeps its own extcodesize revert on a codeless target.
+        vm.expectRevert();
+        adapter.latestRoundData();
+    }
+
     function test_latestAnswer_zeroWhenBaseLatestRoundDataReverts() public {
         RevertingAggregator revertingFeed = new RevertingAggregator();
+        vm.etch(address(feed), address(revertingFeed).code);
+
+        assertEq(adapter.latestAnswer(), 0);
+        assertEq(adapter.latestTimestamp(), 0);
+        assertEq(adapter.latestRound(), 0);
+        assertEq(adapter.getAnswer(1), 0);
+        assertEq(adapter.getTimestamp(1), 0);
+    }
+
+    function test_failedStaticcallIsRejectedEvenWithCanonicalExactLengthRevertData() public {
+        ConfigurableReturnDataFeed revertingFeed = new ConfigurableReturnDataFeed(AUSD_PRICE);
         MockAusdPt token = new MockAusdPt(maturity);
-        PendlePtDiscountOracleAdapter a = new PendlePtDiscountOracleAdapter(
-            address(revertingFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "PT-AUSD / USD"
-        );
+        PendlePtDiscountOracleAdapter a =
+            new PendlePtDiscountOracleAdapter(address(revertingFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "x");
+        revertingFeed.setRevertResponse(true);
+
+        (bool feedCallSuccess, bytes memory revertData) =
+            address(revertingFeed).staticcall(abi.encodeWithSignature("latestRoundData()"));
+        bytes32 expectedRevertHash =
+            keccak256(abi.encode(uint80(1), AUSD_PRICE, block.timestamp, block.timestamp, uint80(1)));
+
+        assertFalse(feedCallSuccess);
+        assertEq(revertData.length, 160);
+        assertEq(keccak256(revertData), expectedRevertHash);
 
         assertEq(a.latestAnswer(), 0);
         assertEq(a.latestTimestamp(), 0);
         assertEq(a.latestRound(), 0);
-        assertEq(a.getAnswer(1), 0);
-        assertEq(a.getTimestamp(1), 0);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
+        a.setDiscountRatePerYear(1000);
+
+        assertEq(a.discountRatePerYear(), RATE);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -462,10 +751,13 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         assertEq(updatedAt, block.timestamp - MAX_DELAY);
     }
 
-    function test_latestRoundData_revertsOnAnsweredInRoundZero() public {
+    function test_latestRoundData_acceptsAnsweredInRoundZero() public {
         feed.set(AUSD_PRICE, 2, block.timestamp, block.timestamp, 0);
-        vm.expectRevert(CommonChecksLibrary.StaleRound.selector);
-        adapter.latestRoundData();
+        (uint80 roundId, int256 answer,,, uint80 answeredInRound) = adapter.latestRoundData();
+
+        assertEq(roundId, 2);
+        assertEq(answer, 75_000_000);
+        assertEq(answeredInRound, 0);
     }
 
     function test_latestRoundData_revertsOnFutureTimestamp() public {
@@ -502,13 +794,10 @@ contract PendlePtDiscountOracleAdapterTest is Test {
 
     function test_latestRoundData_bubblesBaseFeedRevert() public {
         RevertingAggregator revertingFeed = new RevertingAggregator();
-        MockAusdPt token = new MockAusdPt(maturity);
-        PendlePtDiscountOracleAdapter a = new PendlePtDiscountOracleAdapter(
-            address(revertingFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "PT-AUSD / USD"
-        );
+        vm.etch(address(feed), address(revertingFeed).code);
 
         vm.expectRevert(RevertingAggregator.FeedReverted.selector);
-        a.latestRoundData();
+        adapter.latestRoundData();
     }
 
     function test_getRoundData_returnsDiscountedPriceAndMetadata() public {
@@ -544,13 +833,10 @@ contract PendlePtDiscountOracleAdapterTest is Test {
 
     function test_getRoundData_bubblesBaseFeedRevert() public {
         RevertingAggregator revertingFeed = new RevertingAggregator();
-        MockAusdPt token = new MockAusdPt(maturity);
-        PendlePtDiscountOracleAdapter a = new PendlePtDiscountOracleAdapter(
-            address(revertingFeed), address(token), MAX_DELAY, MAX_RATE, RATE, "PT-AUSD / USD"
-        );
+        vm.etch(address(feed), address(revertingFeed).code);
 
         vm.expectRevert(RevertingAggregator.FeedReverted.selector);
-        a.getRoundData(1);
+        adapter.getRoundData(1);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -562,6 +848,15 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         assertEq(adapter.latestRound(), 1);
         assertEq(adapter.getAnswer(1), 75_000_000);
         assertEq(adapter.getTimestamp(1), block.timestamp);
+    }
+
+    function test_legacy_timestampUsesUpdatedAtWhenStartedAtDiffers() public {
+        uint256 startedAt = block.timestamp - 12;
+        uint256 updatedAt = block.timestamp - 7;
+        feed.set(AUSD_PRICE, 7, startedAt, updatedAt, 7);
+
+        assertEq(adapter.latestTimestamp(), updatedAt);
+        assertEq(adapter.getTimestamp(7), updatedAt);
     }
 
     function test_legacy_getAnswerZeroOnOversizedAndNonLatestRound() public view {
@@ -591,6 +886,24 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         assertEq(adapter.latestAnswer(), 90_000_000);
     }
 
+    function test_setDiscountRate_acceptsAnsweredInRoundZero() public {
+        feed.set(AUSD_PRICE, 2, block.timestamp, block.timestamp, 0);
+
+        adapter.setDiscountRatePerYear(1000);
+
+        assertEq(adapter.discountRatePerYear(), 1000);
+        assertEq(adapter.latestAnswer(), 90_000_000);
+    }
+
+    function test_setDiscountRate_revertsWhenBaseRoundIsStale() public {
+        feed.setStale(MAX_DELAY + 1);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
+        adapter.setDiscountRatePerYear(1000);
+
+        assertEq(adapter.discountRatePerYear(), RATE);
+    }
+
     function test_setDiscountRate_revertsForNonOwner() public {
         vm.prank(address(0xBAD));
         vm.expectRevert();
@@ -612,6 +925,76 @@ contract PendlePtDiscountOracleAdapterTest is Test {
         PendlePtDiscountOracleAdapter a = _deploy(block.timestamp + 5 * 365 days, MAX_RATE, 1000);
         vm.expectRevert(IPendlePtDiscountOracleAdapter.DiscountExceedsHundredPercent.selector);
         a.setDiscountRatePerYear(2500);
+    }
+
+    function test_setDiscountRate_revertsWhenImplyingExactlyFullDiscount() public {
+        // 2-year PT with a 50%/yr ceiling: 5000 bps over 2 years implies an exact 100% discount.
+        PendlePtDiscountOracleAdapter a = _deploy(block.timestamp + 730 days, 5000, 1000);
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.DiscountExceedsHundredPercent.selector);
+        a.setDiscountRatePerYear(5000);
+
+        // 1 bp below implies a 99.98% discount: accepted, with a small strictly positive price.
+        a.setDiscountRatePerYear(4999);
+        assertEq(a.discountRatePerYear(), 4999);
+        assertGt(a.latestAnswer(), 0);
+        assertEq(a.latestAnswer(), 20_000);
+    }
+
+    function test_setDiscountRate_revertsBeforeStoringRateThatNormalizesPriceToZero() public {
+        PendlePtDiscountOracleAdapter a = _deploy(block.timestamp + 4 * 365 days - 1, MAX_RATE, 1000);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
+        a.setDiscountRatePerYear(RATE);
+
+        assertEq(a.discountRatePerYear(), 1000, "failed update must leave the previous rate intact");
+        assertEq(a.latestAnswer(), 60_000_000);
+    }
+
+    function test_setDiscountRate_acceptsMinimumPositiveNormalizedPrice() public {
+        MockChainlinkAggregator minimumFeed = new MockChainlinkAggregator(3, FEED_DECIMALS, "minimum");
+        MockAusdPt token = new MockAusdPt(maturity);
+        PendlePtDiscountOracleAdapter minimumPriceAdapter =
+            new PendlePtDiscountOracleAdapter(address(minimumFeed), address(token), MAX_DELAY, 5000, 1000, "x");
+
+        assertEq(minimumPriceAdapter.latestAnswer(), 2);
+
+        minimumPriceAdapter.setDiscountRatePerYear(5000);
+
+        assertEq(minimumPriceAdapter.discountRatePerYear(), 5000);
+        assertEq(minimumPriceAdapter.latestAnswer(), 1);
+    }
+
+    function test_setDiscountRate_revertsBeforeStateChangeWhenCurrentBaseRoundIsInvalid() public {
+        _refresh(-1);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
+        adapter.setDiscountRatePerYear(1000);
+
+        assertEq(adapter.discountRatePerYear(), RATE);
+    }
+
+    function test_setDiscountRate_revertsBeforeStateChangeWhenCurrentBaseMetadataIsInvalid() public {
+        feed.set(AUSD_PRICE, 0, block.timestamp, block.timestamp, 0);
+
+        vm.expectRevert(IPendlePtDiscountOracleAdapter.InvalidPtPrice.selector);
+        adapter.setDiscountRatePerYear(1000);
+
+        assertEq(adapter.discountRatePerYear(), RATE);
+    }
+
+    function test_setDiscountRate_afterMaturity_succeedsUpToCeilingAndPricesAtPar() public {
+        vm.warp(maturity + 1 days);
+        _refresh(AUSD_PRICE);
+
+        // Post-maturity the discount is zero, so the full-discount guard passes for any in-range rate.
+        adapter.setDiscountRatePerYear(1000);
+        assertEq(adapter.discountRatePerYear(), 1000);
+        adapter.setDiscountRatePerYear(MAX_RATE);
+        assertEq(adapter.discountRatePerYear(), MAX_RATE);
+
+        // The stored rate no longer applies: the PT prices at par.
+        assertEq(adapter.latestAnswer(), AUSD_PRICE);
+        assertEq(adapter.getCurrentDiscount(), 0);
     }
 
     function test_ownership_renounceDisabled() public {
@@ -837,7 +1220,7 @@ contract PendlePtDiscountAdapterE2ETest is Test {
     }
 
     function test_e2e_invalidAnsweredInRoundReturnsZeroAndAaveFallsBack() public {
-        feed.set(AUSD_PRICE, 2, block.timestamp, block.timestamp, 0);
+        feed.set(AUSD_PRICE, 2, block.timestamp, block.timestamp, 1);
 
         assertEq(adapter.latestAnswer(), 0, "Aave-facing source read must fail closed to zero");
         assertEq(aaveOracle.getAssetPrice(address(pt)), FALLBACK_PRICE, "AaveOracle must use fallback on zero source");

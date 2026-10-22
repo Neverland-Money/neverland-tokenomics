@@ -1,12 +1,11 @@
 import "@nomicfoundation/hardhat-ethers";
-import "@nomicfoundation/hardhat-chai-matchers";
 import "@nomicfoundation/hardhat-foundry";
 import "@typechain/hardhat";
-require("dotenv").config();
-
-const ETHERS_V5 = process.env.ETHERS_V5 === "true";
-
 export default {
+  paths: {
+    sources: "./src",
+    cache: "./cache_hardhat",
+  },
   solidity: {
     version: "0.8.30",
     settings: {
@@ -27,7 +26,7 @@ export default {
     },
   },
   typechain: {
-    outDir: ETHERS_V5 ? "typechain-v5" : "typechain-v6",
-    target: ETHERS_V5 ? "ethers-v5" : "ethers-v6",
+    outDir: "generated/types",
+    target: "ethers-v6",
   },
 };

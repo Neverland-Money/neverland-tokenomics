@@ -7,7 +7,13 @@
     "strict": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node", "mocha"]
+    "types": ["node"]
   },
-  "include": ["hardhat.config.ts", "wagmi.config.ts"]
+  "include": [
+    "hardhat.config.ts",
+    "wagmi.config.ts",
+    "config/**/*.ts",
+    "index.ts",
+    "generated/**/*.ts"
+  ]
 }

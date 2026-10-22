@@ -8,34 +8,14 @@ evm_version = "cancun"
 bytecode_hash = "none"
 extra_output_files = ["abi", "metadata"]
 ignored_error_codes = ["license","code-size","init-code-size","transient-storage",8760,2519,3628]
-no_match_coverage = "^(script|test)/|^src/leaderboard/ProxyImports\\.sol$"
 fs_permissions = [
-  { access = "read", path = "./deployments" },
-  { access = "read", path = "./script/hardhat/config" },
+  { access = "read", path = "./ADDRESS_BOOK.md" },
   { access = "read", path = "./src" },
   { access = "read", path = "./out" },
 ]
 
-[profile.default.invariant]
-runs = 4
-depth = 256
-
-[profile.claim-reform-predeploy.invariant]
-runs = 256
-depth = 500
-fail_on_revert = true
-
-# Deep runs for the pre-existing oracle invariant suites (not fail_on_revert-hardened)
-[profile.deep-invariants.invariant]
-runs = 256
-depth = 500
-
-[rpc_endpoints]
-mainnet = "${MAINNET_RPC}"
-
 [lint]
 ignore = [
-  "script/Imports.sol",
   "src/leaderboard/ProxyImports.sol",
 ]
 exclude_lints = [

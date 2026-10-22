@@ -5,6 +5,9 @@ lib
 
 # Build outputs
 artifacts
+dist
+generated
+vendor
 cache
 out
 typechain
