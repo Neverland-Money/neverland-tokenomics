@@ -1,6 +1,7 @@
 # common folders to ignore
 node_modules/**
 lib/**
+vendor/**
 src/libraries/**
 # Deployed non-upgradeable timelock: keep OZ v5/deployed-lineage ^0.8.20 pragma.
 src/governance/NeverlandTimelockController.sol

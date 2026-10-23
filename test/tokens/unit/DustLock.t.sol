@@ -39,6 +39,16 @@ contract BadReceiver {
     }
 }
 
+contract EmptyDustLockReceiver {}
+
+contract RevertNoDataValidator {
+    fallback() external {
+        assembly {
+            revert(0, 0)
+        }
+    }
+}
+
 contract DustLockTests is BaseTestLocal {
     // Local event declaration for expectEmit matching (ERC-4906)
     event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
@@ -2604,6 +2614,321 @@ contract DustLockTests is BaseTestLocal {
         emit log_named_uint("[startField] Before unlock block timestamp", beforeUnlockTimestamp);
         assertEq(lockedBalance.effectiveStart, beforeUnlockTimestamp);
         assertFalse(lockedBalance.isPermanent);
+    }
+
+    /* ========== COVERAGE BRANCHES ========== */
+
+    /*
+     * DustLock storage slots the coverage tests write with vm.store; re-derive them from
+     * `forge inspect DustLock storage-layout` whenever the layout changes.
+     */
+    uint256 private constant POINT_HISTORY_SLOT = 155;
+    uint256 private constant EPOCH_SLOT = 166;
+    uint256 private constant LOCKED_SLOT = 168;
+    uint256 private constant SLOPE_CHANGES_SLOT = 171;
+
+    function testRevenueCoverageDustLockRemainingViewsAndReverts() public {
+        assertEq(dustLock.owner(), address(this));
+        assertEq(dustLock.clock(), uint48(block.timestamp));
+        assertEq(dustLock.CLOCK_MODE(), "mode=timestamp");
+
+        assertFalse(dustLock.isApprovedForAll(address(this), user2));
+        dustLock.setApprovalForAll(user2, true);
+        assertTrue(dustLock.isApprovedForAll(address(this), user2));
+        dustLock.setApprovalForAll(user2, false);
+        assertFalse(dustLock.isApprovedForAll(address(this), user2));
+
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 tokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        dustLock.approve(user3, tokenId);
+
+        vm.expectRevert(IDustLock.NotOwner.selector);
+        dustLock.transferFrom(user2, user3, tokenId);
+
+        EmptyDustLockReceiver emptyReceiver = new EmptyDustLockReceiver();
+        vm.expectRevert(IDustLock.ERC721TransferToNonERC721ReceiverImplementer.selector);
+        dustLock.safeTransferFrom(user, address(emptyReceiver), tokenId);
+
+        vm.expectRevert(IDustLock.NoLockFound.selector);
+        dustLock.depositFor(99_999, TOKEN_1);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        dustLock.earlyWithdraw(tokenId);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        dustLock.lockPermanent(tokenId);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotTeam.selector);
+        dustLock.toggleSplit(user, true);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotTeam.selector);
+        dustLock.setRevenueReward(revenueReward);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotTeam.selector);
+        dustLock.setEarlyWithdrawPenalty(1);
+
+        vm.expectRevert(IDustLock.InvalidWithdrawPenalty.selector);
+        dustLock.setEarlyWithdrawPenalty(BASIS_POINTS);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotTeam.selector);
+        dustLock.setEarlyWithdrawTreasury(user2);
+
+        vm.expectRevert(CommonChecksLibrary.AddressZero.selector);
+        dustLock.setEarlyWithdrawTreasury(address(0));
+
+        dustLock.setFeeEnforcedOperator(user2, false);
+    }
+
+    function testRevenueCoverageDustLockExpiredAndBoundaryReverts() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 tokenId = dustLock.createLock(TOKEN_1, MINTIME + WEEK);
+        IDustLock.LockedBalance memory locked = dustLock.locked(tokenId);
+        skipAndRoll(locked.end - block.timestamp + 1);
+
+        vm.expectRevert(IDustLock.LockExpired.selector);
+        dustLock.depositFor(tokenId, TOKEN_1);
+
+        vm.expectRevert(IDustLock.LockExpired.selector);
+        dustLock.lockPermanent(tokenId);
+
+        vm.expectRevert(IDustLock.LockExpired.selector);
+        dustLock.increaseUnlockTime(tokenId, MINTIME);
+    }
+
+    function testRevenueCoverageDustLockIncreaseUnlockTimeReverts() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+
+        uint256 maxTokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+        vm.expectRevert(IDustLock.LockDurationNotInFuture.selector);
+        dustLock.increaseUnlockTime(maxTokenId, MINTIME);
+
+        uint256 shortTokenId = dustLock.createLock(TOKEN_1, MINTIME + WEEK);
+        vm.expectRevert(IDustLock.LockDurationTooLong.selector);
+        dustLock.increaseUnlockTime(shortTokenId, MAXTIME + WEEK);
+
+        uint256 emptyTokenId = dustLock.createLock(TOKEN_1, MINTIME + WEEK);
+        _storeLocked(address(dustLock), emptyTokenId, 0, block.timestamp, block.timestamp + WEEK, false);
+        vm.expectRevert(IDustLock.NoLockFound.selector);
+        dustLock.increaseUnlockTime(emptyTokenId, MAXTIME);
+    }
+
+    function testRevenueCoverageDustLockWithdrawReverts() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 tokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        dustLock.withdraw(tokenId);
+
+        vm.expectRevert(IDustLock.LockNotExpired.selector);
+        dustLock.withdraw(tokenId);
+    }
+
+    function testRevenueCoverageDustLockSplitMergeAndPermanentReverts() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 from = dustLock.createLock(TOKEN_1 * 3, MAXTIME);
+        uint256 to = dustLock.createLock(TOKEN_1, MAXTIME);
+
+        vm.expectRevert(IDustLock.SameNFT.selector);
+        dustLock.merge(from, from);
+
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        dustLock.merge(from, to);
+
+        dustLock.approve(user2, from);
+        vm.prank(user2);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        dustLock.merge(from, to);
+
+        vm.expectRevert(IDustLock.SplitNotAllowed.selector);
+        dustLock.split(from, TOKEN_1);
+
+        dustLock.toggleSplit(user, true);
+
+        vm.prank(user3);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        dustLock.split(from, TOKEN_1);
+
+        vm.expectRevert(IDustLock.AmountTooBig.selector);
+        dustLock.split(from, TOKEN_1 * 3);
+        vm.expectRevert(IDustLock.AmountTooSmall.selector);
+        dustLock.split(from, TOKEN_1 * 2 + 1);
+
+        dustLock.lockPermanent(to);
+        vm.expectRevert(IDustLock.PermanentLock.selector);
+        dustLock.lockPermanent(to);
+    }
+
+    function testRevenueCoverageDustLockMergeExpiredTokenBranches() public {
+        _assertMergeExpiredReverts(false);
+        _assertMergeExpiredReverts(true);
+    }
+
+    function testRevenueCoverageDustLockSplitExpiredBranch() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 tokenId = dustLock.createLock(TOKEN_1 * 3, MINTIME + WEEK);
+        IDustLock.LockedBalance memory locked = dustLock.locked(tokenId);
+        dustLock.toggleSplit(user, true);
+
+        skipAndRoll(locked.end - block.timestamp + 1);
+
+        vm.expectRevert(IDustLock.LockExpired.selector);
+        dustLock.split(tokenId, TOKEN_1);
+    }
+
+    function testRevenueCoverageDustLockInternalDefensiveBranches() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+
+        uint256 unauthorizedWithdrawTokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+        vm.expectRevert(IDustLock.NotApprovedOrOwner.selector);
+        vm.prank(user2);
+        dustLock.withdraw(unauthorizedWithdrawTokenId);
+
+        uint256 emptyTokenId = dustLock.createLock(TOKEN_1, MINTIME + WEEK);
+        _storeLocked(address(dustLock), emptyTokenId, 0, block.timestamp, block.timestamp + WEEK, false);
+        vm.expectRevert(IDustLock.NoLockFound.selector);
+        dustLock.lockPermanent(emptyTokenId);
+
+        uint256 wrongFromTokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+        vm.expectRevert(IDustLock.NotOwner.selector);
+        dustLock.transferFrom(user2, user, wrongFromTokenId);
+    }
+
+    function testRevenueCoverageDustLockCheckpointDefensiveBranches() public {
+        uint256 nextWeek = ((block.timestamp / WEEK) + 1) * WEEK;
+        uint256 lastTimestamp = nextWeek - WEEK;
+        vm.warp(nextWeek + 1);
+        _storeEpoch(address(dustLock), 1);
+        _storeGlobalPoint(address(dustLock), 1, 1, 1, lastTimestamp, 0, 0);
+        _storeSlopeChange(address(dustLock), nextWeek, -2);
+        dustLock.checkpoint();
+
+        mintErc20Token(address(DUST), user, TOKEN_100K);
+        DUST.approve(address(dustLock), TOKEN_100K);
+        dustLock.createLock(TOKEN_100K, MAXTIME);
+    }
+
+    function testRevenueCoverageDustLockCheckpointTokenClampBranches() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 tokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+
+        _storeGlobalPoint(address(dustLock), dustLock.epoch(), 0, 0, block.timestamp, block.number, 0);
+        dustLock.lockPermanent(tokenId);
+    }
+
+    function testRevenueCoverageDustLockRoyaltyAndValidatorNoDataBranches() public {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 tokenId = dustLock.createLock(TOKEN_1, MAXTIME);
+
+        dustLock.setRoyaltyInfo(user2, 500);
+        DustLock(address(dustLock)).setTransferValidator(address(new RevertNoDataValidator()));
+        dustLock.setFeeEnforcedOperator(user, true);
+
+        vm.expectRevert(IDustLock.TransferValidationFailed.selector);
+        dustLock.transferFrom(user, user2, tokenId);
+    }
+
+    function _mappingSlot(uint256 key, uint256 slot) internal pure returns (bytes32) {
+        return keccak256(abi.encode(key, slot));
+    }
+
+    function _storeEpoch(address target, uint256 value) internal {
+        vm.store(target, bytes32(EPOCH_SLOT), bytes32(value));
+
+        assertEq(IDustLock(target).epoch(), value, "EPOCH_SLOT drifted");
+    }
+
+    function _storeGlobalPoint(
+        address target,
+        uint256 index,
+        int256 bias,
+        int256 slope,
+        uint256 timestamp,
+        uint256 blockNumber,
+        uint256 permanent
+    ) internal {
+        bytes32 base = _mappingSlot(index, POINT_HISTORY_SLOT);
+        vm.store(target, base, _intToBytes32(bias));
+        vm.store(target, bytes32(uint256(base) + 1), _intToBytes32(slope));
+        vm.store(target, bytes32(uint256(base) + 2), bytes32(timestamp));
+        vm.store(target, bytes32(uint256(base) + 3), bytes32(blockNumber));
+        vm.store(target, bytes32(uint256(base) + 4), bytes32(permanent));
+
+        IDustLock.GlobalPoint memory point = IDustLock(target).pointHistory(index);
+        assertEq(point.bias, bias, "POINT_HISTORY_SLOT bias drifted");
+        assertEq(point.slope, slope, "POINT_HISTORY_SLOT slope drifted");
+        assertEq(point.ts, timestamp, "POINT_HISTORY_SLOT ts drifted");
+        assertEq(point.blk, blockNumber, "POINT_HISTORY_SLOT blk drifted");
+        assertEq(point.permanentLockBalance, permanent, "POINT_HISTORY_SLOT permanentLockBalance drifted");
+    }
+
+    function _storeLocked(
+        address target,
+        uint256 tokenId_,
+        int256 amount,
+        uint256 effectiveStart,
+        uint256 end,
+        bool isPermanent
+    ) internal {
+        bytes32 base = _mappingSlot(tokenId_, LOCKED_SLOT);
+        vm.store(target, base, _intToBytes32(amount));
+        vm.store(target, bytes32(uint256(base) + 1), bytes32(effectiveStart));
+        vm.store(target, bytes32(uint256(base) + 2), bytes32(end));
+        vm.store(target, bytes32(uint256(base) + 3), bytes32(isPermanent ? uint256(1) : uint256(0)));
+
+        IDustLock.LockedBalance memory stored = IDustLock(target).locked(tokenId_);
+        assertEq(stored.amount, amount, "LOCKED_SLOT amount drifted");
+        assertEq(stored.effectiveStart, effectiveStart, "LOCKED_SLOT effectiveStart drifted");
+        assertEq(stored.end, end, "LOCKED_SLOT end drifted");
+        assertEq(stored.isPermanent, isPermanent, "LOCKED_SLOT isPermanent drifted");
+    }
+
+    function _storeSlopeChange(address target, uint256 timestamp, int256 slopeChange) internal {
+        vm.store(target, _mappingSlot(timestamp, SLOPE_CHANGES_SLOT), _intToBytes32(slopeChange));
+
+        assertEq(IDustLock(target).slopeChanges(timestamp), slopeChange, "SLOPE_CHANGES_SLOT drifted");
+    }
+
+    function _intToBytes32(int256 value) internal pure returns (bytes32 word) {
+        assembly {
+            word := value
+        }
+    }
+
+    /**
+     * @notice Merges two fresh locks after the short one expires and expects LockExpired.
+     * @param expireFrom Whether the short lock is the `from` side of the merge or the `to` side.
+     */
+    function _assertMergeExpiredReverts(bool expireFrom) internal {
+        mintErc20Token(address(DUST), user, TOKEN_10K);
+        DUST.approve(address(dustLock), TOKEN_10K);
+        uint256 from = dustLock.createLock(TOKEN_1, expireFrom ? MINTIME + WEEK : MAXTIME);
+        uint256 to = dustLock.createLock(TOKEN_1, expireFrom ? MAXTIME : MINTIME + WEEK);
+        IDustLock.LockedBalance memory shortLock = dustLock.locked(expireFrom ? from : to);
+
+        skipAndRoll(shortLock.end - block.timestamp + 1);
+
+        vm.expectRevert(IDustLock.LockExpired.selector);
+        dustLock.merge(from, to);
     }
 
     /* ========== HELPER FUNCTIONS ========== */

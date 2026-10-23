@@ -2,44 +2,204 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
-env:
-  FOUNDRY_PROFILE: ci
+permissions:
+  contents: read
+
+concurrency:
+  group: tokenomics-ci-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   check:
-    strategy:
-      fail-fast: true
-
-    name: Foundry project
-    runs-on: ubuntu-latest
+    name: Public package checks
+    runs-on: ubuntu-26.04
+    outputs:
+      release_requested: ${{ steps.release.outputs.release_requested }}
+      version: ${{ steps.release.outputs.version }}
+      artifact_id: ${{ steps.candidate.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Pin npm CLI
+        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
+
+      - name: Identify versioned main release
+        id: release
+        run: node tools/release.cjs plan
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+
+      - name: Install dependencies
+        run: |
+          corepack enable
+          yarn install --immutable
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: 1.5.1
 
-      - name: Show Forge version
-        run: |
-          forge --version
+      - name: Check formatting
+        run: yarn format:check
 
-      - name: Run Forge fmt
-        run: |
-          forge fmt --check
-        id: fmt
+      - name: Lint contracts
+        run: yarn lint
 
-      - name: Run Forge build
-        run: |
-          forge build --sizes
-        id: build
+      - name: Test release controls
+        run: yarn test:release
 
-      - name: Run Forge tests
-        run: |
-          forge test -vvv --no-match-contract '.*Fork.*'
-        id: test
+      - name: Build package exports
+        run: yarn build
+
+      - name: Check TypeScript and contract sizes
+        run: yarn typecheck && yarn check:sizes
+
+      - name: Run local contract tests
+        run: yarn tests:foundry
+
+      - name: Test package artifact verification
+        run: yarn test:package-verifier
+
+      - name: Verify package artifacts and sources
+        run: yarn verify:package
+
+      - name: Test installed release tarball
+        run: yarn test:package
+        env:
+          TOKENOMICS_RELEASE_OUTPUT: ${{ runner.temp }}/tokenomics-release
+
+      - name: Preserve verified release candidate
+        id: candidate
+        if: steps.release.outputs.release_requested == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tokenomics-release-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tokenomics-release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish verified package
+    needs: check
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'Neverland-Money/neverland-tokenomics' &&
+      needs.check.outputs.release_requested == 'true'
+    runs-on: ubuntu-26.04
+    environment: npm
+    outputs:
+      release_ready: ${{ steps.publication.outputs.release_ready }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Pin npm CLI
+        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
+
+      - name: Download verified release candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.check.outputs.artifact_id }}
+          path: ${{ runner.temp }}/tokenomics-release
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Publish or verify exact npm archive
+        id: publication
+        run: node tools/release.cjs publish "$TOKENOMICS_RELEASE_OUTPUT"
+        env:
+          TOKENOMICS_RELEASE_OUTPUT: ${{ runner.temp }}/tokenomics-release
+          TOKENOMICS_RELEASE_ARTIFACT_ID: ${{ needs.check.outputs.artifact_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  registry-check:
+    name: Verify registry consumers
+    needs: [check, publish]
+    if: needs.publish.outputs.release_ready == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Pin npm CLI
+        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund
+
+      - name: Download the same verified release candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.check.outputs.artifact_id }}
+          path: ${{ runner.temp }}/tokenomics-release
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Verify registry integrity and execute installed consumers
+        run: node tools/release.cjs registry-check "$TOKENOMICS_RELEASE_OUTPUT"
+        env:
+          TOKENOMICS_RELEASE_OUTPUT: ${{ runner.temp }}/tokenomics-release
+
+  finalize:
+    name: Finalize verified GitHub release
+    needs: [check, registry-check]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Download the same verified release candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.check.outputs.artifact_id }}
+          path: ${{ runner.temp }}/tokenomics-release
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Recheck identities and create GitHub tag and release
+        run: node tools/release.cjs finalize "$TOKENOMICS_RELEASE_OUTPUT"
+        env:
+          TOKENOMICS_RELEASE_OUTPUT: ${{ runner.temp }}/tokenomics-release
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

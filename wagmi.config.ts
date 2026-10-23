@@ -2,13 +2,19 @@ import { defineConfig } from "@wagmi/cli";
 import { hardhat } from "@wagmi/cli/plugins";
 
 export default defineConfig({
-  out: "artifacts/types/src/generated.ts",
+  out: "generated/abis.ts",
   contracts: [],
   plugins: [
     hardhat({
-      artifacts: "./artifacts",
+      artifacts: "./generated/artifacts",
       project: ".",
-      include: [`src/**`],
+      sources: "src",
+      commands: {
+        build: "yarn hardhat build --no-tests && node tools/bindings.mjs",
+        rebuild: "yarn hardhat build --no-tests && node tools/bindings.mjs",
+      },
+      include: ["src/**/*.json"],
+      exclude: ["**/*.dbg.json", "src/libraries/**", "src/utils/libraries/**"],
     }),
   ],
 });

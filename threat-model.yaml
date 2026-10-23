@@ -1,0 +1,813 @@
+version: 1
+
+instructions:
+  - Use this file for security review of src/ contracts; README.md, ARCHITECTURE.md, and CONTEXT.md describe the public package, behavior, and integration boundaries.
+  - Apply a known-issue exclusion only when its documented mechanism, preconditions, and impact match the finding.
+  - Treat declared trusted actors, dependencies, and operating conditions as audit premises. Verify claims about code-enforced checks and invariants against current source.
+  - Current source is authoritative. Distinguish deployed-code differences and block-pinned configuration from the implementation under review.
+  - This is a public source mirror. ADDRESS_BOOK.md contains recorded deployment metadata, not fresh live-state or source/bytecode verification. Deployment status, deployed-code differences, role assignments, and statements labeled "Current configuration" are carried-forward audit context from the development threat model; independently establish the applicable deployed code and block-pinned state before relying on them.
+  - Deployment tooling, historical compiler-input manifests, operator runbooks, private audit workpapers, fork suites, and extended stateful invariant and rehearsal campaigns are outside this repository. Retained local tests support their stated scope; their presence is not evidence of a completed audit or deployment validation.
+  - Keep entries specific to authority, trust boundaries, security invariants, and accepted failure mechanisms. SDK recipes, UI guidance, test results, and operational procedures belong in the referenced documentation.
+
+known_issues:
+  - id: KI-001
+    description: |
+      Behavior: DustLock team setters apply immediately, with no delay or expected-prior-value argument: setEarlyWithdrawPenalty (re-prices existing locks within [2500, 9999] bps), setEarlyWithdrawTreasury, setMinLockAmount (nonzero, no upper bound), toggleSplit, setRevenueReward (address(0) disables reward hooks, KI-009), setBaseURI, and the creator-fee setters (AS-015). A high minLockAmount blocks createLock, increaseAmount, depositFor, split, and emissions lock routes, but not exits, merges, or transfers.
+      Accepted because: these are trusted runtime powers (AS-003). earlyWithdrawPenalty is the maximum of the remaining-duration exit curve (AS-009), not a flat rate. DustLock enforces no ordering between that curve and the 50% emissions liquid fee (AS-013): below about 5,049 bps, claiming emissions into a zero-fee lock (commitment of at least 358 days) and exiting immediately keeps more than 50%; at 7,500 bps the best lock-then-exit route keeps about 42.7%. The exit penalty drops from at least 25% to 0 at maturity.
+      Mitigation: callers bound execution-time exit pricing with earlyWithdraw(tokenId, maxPenalty).
+      Still reportable: any path that changes these parameters without the team, or that sets values outside the coded bounds.
+    references:
+      - src/tokens/DustLock.sol
+      - src/interfaces/IDustLock.sol
+      - test/claim-reform/unit/DustLockExitPricing.t.sol
+
+  - id: KI-002
+    description: |
+      Behavior: DustLock early-exit penalties (earlyWithdraw) and DustLockTransferStrategy emissions fees are transferred to DustLock.earlyWithdrawTreasury, a nonzero, team-mutable address. No Neverland contract calls Dust.burn or burnFrom on these paths, and total supply does not change. Source comments that call the destination an "early-exit burn wallet" or describe the fee as burned (IDustLock, IDustLockTransferStrategy, DustLockTransferStrategy) describe an operational intent, not runtime behavior.
+      Accepted because: treasury routing is policy; any later burn is a separate operational action outside these contracts.
+      Do not report: the absence of an on-chain burn, or the "burn wallet" wording, as a vulnerability.
+    references:
+      - src/tokens/DustLock.sol
+      - src/emissions/DustLockTransferStrategy.sol
+      - src/interfaces/IDustLock.sol
+      - src/interfaces/IDustLockTransferStrategy.sol
+
+  - id: KI-003
+    description: |
+      Behavior: DustLock._checkpoint (MAX_CHECKPOINT_ITERATIONS = 255) and BalanceLogicLibrary.supplyAt each walk at most 255 weekly points per call; there is no stale-history guard and no CheckpointTooStale error. After a global idle gap longer than 255 weeks, a lock mutation does not revert: it writes 255 weekly points, applies the token's slope and bias change to the last, stale-timestamped global point, and later checkpoints decay that bias across the unprocessed gap. totalSupplyAt can then be understated relative to the sum of balanceOfNFTAt, so the shares of an affected RevenueReward bucket can sum above 100% and that bucket can pay out of other buckets' pooled balance (AS-011). balanceOfNFTAt uses a binary search with no week-walk cap.
+      Accepted because: the cap bounds per-call work, and the condition requires roughly 4.9 years without any DustLock checkpoint.
+      Mitigation: after long inactivity, call the permissionless checkpoint() repeatedly until pointHistory(epoch).ts reaches the current week before mutating locks or relying on current history.
+      Still reportable: a stale or understated global point reachable without an idle gap longer than 255 weeks.
+    references:
+      - src/tokens/DustLock.sol
+      - src/libraries/BalanceLogicLibrary.sol
+      - test/tokens/unit/DustLock.t.sol
+
+  - id: KI-004
+    description: |
+      Behavior: when block.timestamp is a nonzero exact multiple of WEEK, these revert with EpochFinalizationPending (declared in CommonChecksLibrary): DustLock transferFrom, both safeTransferFrom overloads, checkpoint, createLock, createLockFor, createLockPermanent, createLockPermanentFor, depositFor, increaseAmount, increaseUnlockTime, withdraw, both earlyWithdraw overloads, merge, split, lockPermanent, and unlockPermanent; and every RevenueReward state-changing claim (including claims for an older end time) and closeout hook. Approvals, team setters, reward notification, view functions, and the emissions liquid route (tokenId = 0, lockTime = 0) stay available; RevenueReward previews exclude bucket T, and DustLockTransferStrategy.previewClaim returns lock-route numbers that would revert. Timed lock ends are week-aligned, so a lock's maturity second is always a guarded second.
+      Accepted because: the revert is finality protection for the reward bucket at T (AS-007); every affected call succeeds at T + 1. RevenueReward.notifyAfterTokenMerged has a preclaim branch for the exact boundary that is entered at T but whose claim always reverts, so the branch is dead in effect, not a defense.
+      Still reportable: a boundary revert that persists after T, or a mutation at T that succeeds and changes bucket T.
+    references:
+      - src/libraries/CommonChecksLibrary.sol
+      - src/tokens/DustLock.sol
+      - src/rewards/RevenueReward.sol
+      - test/claim-reform/e2e/ClaimReformEpochFinalization.t.sol
+
+  - id: KI-005
+    description: |
+      Behavior: DustLock.createLockFor and createLockPermanentFor mint a veNFT to any nonzero address without the recipient's consent and without an onERC721Received check (split children are minted the same way), so anyone can create a timed or permanent lock owned by anyone; a lock minted to a contract that cannot handle ERC721 tokens is stranded. An approved address or operator can call withdraw, earlyWithdraw (the owner bears the penalty and receives the proceeds), increaseAmount, increaseUnlockTime (extending the owner's lock up to MAXTIME), merge into another token it controls (including a token owned by someone else, which moves the principal and the source's sub-unit reward carry to that owner without an ERC721 transfer and without creator-fee validation), lockPermanent, unlockPermanent, and split (subject to the owner's split permission).
+      Accepted because: DustLockTransferStrategy and DustLockLegendaryLedger mint locks for users; ERC721 approval already grants transferFrom-equivalent control over the token.
+      Still reportable: any lifecycle action other than the permissionless createLockFor, createLockPermanentFor, depositFor, and checkpoint that succeeds for a caller who is neither the owner nor approved for every token involved.
+    references:
+      - src/tokens/DustLock.sol
+
+  - id: KI-006
+    description: |
+      Behavior: DustLock.totalSupply() and totalSupplyAt() return total voting power, not an NFT count, while balanceOf(address) returns an NFT count; ERC721Enumerable is neither implemented nor advertised. merge and split neither check nor reset vote state, because no on-chain vote tally exists (AS-001); voting power is consumed only as RevenueReward bucket snapshots, leaderboard tiers, and off-chain snapshots.
+      Accepted because: intentional vote-escrow semantics. A vote-state finding becomes relevant only if an on-chain vote tally is introduced.
+    references:
+      - src/tokens/DustLock.sol
+      - src/interfaces/IDustLock.sol
+
+  - id: KI-007
+    description: |
+      Behavior: given the validation semantics in AS-015, owners, unlisted operators, mint, merge, split, withdraw, and earlyWithdraw are never validated; a validator or custom selector that returns false instead of reverting does not deny a transfer; royaltyInfo (EIP-2981, up to 10,000 bps) is informational and enforced nowhere; setTransferValidator checks code presence only when called; a state-writing validator configured as a view call makes every enforced transfer revert.
+      Accepted because: the team selects a compatible validator, selector, call type, and operator list; fee enforcement is intentionally limited to listed operators on ERC721 transfers.
+      Still reportable: a transfer by a listed fee-enforced operator that skips validation while a validator is set, or a validator failure that is ignored for a listed operator.
+    references:
+      - src/libraries/CreatorTokenLibrary.sol
+      - src/tokens/DustLock.sol
+      - test/tokens/unit/DustLockCreatorEarnings.t.sol
+
+  - id: KI-008
+    description: |
+      Behavior: DustLock ERC721 transfers, withdraw, earlyWithdraw, merge, and split call RevenueReward closeout hooks synchronously with no try/catch (AS-010). Each closeout iterates every registered reward token (registration has no lifetime cap, AS-011) and every unpaid weekly epoch since the token's last settlement, and transfers each nonzero entitlement with safeTransfer. One failing reward-token transfer or gas exhaustion reverts the DustLock operation; failures caused by an issuer pause or blocklist are covered by KI-035. Hook gas grows with unpaid epochs, on the order of 100k gas per unpaid week per reward token on mainnet state. A token minted while hooks were disabled has tokenMintTime = 0, so its first scan starts at epochNext(0) (in 1970) and adds roughly 2,960 weekly iterations per reward token: extra gas, never over-payment (voting power before mint is 0).
+      Accepted because: liveness limit under a small, curated reward-token set registered only by the trusted rewardDistributor (AS-005).
+      Mitigation: owners pre-claim per token and time range with getRewardUntilTs; the team can disable hooks with setRevenueReward(address(0)), which introduces KI-009 and KI-010.
+      Still reportable: a blocked closeout that chunked pre-claims by the owner cannot unblock.
+    references:
+      - src/rewards/RevenueReward.sol
+      - src/tokens/DustLock.sol
+      - test/revenue/unit/RevenueReward.t.sol
+
+  - id: KI-009
+    description: |
+      Behavior: while DustLock.revenueReward is address(0), lifecycle events do not reach RevenueReward, and re-enabling the handler does not replay them. Consequences: tokens minted in the window lack tokenMintTime (KI-008); transfers, merges, splits, and burns are not settled when they happen, so rewards accrued before an unhooked transfer stay with the tokenId and become claimable by the new owner; tokenRewardReceiver values and the usersWithSelfRepayingLoan and userTokensWithSelfRepayingLoan sets keep stale entries (a former owner cannot remove them because disabling requires current ownership, and burned IDs can never be removed); a token burned in the window without a stored receiver becomes unclaimable (KI-012), and one with a stored receiver follows KI-010.
+      Accepted because: setRevenueReward(address(0)) is the emergency valve that keeps lock operations available if RevenueReward fails; current-owner receiver checks prevent paying a stale receiver of a live token (AS-011).
+      Operational requirement: RevenueReward is wired before any mint; tokens affected during a disabled window are recorded and reconciled; re-enabling is not reconciliation.
+    references:
+      - src/tokens/DustLock.sol
+      - src/rewards/RevenueReward.sol
+
+  - id: KI-010
+    description: |
+      Behavior: if owner A enables self-repay, the team disables hooks, A transfers the NFT to B, B burns it (through withdraw or earlyWithdraw, or as a merge or split source), and hooks are restored, then DustLock.ownerOf reverts and RevenueReward._resolveRewardsReceiver returns A's stored tokenRewardReceiver (A's UserVault). The burned token's unsettled rewards, including those accrued while B owned it, are claimable only by and paid only to A's vault; settlement happens once.
+      Accepted because: residual of the burned-token fallback, which preserves claims after a same-owner burn during a hook-disabled window. No arbitrary caller and no double settlement results.
+      Mitigation: keep hooks enabled; if they were disabled, reconcile affected token IDs from reviewed ownership evidence.
+    references:
+      - src/rewards/RevenueReward.sol
+      - test/revenue/coverage/RevenueRewardCoverage.t.sol
+
+  - id: KI-011
+    description: |
+      Behavior: RevenueReward._earned returns before loading the fractional carry (AS-011) when no new eligible epoch exists (startTs > endTsEpoch). A merge can raise the destination's combined carry to one or more whole units, which stay unpaid until the next eligible epoch for that reward token is processed.
+      Accepted because: carry is retained, not lost; carry-only redemption is unsupported.
+    references:
+      - src/rewards/RevenueReward.sol
+
+  - id: KI-012
+    description: |
+      Behavior: these RevenueReward balances strand permanently:
+      - A bucket whose DustLock.totalSupplyAt(T) is 0 is skipped by every claimant, stays counted in totalRewardsPerToken, and cannot be recovered or rolled over; no rollover function exists.
+      - Sub-unit carry left on a tokenId burned by withdraw or earlyWithdraw. Merge moves the source carry to the destination, split divides it exactly, and a transfer leaves it with the tokenId.
+      - Unsettled rewards of a token burned while hooks were disabled and without a stored tokenRewardReceiver.
+      - Tokens sent directly to RevenueReward once cumulative payouts exceed them: recoverTokens (rewardDistributor only) sends each registered token's balance above its lifetime notified amount to the distributor, unregistered tokens have no recovery path, and one reverting balanceOf reverts the whole recovery.
+      Accepted because: conservative accounting that never lets recovery reach liabilities. The carry is dust; stray transfers are sender error and can be any size. A zero-supply bucket requires every lock to have expired or exited; permanent locks currently hold most voting power, but no protocol-owned permanent lock guarantees nonzero supply.
+    references:
+      - src/rewards/RevenueReward.sol
+      - test/revenue/coverage/RevenueRewardCoverage.t.sol
+
+  - id: KI-013
+    description: |
+      Behavior: on an ERC721 transfer, withdraw, or earlyWithdraw, RevenueReward settles every registered reward token to the previous owner's wallet (the from address DustLock passes), even when a current self-repay receiver is configured, then clears tokenRewardReceiver and removes the token from the self-repay sets. The new owner inherits no routing, and a transfer leaves the lock's amount, end, and permanent status unchanged. Merge and split closeouts follow the claim routing in AS-011.
+      Accepted because: intended exit routing; funds go to the owner, never to a third party.
+    references:
+      - src/rewards/RevenueReward.sol
+      - test/revenue/unit/RevenueReward.t.sol
+
+  - id: KI-014
+    description: |
+      Behavior: RevenueReward.getUsersWithSelfRepayingLoan and getUserTokensWithSelfRepayingLoanRange paginate live OpenZeppelin EnumerableSets whose removals swap and pop, so paging across blocks can skip or repeat entries; getAllUsersWithSelfRepayingLoan and getUserTokensWithSelfRepayingLoan return whole sets as unbounded views. The sets can hold stale entries after hook-disabled windows (KI-009). Routing changes made by hooks (removal on transfer, burn, merge, and split; propagation to split children) emit no SelfRepayingLoanUpdate event.
+      Accepted because: the getters and events are off-chain discovery aids; on-chain routing re-validates the current owner's canonical vault at claim time (AS-011). Executors filter by current ownership and routing before acting.
+    references:
+      - src/rewards/RevenueReward.sol
+      - src/interfaces/IRevenueReward.sol
+
+  - id: KI-015
+    description: |
+      Behavior: notifyRewardAmount and notifyRewardAmountForFollowingEpoch fund future buckets publicly, and a lock created or topped up as late as T - 1 shares bucket T pro rata by DustLock.balanceOfNFTAt(id, T) / totalSupplyAt(T). No holding period applies beyond the lock's own duration. Raising voting power at T - 1 without new principal (increaseUnlockTime, lockPermanent, or merging into a longer lock) also captures a larger share of bucket T, at the cost of a longer commitment.
+      Accepted because: standard vote-escrow snapshot design, bounded by the realized minimum commitment above 28 days, minLockAmount, the 28-day remaining-duration requirement for top-ups, decaying voting power, and the non-refundable exit penalty. AS-012 states the economic bound that a finding in this class must overcome.
+    references:
+      - src/rewards/RevenueReward.sol
+      - src/tokens/DustLock.sol
+
+  - id: KI-016
+    description: |
+      Behavior: DustRewardsController claim functions accept no maximum-fee or minimum-net parameter, and DustLockTransferStrategy prices timed claims from the commitment at inclusion time. An existing timed NFT's remaining commitment shrinks every second: a claim previewed at 358 days that executes one second later pays about 0.83% (about 83.086 DUST on 10,000 DUST) instead of 0 (the fee step in AS-013). A new timed lock's commitment is lockTime - ((block.timestamp + lockTime) mod WEEK), so any lockTime below 365 days can price differently between preview and inclusion. Only lockTime = 365 days exactly, the permanent-lock sentinel, deposits into permanent NFTs, and the liquid route are time-invariant. A lockTime in (365 days, 372 days) reverts LockDurationTooLong when (block.timestamp + lockTime) mod WEEK < lockTime - 365 days, and a lockTime of 372 days or more always reverts.
+      Accepted because: timed fees are bounded by ceil(gross * 4000 / 10000), and gross is always fully allocated between fee and net.
+      Mitigation: re-preview near submission. An enforceable user bound requires a new controller and strategy API.
+    references:
+      - src/emissions/DustLockTransferStrategy.sol
+      - src/emissions/DustRewardsController.sol
+      - test/claim-reform/unit/DustLockTransferStrategyPricing.t.sol
+
+  - id: KI-017
+    description: |
+      Behavior: the DustRewardsController proxy was deployed without calling initialize (lastInitializedRevision is 0), so anyone can call initialize(address) once; the call has no effect because EMISSION_MANAGER is an implementation immutable (AS-013) and initialize writes no privileged state. The UserVaultFactory implementation contract does not call _disableInitializers() and is uninitialized; its storage is not the proxy's configuration, it performs no delegatecall or selfdestruct, and RevenueReward only honors the factory proxy's getUserVault.
+      Accepted because: neither path grants authority or changes proxy state.
+      Still reportable: an initializer reachable on a proxy whose execution changes privileged state.
+    references:
+      - src/emissions/DustRewardsController.sol
+      - src/self-repaying-loans/UserVaultFactory.sol
+
+  - id: KI-018
+    description: |
+      Behavior: UserVault.swapAndVerify and repayUserDebt value both swap legs as amount * price / 10^decimals (rounded down, in the oracle's own unit) using one getAssetsPrices([tokenIn, tokenOut]) call on the oracle of the executor-chosen registered provider (zero prices revert GettingAssetPriceFailed; an oracle without the batch function reverts). The check compares output value with the requested input value and runs only when output value is lower; if the input value rounds down to 0 (dust inputs), any output, including 0, passes; computed slippage bps round down and revert only when strictly above the maximum; input spend is not measured, and unspent input stays in the vault. UserVaultRegistry.setMaxSwapSlippageBps has no cap, and a ceiling of 10,000 bps or more lets a zero-output swap pass (current configuration: 1,000 bps). Executor-supplied aggregatorData decides where swap output goes, so each swap can divert value up to the slippage ceiling, and repeated swaps compound with no rate limit. Allowlisting a contract that acts on msg.sender's assets (for example a token contract) would let a dust-input call move vault funds.
+      Accepted because: the executor, the registry owner, the aggregator allowlist, the AaveOracle wiring of registered markets, and token semantics are trusted (AS-016); the check bounds normal execution and does not isolate a compromised trusted component. There is no revert on a zero valuation and no rounded-up slippage in current code (the 18-decimal normalization comment is listed in KI-034).
+      Still reportable: an unprivileged caller reaching an executor-only function, an approval left nonzero after a call, value leaving the vault through any path other than executor-directed swaps, repayments, and supplies and recoveries to the vault user, or a mispricing in a src/ price source (KI-020).
+    references:
+      - src/self-repaying-loans/UserVault.sol
+      - src/self-repaying-loans/UserVaultRegistry.sol
+      - test/self-repaying-loans/unit/UserVault.t.sol
+
+  - id: KI-019
+    description: |
+      Behavior: UserVault.repayDebt calls repay(debtToken, amount, 2, user), discards the pool's return value, and emits LoanSelfRepaid with the requested amount; the pool repays at most the user's variable debt, and the excess stays in the vault, recoverable to the user. Repaying amount = type(uint256).max on behalf of another user reverts in the lending core. repayUserDebt always swaps (a zero aggregator or zero amount reverts) and ignores the claimed amount, spending the executor-chosen amount from the vault's pooled balance. getTokenIdsReward is all-or-nothing: an ID whose stored receiver is not the vault reverts InvalidUserVaultForToken, RevenueReward reverts NotOwner when the vault is not the resolved receiver (for example a stale ID), and every claim reverts EpochFinalizationPending at the exact boundary second (KI-004), so the executor must pre-filter IDs and timing. Only repayDebt emits an event. Funds in the vault stay at the executor's discretion until used or recovered.
+      Accepted because: reporting and liveness limits only; no path misroutes value.
+    references:
+      - src/self-repaying-loans/UserVault.sol
+      - src/rewards/RevenueReward.sol
+      - test/self-repaying-loans/coverage/UserVaultCoverage.t.sol
+
+  - id: KI-020
+    description: |
+      Behavior: with every registered market's AaveOracle fallback unset (AS-006), a Neverland price source that answers 0 or reverts (invalid or stale base feed, a YieldBearingOracleAdapter ratio beyond cap * (1 + grace), a PendlePtDiscountOracleAdapter without a valid base round, and, once deployed, MarketHoursPriceAdapter age failures) makes getAssetPrice revert for that asset. Every action that values an affected account then reverts, for example borrowing, withdrawing or transferring collateral aTokens or disabling collateral while in debt, E-mode changes while in debt, liquidation (including below health factor 0.95), repayWithATokens on a collateral reserve when debt remains afterward, and UserVault swaps that price the asset.
+      Accepted because: failing closed is preferred over pricing at an unverified value. Recovery is operational: restore the feed, re-baseline or wait for the snapshot cap, or switch the reserve to a governed source.
+      Still reportable: a source that returns a nonzero wrong value, or reverts, while its upstream inputs are valid and conformant.
+    references:
+      - lib/neverland-lending/contracts/misc/AaveOracle.sol
+      - src/oracles/YieldBearingOracleAdapter.sol
+      - src/oracles/PendlePtDiscountOracleAdapter.sol
+      - test/oracles/e2e/AaveOracleE2E.t.sol
+
+  - id: KI-021
+    description: |
+      Behavior: RatioOracleAggregator and YieldBearingOracleAdapter read upstream feeds and the ERC-4626 vault with typed try/catch, which catches upstream reverts but not caller-side ABI-decoding failures. A feed reply shorter than 160 bytes or with dirty uint80 high bits, a convertToAssets reply shorter than 32 bytes, or an upstream address without code makes latestAnswer revert instead of returning 0. The version 1 PendlePtDiscountOracleAdapter instance (AS-020) reads its feed the same way; current PendlePtDiscountOracleAdapter source (version 2) uses a bounded raw staticcall and returns 0 in these cases. Comments claiming that legacy reads return 0 on any failure are listed in KI-034.
+      Accepted because: upstream feeds and vaults are trusted, ABI-conformant contracts (AS-017), and with the AaveOracle fallback unset a revert and a 0 answer both fail closed (KI-020).
+      Still reportable: a conformant upstream that can trigger the revert, or a configuration with a nonzero AaveOracle fallback for such an asset.
+    references:
+      - src/oracles/RatioOracleAggregator.sol
+      - src/oracles/YieldBearingOracleAdapter.sol
+      - src/oracles/PendlePtDiscountOracleAdapter.sol
+
+  - id: KI-022
+    description: |
+      Behavior (YieldBearingOracleAdapter; mechanics in AS-018):
+      - Until setGrowthCapBounds has been called and a snapshot is effective, the adapter publishes the uncapped vault ratio times the base price (base-feed validation still applies). Nothing on-chain prevents wiring an unconfigured adapter into AaveOracle.
+      - A queued snapshot records the ratio at queue time, but its headroom starts at effectiveAt, so ratio growth during minimumSnapshotDelay is clamped, or priced at 0 when it exceeds grace (always, with rejectionGraceBps = 0), until the cap catches up.
+      - Each updateSnapshot replaces any pending snapshot and restarts its delay, so the keeper can postpone activation indefinitely; a snapshot can latch a transiently inflated live ratio as the next baseline; updateSnapshotImmediate (owner) applies at once.
+      - setGrowthCapBounds and setRejectionGraceBps apply immediately and retroactively over the snapshot's whole age.
+      - Beyond cap * (1 + grace) the adapter fails closed until the cap catches up, a queued snapshot matures, or the owner calls updateSnapshotImmediate or raises setGrowthCapBounds or setRejectionGraceBps; recovery depends on the operator, and a permanently compromised vault keeps the adapter frozen.
+      Accepted because: the owner and keeper are trusted, and the activation-time freeze, which occurs under correct operation when rejectionGraceBps = 0, is an accepted fail-closed outcome. Configuring cap bounds and an initial snapshot before wiring is a deployment prerequisite enforced by deployment tooling and process, not by code.
+    references:
+      - src/oracles/YieldBearingOracleAdapter.sol
+      - src/interfaces/IYieldBearingOracleAdapter.sol
+      - test/oracles/unit/YieldBearingOracleAdapter.t.sol
+
+  - id: KI-023
+    description: |
+      Behavior: owner-set valuations are not market prices. GovernedPriceOracle.setPrice takes effect immediately with no expiry, market check, step bound, delay, or expected-prior-value check (AS-021); a mis-scaled post reaches AaveOracle unchanged, and an older pending Safe transaction can overwrite a newer price when executed later. HardcodedPriceOracle never tracks the market and always reports updatedAt = block.timestamp. PendlePtDiscountOracleAdapter owners change the discount rate immediately within the immutable ceiling, independently of Pendle market prices. YieldBearingOracleAdapter owners can apply snapshots immediately (KI-022).
+      Accepted because: trusted valuation authority (AS-003); authorized changes can still move health factors and fills.
+      Mitigation: operations keep one outstanding governed-price transaction at a time, reject superseded proposals, check execution state, monitor prices, and size reserve parameters.
+    references:
+      - src/oracles/GovernedPriceOracle.sol
+      - src/oracles/HardcodedPriceOracle.sol
+      - src/oracles/PendlePtDiscountOracleAdapter.sol
+      - test/oracles/unit/GovernedPriceOracle.t.sol
+
+  - id: KI-024
+    description: |
+      Behavior: NeverlandAssetRedemption.redeem(amount) pays floor(amount * exchangeRate / FROM_DENOMINATOR) of TO_TOKEN (FROM_DENOMINATOR = 10^FROM_TOKEN decimals) with no user minimum-output parameter; a zero payout or insufficient TO_TOKEN balance reverts. The owner can pause (pausing gates only redeem), change exchangeRate only while paused, and withdraw any token at any time, including while redemption is live, so a pending redeem can be front-run into a revert. Withdrawing FROM_TOKEN requires a TO_TOKEN balance of 0, so a 1-wei TO_TOKEN donation blocks FROM_TOKEN withdrawal until the owner withdraws that TO_TOKEN. Surrendered source units are held, not burned, and recirculated units remain redeemable. totalRedeemed and totalPaid are saturating lifetime counters, not an entitlement ledger. Anyone can add liquidity with supply(amount) or a direct transfer; amounts are credited without balance-delta checks (AS-005). The deployed instance redeems the main market's nLOAZND aToken for USDC: aToken balances stay constant only while that reserve's liquidity index is unchanged (current configuration: the reserve is frozen with borrowing disabled), and aToken transfers are subject to lending-core health-factor checks and reserve pauses.
+      Accepted because: bearer redemption with owner-governed liquidity and rate. Pause, reprice, and unpause can execute in one batch, so the paused-only rate rule does not guarantee a quote to a queued redeemer.
+    references:
+      - src/utils/NeverlandAssetRedemption.sol
+      - test/utils/unit/NeverlandAssetRedemption.t.sol
+
+  - id: KI-025
+    description: |
+      Behavior: NeverlandNativeGateway.withdraw with amount = type(uint256).max resolves to the caller's full current aToken balance, not min(balance, allowance), so an exact approval becomes insufficient after interest accrual or an aToken donation and the call reverts. In current source, withdrawWithPermit swallows any permit failure, not only an already-consumed permit, and the allowance-gated pull decides the outcome.
+      Deployed difference: the shMON instance runs earlier source (AS-002). In that instance a failing or front-run permit reverts withdrawWithPermit (withdraw still works once an allowance exists), supply accepts onBehalfOf = address(0), withdrawals accept to = address(0), and the emergency transfer functions accept to = address(0) and emit no events.
+      Accepted because: matches the upstream native-gateway pattern and intentionally differs from the maturity gateway's max resolution (KI-028); zero-recipient inputs in the deployed instance only harm the caller who passes them. Other gateway behaviors are listed in AS-023.
+    references:
+      - src/utils/NeverlandNativeGateway.sol
+      - test/utils/unit/NeverlandNativeGateway.t.sol
+
+  - id: KI-026
+    description: |
+      Behavior: NeverlandUiProvider revenue summaries call pendingRewards(address,address), which RevenueReward does not implement; the failure is caught and the revenue component is marked unresolved, so against the current RevenueReward source the revenue resolution mask is always 0 and a reported zero is not a confirmed zero. Summaries do not include tokens already held in the user's UserVault. Dashboard, essential, and full-bundle reward rows report a failed earnedRewardsAll read as 0 with no resolution flag. Resolution bitmasks cover only the first 256 rows. The paginated dashboard, essential, and full-bundle views cap raw scans at 1,024 slots per call, while getUnlockSchedule and getUserRewardsSummary scan without a cap up to DustLock.tokenId(). Some reads stay strict, for example BalanceUnreadable for an unreadable reward-token balance.
+      Accepted because: view-only integration limits that move no value; consumers handle resolution flags, timestamps, and pagination (AS-022).
+    references:
+      - src/utils/NeverlandUiProvider.sol
+      - src/utils/libraries/NeverlandUiRewardsSummaryLibrary.sol
+      - src/utils/libraries/NeverlandUiEnumerationLibrary.sol
+
+  - id: KI-027
+    description: |
+      Behavior: NeverlandPendleMaturityGateway.migrate buys target PT round by round with a per-round minimum output of 0 and checks the aggregate output once against max(minPtOut, oracleFloor, parFloor). oracleFloor = ceil(spent * debtPrice * 9000 / (ptPrice * 10000)) target-PT units, priced by the isolated pool's oracle (MAX_ORACLE_DEVIATION_BPS = 1,000; spent excludes repayment); parFloor = spent - floor(spent / 10000). While ptPrice / debtPrice is above about 0.9001, oracleFloor is below parFloor and never binds, so the caller's minPtOut is the only protection of expected yield against sandwiching; parFloor limits loss to 1 bp of principal units. Only migrate takes minHealthFactor, enforced when the caller still borrows after the migration; close takes no health-factor minimum, although each collateral pull by a borrower runs the pool's health-factor check.
+      Accepted because: minPtOut is the caller's slippage control; callers derive it from a simulated fill plus their chosen slippage; previews do not bind later state.
+      Still reportable: a migration whose aggregate output is below any of the three bounds without reverting, or a loss caused by the gateway rather than by the caller's parameters or a trusted dependency (AS-024).
+    references:
+      - src/utils/NeverlandPendleMaturityGateway.sol
+      - test/utils/unit/NeverlandPendleMaturityGateway.t.sol
+
+  - id: KI-028
+    description: |
+      Behavior: with ptAmount = type(uint256).max, NeverlandPendleMaturityGateway resolves the amount to min(source aToken balance, allowance) at execution, and the pre-flight check reverts InsufficientFlashLiquidity when ceilDiv(flashTotal, cash) > maxRounds, where flashTotal is the amount to flash-borrow and cash is the selected lender's per-round capacity. When the allowance exceeds the balance (for example an unlimited approval), a third party can transfer source aTokens to the user so that the required rounds exceed maxRounds; migrate, or a close limited by the source balance, then reverts before any flash loan, and unchanged retries keep failing because the donation persists. Closes limited by debt are unaffected.
+      Accepted because: a clean revert with no loss. The attacker must donate enough to cross the next round boundary, and the donated aTokens stay with the user as collateral. No separate ptAmountCap is provided: an exact approval or permit already caps max through the allowance. An explicit ptAmount also avoids the balance-driven increase; extra rounds of headroom only raise the donation required. Ordinary changes in lender capacity trip a zero-headroom round budget in the same way, so frontends need headroom regardless.
+    references:
+      - src/utils/NeverlandPendleMaturityGateway.sol
+      - test/utils/unit/NeverlandPendleMaturityGateway.t.sol
+
+  - id: KI-029
+    description: |
+      Behavior: these NeverlandPendleMaturityGateway outcomes revert atomically, with no loss:
+      - Error "25": with the variable-debt index above 1e27, a partial burn of 1 wei floors amount * 1e27 / index to zero, which VariableDebtToken.burn rejects. This includes explicit repayAmount = 1, a finite budget that leaves a 1-wei final round, or a close with ptAmount = 1. A burn that clears the remaining debt uses the full scaled balance instead.
+      - InsufficientFlashLiquidity mid-loop: repay rounding can need one round more than the pre-flight estimate, which reverts when it exceeds maxRounds (previews return the real round count); lender capacity (Morpho balance, global-pool state) can also change between preview and execution.
+      - A near-zero purchase mid-migration reverts inside Pendle, or with error "26" in pool supply when nothing is bought, rather than being skipped.
+      - CollateralNotEnabled: a target with LTV 0 or a debt ceiling, a target held but not enabled as collateral, or a caller already in isolation mode.
+      - Error "51": the target's supply cap. Error "57": a nonzero-LTV source pull while the borrowing caller has another enabled zero-LTV collateral. Error "35": an intermediate collateral pull that would leave a borrowing caller below health factor 1.
+      - A debt-free migration still requires flash liquidity: it buys and supplies the target before withdrawing and redeeming the source. There is no separate debt-free path.
+      Accepted because: documented constraints; previews propagate the same failures and a reverted action leaves the position unchanged. The gateway does not silently skip a partial repayment that burns zero shares. For migrations, repayAmount = 0 or max avoids a finite repayment-budget tail; a finite budget must avoid a 1-wei partial round. Other rounding and liquidity limits still apply. Callers keep round headroom, and debt-free users can use pool withdrawal and Pendle redemption/purchase directly, subject to the pool's collateral checks.
+    references:
+      - src/utils/NeverlandPendleMaturityGateway.sol
+      - test/utils/unit/NeverlandPendleMaturityGateway.t.sol
+      - test/utils/integration/NeverlandPendleMaturityGatewayLending.t.sol
+      - lib/neverland-lending/contracts/protocol/tokenization/VariableDebtToken.sol
+      - lib/neverland-lending/contracts/protocol/libraries/helpers/TokenMath.sol
+      - test/utils/integration/NeverlandPendleMaturityGatewayIndex.t.sol
+
+  - id: KI-030
+    description: |
+      Behavior (leaderboard; trust model in AS-026):
+      - lastSettlement is shared per user, so a user's syncMyState defers that user's next keeper settlement and a settlement defers that user's syncMyState. settle (keeper or owner) skips users settled within minSettlementInterval, syncMyState enforces selfSyncCooldown, and emergencySettle ignores both. Both intervals are unbounded owner settings; an extreme value overflows lastSettlement + interval and reverts settle batches or syncMyState.
+      - EpochManager lets the owner schedule past or future starts and ends without ordering or overlap checks once the current epoch has an end, or whenever currentEpoch() returns 0. currentEpoch() inspects only the two latest epochs and can return 0 inside a scheduled window or disagree with isEpochActive(id); hasStarted() and isInGapPeriod() read true before a future-scheduled first epoch begins.
+      - LeaderboardConfig blacklist removal is O(n) per address (linear scan with swap-and-pop) and O(n * m) in batch.
+      - NFTPartnershipRegistry has no partnership cap; removePartnership, setMultiplierParams, and getActivePartnerships are O(n).
+      Accepted because: owner, keeper, and publisher inputs are trusted for off-chain scoring; syncMyState affects only the caller's own settlement timing; these contracts hold and move no funds.
+    references:
+      - src/leaderboard/LeaderboardKeeper.sol
+      - src/leaderboard/EpochManager.sol
+      - src/leaderboard/LeaderboardConfig.sol
+      - src/leaderboard/NFTPartnershipRegistry.sol
+      - test/leaderboard/unit/EpochManagerScheduledActiveProbe.t.sol
+
+  - id: KI-031
+    description: |
+      Behavior (market-hours safety design, with no deployment recorded in ADDRESS_BOOK.md; design in AS-025):
+      - MarketHoursSentinel never gates borrowing (isBorrowAllowed always returns true): during closures and the opening grace, users borrow and withdraw collateral against the last eligible feed round whenever the price read succeeds; the grace holds only liquidations with health factor in [0.95, 1).
+      - MarketHoursPriceAdapter accepts a halted feed that repeats a price with fresh timestamps, and a pre-adjustment price until the feed reprices after a corporate action; the adapter has no deviation, round-progression, issuer-flag, or sequencer input.
+      - After a sequencer outage there is no detection or recovery grace: the grace is tied only to session window starts, so every position below health factor 1 can be liquidated as soon as execution resumes outside an opening grace, priced at the pre-outage round while that round is within its age bound.
+      - Anyone can send a user a first-receipt stock aToken that the lending core enables as collateral automatically; while that stock's price is invalid, the recipient's valuation-dependent actions, including liquidation, revert (KI-020).
+      - With an exhausted, empty, or not-yet-started calendar, the adapter judges every round by the closure age bound; an exhausted or empty calendar also removes future opening grace (a future window still grants its grace when it starts). Truncating a running window can end its grace early, move fresh in-session rounds to the closure bound, or invalidate a carried round against the new close.
+      - Freezing a stock blocks only its new supply and borrowing; withdrawal, aToken transfer, collateral changes, flash loans, and liquidation continue.
+      Accepted because: limited-policy residuals for stock collateral with USDG debt; issuer actions are out of scope (AS-005, KI-035); controls are pool pause, LTV and cap sizing, governed replacement prices, and monitoring.
+      Still reportable: a price served outside the adapter's age rules, a liquidation in the [0.95, 1) band during an opening grace, or a rejected round that is used.
+    references:
+      - src/oracles/MarketHoursPriceAdapter.sol
+      - src/risk/MarketHoursSentinel.sol
+      - src/oracles/SessionCalendar.sol
+      - test/risk/integration/MarketSafetyLendingCore.t.sol
+
+  - id: KI-032
+    description: |
+      Behavior: MarketHoursPriceAdapter.latestAnswer returns 0 when the feed call reverts, but reverts when feed return data cannot be decoded, when the feed has no code, or when a calendar read reverts. latestRoundData calls the feed without a guard and can return a zero answer, so it does not follow the strict V3 revert policy of the other adapters; the adapter has no getRoundData; latestTimestamp returns the raw feed time even when the answer is rejected; feed decimals are checked only at construction. MarketHoursSentinel reads the calendar without try/catch, so a faulting calendar reverts liquidations in the [0.95, 1) health-factor band while grace is nonzero. Feed reads and sentinel calls forward all available gas.
+      Accepted because: the lending core evaluates sentinel verdicts inside require, and a reverting or 0 adapter answer makes AaveOracle revert while its fallback is unset and no E-mode price source overrides the stock price (AS-025), so these failures fail closed; a gas cap would only add a false-reject mode.
+      Still reportable: a failing or zero read that changes an allow or deny outcome in the permissive direction.
+    references:
+      - src/oracles/MarketHoursPriceAdapter.sol
+      - src/risk/MarketHoursSentinel.sol
+      - test/oracles/unit/MarketHoursPriceAdapter.t.sol
+
+  - id: KI-033
+    description: |
+      Boundary: governance payload preparation, chain/network metadata, provenance checks, and scheduling tooling are maintained outside this public src/ scope. These off-chain checks grant no on-chain authority. Governance Safe authorizes operations; timelocks enforce their source-defined roles, delay floors, operation ordering, and execution conditions, not payload provenance. Direct Safe-administered surfaces have no timelock (AS-003).
+      Accepted boundary: missing tooling metadata or provenance checks alone are not an on-chain access-control bypass.
+      Still reportable: missing or bypassable on-chain role, delay, ordering, or execution checks, privilege escalation, or unauthorized effects; the absence of private tooling does not establish the security of an on-chain execution path.
+    references:
+      - src/governance/NeverlandTimelockController.sol
+      - test/governance/TokenomicsUpgradeTimelock.t.sol
+
+  - id: KI-034
+    description: |
+      Behavior: these source comments and declarations do not match runtime behavior; runtime behavior is authoritative, and a mismatch alone is not a vulnerability.
+      - IDustLock: InvalidWithdrawPenalty says only values >= 10000 are invalid, but setEarlyWithdrawPenalty accepts only [2500, 9999]; earlyWithdrawPenaltyAmount calls the treasury a burn wallet (KI-002); UnlockPermanent says "unlocked by governance", but unlocking is an owner or approved action that also runs inside a permanent earlyWithdraw; the withdraw notice says rewards are no longer claimable, but while hooks are enabled the burn hook settles them to the owner; DepositForLockDurationTooShort is also thrown by increaseAmount and by DustLockTransferStrategy; InvalidTransferValidationFunction is never thrown; the merge notice says the destination's duration is preserved, but the merged lock takes the later of both ends.
+      - IYieldBearingOracleAdapter: SnapshotTooRecent and SnapshotTooOld are never thrown, and the keeper is said to update growth cap parameters, but the keeper can only call updateSnapshot. YieldBearingOracleAdapter describes minimumSnapshotDelay as a minimum interval between updates, but it is the delay from queuing to activation. RatioOracleAggregator and YieldBearingOracleAdapter comments say legacy reads return 0 on any failure (KI-021).
+      - IDustLockTransferStrategy and DustLockTransferStrategy use "burn wallet" wording (KI-002), and IDustLockTransferStrategy says the fee declines linearly to 0 at 358 days, but the fee steps to 0 there (AS-013). IDustTransferStrategy says the controller calls the strategy by delegate call, but it is a regular call. IDustRewardsController names an allowClaimOnBehalf function; the mechanism is setClaimer.
+      - IRevenueReward: getReward says DustLock may call it directly (DustLock has no special access) and that rewards go to the configured receiver (routing follows AS-011); enableSelfRepayLoan says it configures a custom receiver and reverts on a zero rewardReceiver, but the receiver is always the owner's UserVault and no such parameter exists; fractional carry is described as a remainder that cannot be paid out, but whole units are paid when an eligible epoch is processed. The RevenueReward initializer documents the distributor as the DustRewardsController.
+      - IUserVaultFactory swaps the descriptions of getUserVault and getOrCreateUserVault; UserVault says amounts are normalized to 18 decimals, but they are valued in oracle units; IUserVault describes the repayUserDebt swap as optional, but repayUserDebt always swaps.
+      - IEpochManager says overlapping epochs revert and that hasStarted means currentEpoch > 0, but hasStarted checks latestEpoch > 0; SpecialEditionRegistry says it rejects IDs that are not minted veDUST tokens, but it rejects only 0; LeaderboardKeeper and ILeaderboardKeeper describe verified on-chain state, but current-source inputs are unverified; IVotingPowerMultiplier documents MultiplierTooHigh as exceeding the maximum, but it is also thrown for values below the minimum.
+      - INeverlandUiProvider mentions RevenueLending lender tabs, which are absent from src/, and calls effectiveStart a penalty anchor, but effectiveStart is not a pricing input.
+    references:
+      - src/interfaces/IDustLock.sol
+      - src/interfaces/IYieldBearingOracleAdapter.sol
+      - src/oracles/YieldBearingOracleAdapter.sol
+      - src/interfaces/IDustLockTransferStrategy.sol
+      - src/interfaces/IDustTransferStrategy.sol
+      - src/interfaces/IDustRewardsController.sol
+      - src/interfaces/IRevenueReward.sol
+      - src/rewards/RevenueReward.sol
+      - src/interfaces/IUserVaultFactory.sol
+      - src/self-repaying-loans/UserVault.sol
+      - src/interfaces/IUserVault.sol
+      - src/interfaces/IEpochManager.sol
+      - src/leaderboard/SpecialEditionRegistry.sol
+      - src/leaderboard/LeaderboardKeeper.sol
+      - src/interfaces/IVotingPowerMultiplier.sol
+      - src/interfaces/INeverlandUiProvider.sol
+
+  - id: KI-035
+    description: |
+      Behavior: issuer pauses, blocklists, freezes, or token upgrades can make transfers, pulls, or approvals fail. This can block claims, synchronous DustLock reward closeouts, vault/gateway/redemption actions, and lending liquidations. A paused reward token or blocklisted payout recipient can therefore block an NFT lifecycle operation. A trusted Dust owner pause similarly blocks DUST movements.
+      Accepted: these issuer-caused failures and resulting delayed or stuck funds are out of scope (AS-005). Atomic rejection is intentional; deferral, skipped payments, or alternative recipients are not required.
+      Still reportable: defects reachable without issuer action, or third-party extraction or mispricing through Neverland code during an issuer-caused window beyond the blocked operation itself.
+    references:
+      - src/rewards/RevenueReward.sol
+      - src/tokens/DustLock.sol
+      - src/self-repaying-loans/UserVault.sol
+      - src/utils/NeverlandAssetRedemption.sol
+      - src/tokens/Dust.sol
+
+  - id: KI-036
+    description: |
+      Behavior: with ptAmount = type(uint256).max, NeverlandPendleLeverager.decreaseLeverage resolves the amount to min(aPT balance, allowance) at execution. When the allowance exceeds the balance (for example an unlimited approval), a third party can transfer aPT to the caller before inclusion. The donation is withdrawn and sold with the rest of the selected PT, so a previously valid decrease can revert, and unchanged retries keep failing while the donation persists. Every check that scales with the selected amount moves with it:
+      - Entry health floor: the final health factor must reach the caller's entry health factor, which the donation raises. With a finite repayment and a binding maxCashRepaid the donation's proceeds are refunded rather than repaid, so the decrease reverts HealthFactorBelowMinimum. This needs collateral other than the selected PT, because selling all PT against remaining debt fails the pool's health checks regardless.
+      - Aggregate oracle floor: the 90% floor over all converted PT (AS-027) grows with the sale while the sale's price impact deepens, so the decrease can revert OutputBelowMinimum.
+      - Pendle depth and proportion limits: the larger sale can exceed them and revert inside Pendle (MarketProportionTooHigh).
+      Accepted because: a clean revert with no loss. The attacker gives the donated aPT away, and after the revert it stays with the caller as collateral. An explicit ptAmount or an exact approval or permit caps the selection and avoids every case; cash-cap headroom lets the extra proceeds repay debt instead of failing the health floor. In the current configuration, Pendle's proportion limit on the PT-AUSD-17DEC2026 market rejects an oversized sale before the oracle floor can bind. This mirrors KI-028 for the maturity gateway.
+      Still reportable: any path that lets a donation move value out of the caller's position, or that completes a decrease below the entry health floor or the aggregate output floors.
+    references:
+      - src/utils/NeverlandPendleLeverager.sol
+      - test/utils/integration/NeverlandPendleLeveragerHealthRounding.t.sol
+
+  - id: KI-037
+    description: |
+      Behavior: NeverlandUiPriceMarketLibrary.getTokenPriceInUSDResolved has no code-length guard before its typed provider/oracle calls. If canonical registry id 1 is unregistered, resolves to a provider with no code, or the provider returns a nonzero oracle address with no code, a call can return empty data and revert during caller-side ABI decoding outside try/catch. When a non-DUST reward token needs the oracle path, getAllPrices, getUiBootstrap, and getUiFullBundle can revert instead of returning an unresolved zero price. The zero-oracle-address case is already handled; the canonical-provider NatSpec overstates graceful degradation for missing/no-code providers. NeverlandUiProvider._tryMarketId has the same missing guard: getRegisteredPoolMarkets reverts if any registered provider has no code, instead of returning an empty market label; its NatSpec also overstates failure isolation.
+      Accepted for public version 1.2.0: this is a read-only UI availability limitation, and no value-moving path consumes these helpers (AS-022). This release preserves its pinned contract snapshot.
+      Remediation: price-path provider/oracle code-length guards and regression tests are prepared in neverland-contracts for the next release; they are excluded from this version. The market-discovery provider guard remains pending there.
+      Reported by: CodeRabbit in PR #2, review comment 4352121746 (https://github.com/Neverland-Money/neverland-tokenomics/pull/2#discussion_r4352121746).
+      Still reportable: value-moving effects, unauthorized provider/oracle changes, or a distinct failure mechanism, including malformed return data from a contract with code.
+    references:
+      - src/utils/libraries/NeverlandUiPriceMarketLibrary.sol
+      - src/utils/NeverlandUiProvider.sol
+      - src/interfaces/INeverlandUiProvider.sol
+
+assumptions:
+  - id: AS-001
+    name: Scope, networks, and deployment status
+    details: |
+      Scope: Solidity contracts under src/. KI-033 records only the boundary between governance tooling and on-chain authorization. The recorded production network is Monad mainnet (chain ID 143), an L1 without a sequencer. Other networks require a separate review of execution, oracle, and dependency assumptions; ADDRESS_BOOK.md records only Monad mainnet.
+      Deployment identity: ADDRESS_BOOK.md is the public recorded address source (AS-002). It does not establish current oracle wiring, roles, liquidity, or source/bytecode equivalence. Statements labeled "Current configuration" preserve development-context configuration notes, which AS-003 roles can change; they are not fresh live-state verification.
+      No recorded deployment: SessionCalendar, MarketHoursPriceAdapter, and MarketHoursSentinel have no entries in ADDRESS_BOOK.md; no recorded instance constrains their ABI or storage. Per-user UserVault BeaconProxies are created on demand and are not individually recorded.
+      Absent from src/: RevenueLending, a DustVault product contract (DUST_VAULT is an external funding wallet), RewardMode token modes, UserVault reward buckets/priority lists, AutoCompoundLockLibrary, a standalone PT leverage unwinder, and an on-chain governor/vote tally. Findings requiring these components do not apply.
+      Build: Solidity 0.8.30, optimizer 200 runs, Cancun; NeverlandTimelockController has pragma ^0.8.20. Recorded older implementation notes, including UserVault, identify Paris builds; establish the applicable deployed compiler and EVM target separately from current builds.
+    references:
+      - ARCHITECTURE.md
+      - foundry.toml
+      - ADDRESS_BOOK.md
+
+  - id: AS-002
+    name: Deployed code identity and older live code
+    details: |
+      Linked libraries: DustLock links the deployed external libraries BalanceLogicLibrary and CreatorTokenLibrary; NeverlandUiProvider links NeverlandUiEmissionLibrary, NeverlandUiEnumerationLibrary, NeverlandUiPriceMarketLibrary, and NeverlandUiRewardsSummaryLibrary (NeverlandUiArrayLibrary is internal). Linked libraries are non-upgradeable contracts invoked by delegatecall, and their addresses are embedded in the linking bytecode, so changing a library requires a new DustLock implementation (proxy upgrade) or a redeployed NeverlandUiProvider (a direct contract that consumers repoint to).
+      Deployment evidence: ADDRESS_BOOK.md records implementation and linked-library addresses. Compiler-input manifests and historical deployment workpapers are outside this public mirror. Neither these addresses nor the package source hash establish source/bytecode equivalence.
+      Recorded deployed-code differences carried forward from development context (evaluate findings against current src/; independently verify the applicable deployed code before relying on these notes):
+      - The NeverlandNativeGateway shMON instance runs source older than current src/ (KI-025).
+      - The live LeaderboardKeeper implementation reads DustLock and partner registries on-chain and emits voting-power and NFT-balance sync events from self-sync; current source does neither (AS-026).
+      - The PendlePtDiscountOracleAdapter instance for PT-AUSD-8OCT2026 runs version 1 (AS-020).
+      - Earlier NeverlandUiProvider deployments are recorded; ADDRESS_BOOK.md selects a newer provider.
+    references:
+      - ADDRESS_BOOK.md
+      - CONTEXT.md
+
+  - id: AS-003
+    name: Privileged roles, holders, and delays
+    details: |
+      Trust: every role below is non-malicious, operates diligently, and keeps its keys secure. Correctly authorized actions within coded bounds can still harm users; the material cases are recorded as known issues, including KI-001, KI-007, KI-009, KI-018, KI-022, KI-023, KI-024, KI-030, and KI-031. Still in scope: missing or bypassable access control, privilege escalation, unprivileged paths that produce privileged effects, and defects in code that privileged roles execute.
+      Delayed through a timelock:
+      - GovernanceTimelock (MIN_DELAY_FLOOR and current delay 86,400 s): DEFAULT_ADMIN and POOL_ADMIN of the main lending market; owner and ACL admin of the main PoolAddressesProvider; owner of the core ProxyAdmin, the leaderboard ProxyAdmin, the StaticAToken ProxyAdmin, and UserVaultBeacon.
+      - RiskTimelock (MIN_DELAY_FLOOR and current delay 3,600 s): RISK_ADMIN of the main lending market; documented as the intended SessionCalendar owner.
+      - The Governance Safe holds the proposer, executor, and canceler roles of both timelocks.
+      Immediate, with no delay:
+      - Governance Safe (current configuration: 3-of-6 multisig): owner of the PoolAddressesProviderRegistry, so it can register markets that UserVault then trusts (AS-016); owner and ACL admin of the three isolated markets' PoolAddressesProviders (Pendle AUSD, Pendle shMON, Yuzu) and holder of their DEFAULT_ADMIN, POOL_ADMIN, RISK_ADMIN, and ASSET_LISTING_ADMIN roles, so it can replace those markets' pool and configurator implementations, oracles, ACL manager, and asset sources; owner of GovernedPriceOracle (loAZND), NeverlandAssetRedemption, NeverlandNativeGateway, NeverlandPendleMaturityGateway, both NeverlandPendleLeverager instances, and the PT-AUSD-8OCT2026, PT-AUSD-17DEC2026, and PT-shMON-18MAR2027 PendlePtDiscountOracleAdapter instances.
+      - Sentinel Safe (current configuration: 1-of-4 multisig): EMERGENCY_ADMIN on every registered market.
+      - Runtime roles held by multisig Safes (current configuration): Dust owner; one Safe holds the DustLock team, EMISSION_MANAGER, REWARDS_ADMIN, the UserVaultRegistry owner, and the DustLockLegendaryLedger owner; one Safe holds the RevenueReward rewardDistributor and DustLock.earlyWithdrawTreasury; the external DUST_VAULT funding wallet.
+      - Runtime roles held by an operations EOA with an EIP-7702 delegation (current configuration): the UserVaultRegistry executor; the leaderboard owners and keeper; the owner of the YieldBearingOracleAdapter (no keeper set), the sUSDE PendlePtDiscountOracleAdapter, NeverlandDustHelper, and NeverlandProfileItemsSeller.
+      - Also trusted: the SpecialEditionRegistry publisher, the DustRewardsController claimers authorized by EMISSION_MANAGER or by users themselves (AS-013), and any live ERC-2771 forwarder (AS-014).
+      Ownership conventions: most owned contracts use two-step transfer (Ownable2Step, or DustLock proposeTeam, acceptTeam, and cancelTeamProposal) and disable renounceOwnership; the six leaderboard contracts use single-step OwnableUpgradeable with renounce disabled; NeverlandDustHelper uses single-step Ownable; RevenueReward has no owner (AS-011); EMISSION_MANAGER and REWARDS_ADMIN are immutables (AS-013); the DustLock team can never become address(0).
+    references:
+      - ARCHITECTURE.md
+      - ADDRESS_BOOK.md
+      - src/governance/NeverlandTimelockController.sol
+
+  - id: AS-004
+    name: Upgrade, timelock, and recovery model
+    details: |
+      Deployment forms: transparent proxies administered by the core ProxyAdmin (Dust, DustLock, RevenueReward, DustRewardsController, UserVaultFactory, NeverlandProfileItemsSeller) and by the leaderboard ProxyAdmin (EpochManager, LeaderboardConfig, LeaderboardKeeper, NFTPartnershipRegistry, VotingPowerMultiplier, SpecialEditionRegistry). UserVaultBeacon serves every UserVault BeaconProxy, so one beacon upgrade changes all vaults. Every other contract is a direct deployment; changing one of its immutable dependencies requires redeployment and consumer remapping.
+      Timelocks: NeverlandTimelockController stores an immutable MIN_DELAY_FLOOR; the constructor requires the initial delay to be at least the floor, and updateDelay works only through a scheduled self-call that cannot go below the floor. The contract accepts any floor and has no maximum delay; the deployed floors come from deployment tooling (AS-003). A timelock operation hash covers targets, values, calldata, predecessor, and salt, not the delay.
+      Operational requirements: upgrades preserve the predecessor's storage layout (including inherited OpenZeppelin storage), immutables (for example RevenueReward's trusted forwarder, AS-014), and linked-library addresses. UserVault (four storage slots, no __gap) and UserVaultFactory (no own __gap) grow only by appending after their last slot, so a missing __gap in these non-inherited contracts is not a finding by itself. Recovery for the upgraded core (DustLock, RevenueReward, DustLockTransferStrategy) is roll-forward only: a reviewed corrective implementation is deployed and upgraded to, never a restored older implementation; this is an operational policy, not an on-chain rule.
+    references:
+      - src/governance/NeverlandTimelockController.sol
+      - ARCHITECTURE.md
+      - test/governance/TokenomicsUpgradeTimelock.t.sol
+      - CONTEXT.md
+
+  - id: AS-005
+    name: Token behavior and issuer actions
+    details: |
+      Trusted underlying tokens use exact transfers, non-rebasing balances, immutable decimals, and no transfer hooks; SafeERC20 handles return values. This covers curated RevenueReward tokens (current configuration: USDC), DUST, redemption TO_TOKEN, executor-selected UserVault assets, wrapped native, and the PT/SY/debt assets of both Pendle helpers. Missing fee-on-transfer, rebasing, or callback-token defenses for these assets are not findings. RevenueReward and NeverlandAssetRedemption credit requested amounts under this assumption.
+      Lending tokens are different: aToken balances accrue with the liquidity index, transfers round scaled amounts, transferFrom spends nominal allowance, and transfers enforce pool health/pause checks; variable debt accrues and is nontransferable. These semantics apply to redemption FROM_TOKEN, UserVault lending actions, and gateway/leverager aToken pulls. Pendle custody checks are specified in AS-024 and AS-027.
+      Issuer pauses, blocklists, freezes, upgrades, and fee/decimal changes are excluded only as described in KI-035; this does not exempt a separate Neverland defect.
+      DUST has no mint path after initialize; holders burn and approved spenders burnFrom. Its trusted owner can pause transfers and burns. Approvals, permits, and veNFT transfers/merges/splits remain available during a DUST pause.
+    references:
+      - src/tokens/Dust.sol
+      - src/rewards/RevenueReward.sol
+      - src/utils/NeverlandAssetRedemption.sol
+      - lib/neverland-lending/contracts/protocol/tokenization/AToken.sol
+
+  - id: AS-006
+    name: Lending core and AaveOracle boundary
+    details: |
+      Out of scope: the lending core in lib/neverland-lending (a vendored Aave v3-derived money market: Pool, PoolConfigurator, aTokens, variable debt tokens, interest, health factor, liquidation, AaveOracle, PoolAddressesProvider, PoolAddressesProviderRegistry, ACLManager) is not authored under src/ and is trusted; findings whose root cause lies there belong to that codebase. Its behavior still determines integration outcomes.
+      Enforced by vendored code: AaveOracle.getAssetPrice reads the source's latestAnswer(); an unset source or an answer <= 0 is delegated to the fallback oracle; with the fallback unset (address(0)) the typed call reverts on empty return data, so the price read fails closed; a reverting source propagates; a nonzero fallback that returns 0 yields a price of 0. AaveOracle source and fallback setters take effect immediately. An E-mode category can carry a price source that replaces reserve prices. Stable-rate debt is unsupported: BorrowLogic reverts STABLE_BORROWING_NOT_ENABLED for interest rate mode 1 in both borrow and repay, regardless of reserve flags.
+      Current configuration: every registered market's AaveOracle has no fallback oracle, and the main market's E-mode categories set no price source, so an invalid Neverland source answer makes the price read revert (KI-020).
+      Integrations: UserVault resolves the pool and oracle through an executor-chosen PoolAddressesProvider on every call; NeverlandNativeGateway and NeverlandPendleMaturityGateway use an immutable pool, and the maturity gateway reads its pool's oracle on every call. UserVault and NeverlandPendleMaturityGateway use interest rate mode 2; NeverlandNativeGateway forwards the caller's mode, and mode 1 reverts in the core.
+    references:
+      - lib/neverland-lending/contracts/misc/AaveOracle.sol
+      - lib/neverland-lending/contracts/protocol/libraries/logic/BorrowLogic.sol
+      - test/oracles/e2e/AaveOracleE2E.t.sol
+
+  - id: AS-007
+    name: Timestamp and epoch finality
+    details: |
+      Trusted: Monad block.timestamp is monotonic with bounded proposer drift; producers cannot choose arbitrary timestamps.
+      Enforced by code: lock and reward accounting use WEEK = 604,800 s boundaries. When block.timestamp is a nonzero exact multiple of WEEK, DustLock checkpoint-changing actions and ERC721 transfers, and every RevenueReward state-changing claim and closeout hook, revert EpochFinalizationPending; the same calls succeed at T + 1. A reward bucket at T is finalized only after T, so no state change at T can alter a bucket that has become claimable.
+      Accepted: the one-second unavailability is intended finality protection, not a denial of service; KI-004 lists the affected functions.
+      Still reportable: a way to extend a boundary revert beyond the boundary second, or timestamp influence materially beyond bounded drift.
+    references:
+      - src/libraries/CommonChecksLibrary.sol
+      - src/libraries/EpochTimeLibrary.sol
+
+  - id: AS-008
+    name: DustLock lock lifecycle and voting power
+    details: |
+      Enforced by code:
+      - Lock ends round down to whole weeks: end = floor((block.timestamp + duration) / WEEK) * WEEK. MINTIME = 28 days and MAXTIME = 365 days are compile-time constants. A request of exactly 28 days never succeeds (outside a boundary second it rounds below the minimum, and the boundary second reverts), so the realized minimum commitment lies in (28 days, 35 days). A requested duration above 365 days is accepted whenever the week-rounded end stays within block.timestamp + MAXTIME. Permanent-lock creation also takes a valid duration.
+      - Amounts: createLock requires at least minLockAmount; increaseAmount and depositFor require at least minLockAmount / 10 and, on timed locks, at least 28 days remaining (DepositForLockDurationTooShort); both split parts must be at least minLockAmount.
+      - Permanent locks: voting power equals the locked amount without decay; permanent locks cannot split; merging a permanent source into a timed destination reverts; a merge keeps the later end; split children copy the source end.
+      - Authorization: lifecycle actions accept the owner or an approved address or operator (KI-005); merge requires approval for both IDs and may combine different owners; split also requires canSplit for the owner or the global canSplit[address(0)] flag, both set by the team through toggleSplit; depositFor and checkpoint are permissionless.
+      - Voting power: balanceOf(address) counts NFTs, while totalSupply() and totalSupplyAt() return total voting power (KI-006); balanceOfNFT returns 0 in a block in which the token changed owner (a flash guard set by transfers, not mints, and propagated by merge and split); balanceOfNFTAt reads checkpoint history without that guard; future timestamps return decay projections. RevenueReward reads balanceOfNFTAt and totalSupplyAt at finalized bucket timestamps; VotingPowerMultiplier and the UI read balanceOfNFT.
+      - Every lifecycle and transfer entrypoint is nonReentrant. External calls go only to DUST, RevenueReward, the transfer validator, and ERC721 receivers (safeTransferFrom); notifyTokenMinted (createLock paths), notifyAfterTokenMerged (merge), and the validator call run before the related lock or ownership writes, while DUST pulls and payouts follow state writes. Checkpoint math casts to int256 only within DUST-supply bounds.
+      - effectiveStart is amount-weighted bookkeeping returned to the UI; it is not an input to exit pricing or voting power.
+      - EpochFinalizationPending, InvalidTokenId, ZeroAmount, AddressZero, and SameAddress are declared in CommonChecksLibrary, not IDustLock; getApproved reverts InvalidTokenId for nonexistent tokens.
+    references:
+      - src/tokens/DustLock.sol
+      - src/interfaces/IDustLock.sol
+      - src/libraries/BalanceLogicLibrary.sol
+      - src/libraries/CommonChecksLibrary.sol
+
+  - id: AS-009
+    name: DustLock exit pricing invariant
+    details: |
+      Enforced by code:
+      - For an active timed lock with principal L, remaining time R (capped at MAXTIME = 365 days), and p = earlyWithdrawPenalty, exit proceeds are floor(L * (10000 * MAXTIME - (2500 * MAXTIME + (p - 2500) * R)) / (10000 * MAXTIME)). The penalty is L minus proceeds: it rounds up and is at least 25% of the full principal for any remaining time above 0 (MIN_EARLY_WITHDRAW_PENALTY_BPS = 2500). A matured timed lock pays no penalty.
+      - setEarlyWithdrawPenalty bounds p to [2500, 9999] (InvalidWithdrawPenalty); the initializer default is 7500 (current configuration: 7500).
+      - A permanent lock's early exit first converts it to the same fresh weekly-rounded end that unlockPermanent would create (remaining time in (358 days, 365 days]) and then applies the curve, so the permanent-exit penalty varies with the time of week by up to (p - 2500) * 7 / 365 bps of principal. earlyWithdrawPenaltyAmount quotes exactly this executable path; earlyWithdraw(tokenId, maxPenalty) reverts EarlyWithdrawPenaltyAboveMax above the caller's bound.
+      - Proceeds go to the NFT owner even when an approved operator calls; the penalty goes to earlyWithdrawTreasury (KI-002).
+      - The penalty is a path-independent function of (principal, remaining time, p) and never decreases as remaining time increases. No lifecycle path shortens the remaining time of existing principal: merge keeps the later end, a timed source merged into a permanent destination takes the fresh horizon, split and deposits keep the end, increaseUnlockTime only extends, and unlockPermanent writes the fresh end. Per-operation rounding differences are at most 1 wei. A penalty-discount finding must show a lifecycle path that reduces remaining time or principal basis.
+      - Penalties are never netted against, refunded from, or offset by rewards; rewards settle separately through RevenueReward hooks.
+    references:
+      - src/tokens/DustLock.sol
+      - test/claim-reform/unit/DustLockExitPricing.t.sol
+      - test/claim-reform/unit/DustLockLifecyclePricing.t.sol
+
+  - id: AS-010
+    name: DustLock to RevenueReward hook coupling
+    details: |
+      Enforced by code:
+      - DustLock calls RevenueReward synchronously, with no try/catch, only while revenueReward is nonzero: notifyTokenMinted (createLock paths only), notifyAfterTokenTransferred (every ERC721 transfer), notifyAfterTokenBurned (withdraw and earlyWithdraw, after the checkpoint), notifyAfterTokenMerged (before the source burn and checkpoints), and notifyAfterTokenSplit (RevenueReward stamps both children, which receive no notifyTokenMinted). lockPermanent, unlockPermanent, increaseAmount, increaseUnlockTime, and depositFor trigger no hook.
+      - Only DustLock can call the hooks (onlyDustLock, checked against _msgSender()).
+      - setRevenueReward is team-only and immediate; address(0) disables all hooks; a nonzero address must have code; re-enabling does not replay skipped notifications (KI-009, KI-010).
+      Operational requirement: RevenueReward changes only by upgrading its proxy in place. Repointing DustLock to a fresh RevenueReward instance, which would lack tokenMintTime and lastEarnTime history, is excluded by operations; nothing on-chain prevents it.
+      Trusted: RevenueReward fully trusts DustLock. Payout shares derive from DustLock.balanceOfNFTAt and totalSupplyAt, and hooks pay the from and owner addresses DustLock passes, so DustLock's upgrade authority (GovernanceTimelock) effectively controls RevenueReward payouts.
+    references:
+      - src/tokens/DustLock.sol
+      - src/rewards/RevenueReward.sol
+
+  - id: AS-011
+    name: RevenueReward accounting, authorization, and routing
+    details: |
+      Enforced by code:
+      - Funding: only rewardDistributor can notify. notifyRewardAmount credits the bucket at epochNext(block.timestamp), and notifyRewardAmountForFollowingEpoch credits the bucket one week later; nothing credits the current or a past epoch; notification is not boundary-guarded. The requested amount is credited and pulled with safeTransferFrom (AS-005).
+      - Registry: a token is registered permanently on its first notification (isRewardToken). There is no deregistration and no lifetime registry cap; MAX_TOKENS = 32 and MAX_TOKENIDS = 64 bound only per-call input arrays (InvalidArrayLengths).
+      - Entitlement per finalized bucket T: floor(R_T * DustLock.balanceOfNFTAt(id, T) / DustLock.totalSupplyAt(T)) plus a 1e18-scaled fractional carry per (reward token, tokenId) in tokenRewardsRemainingAccScaled, paid in whole units when an eligible epoch is processed (KI-011). A scan starts at the epoch after max(lastEarnTime, tokenMintTime), and lastEarnTime only moves forward, so repeated or historical end times cannot pay twice or skip epochs.
+      - Accounting: each reward token has one pooled balance shared by all buckets, so any over-distribution from one bucket consumes other buckets' funds.
+      - Claims: state-changing claims (getReward, getRewardBatch, getRewardUntilTs, getRewardUntilTsBatch) accept unsorted arrays and duplicates, and a repeated entry is a no-op; the earnedRewardsAll and earnedRewardsAllUntilTs previews require strictly ascending arrays; unknown reward tokens revert.
+      - Authorization and routing: a claim requires the owner, an approved address, or the resolved receiver. Routing does not depend on who claims: rewards go to tokenRewardReceiver only if it equals UserVaultFactory.getUserVault(current owner), otherwise to the current owner; for a burned token they go to the stored tokenRewardReceiver (resolved under try/catch on ownerOf), else nobody can claim.
+      - Self-repay: enableSelfRepayLoan, disableSelfRepayLoan, and their batch forms require the caller to be the NFT owner (approved operators are rejected); enabling creates the owner's vault through getOrCreateUserVault.
+      - Transfer failures: any reward-token transfer failure reverts the entire claim or hook; there is no deferral, no pendingRewards ledger, and no claimDeferredRewards.
+      Trusted: rewardDistributor (RevenueReward has no owner) registers tokens by notifying, recovers surplus with recoverTokens (KI-012), and rotates itself in one step through setRewardDistributor; a mistaken new address can be corrected only by an implementation upgrade.
+      Other facts: the trusted forwarder is an immutable of the implementation (AS-014); version is the constant 2.
+    references:
+      - src/rewards/RevenueReward.sol
+      - src/interfaces/IRevenueReward.sol
+      - test/revenue/unit/RevenueReward.t.sol
+      - test/claim-reform/e2e/ClaimReformRevenueRewardE2E.t.sol
+
+  - id: AS-012
+    name: Reward capture economics
+    details: |
+      Enforced by code: buckets are public and funded before their boundary (notifyRewardAmount can fund bucket T as late as T - 1; nothing credits the current or a past boundary); anyone can lock or top up until T - 1 and share bucket T pro rata (KI-015). Same-block flash capture is impossible: transfers settle the previous owner first, and no checkpoint or transfer executes at T.
+      Economic assumption: one epoch's RevenueReward distribution R is a small periodic yield on the value of all veDUST voting weight (R much smaller than P * s0, a weekly yield on the order of 0.1% to 2%), where s0 is the voting weight of all other locks at T and P is the DUST price in reward-token terms.
+      Bound: a lock of D DUST minted at T - 1 earns at most k * D / (s0 + k * D) of R, with k = voting weight per DUST <= 1 (remaining time / MAXTIME for timed locks, 1 for permanent locks), and an early exit after T pays a non-refundable penalty fraction f >= 0.25 of D * P (AS-009). The strategy is profitable only if R > (f / k) * P * s0. Because f / k >= 0.25 for every lock, profit requires a weekly reward above 25% of the value of all other veDUST voting weight, and about 3.75 times that value for a fresh four-week lock at earlyWithdrawPenalty = 7500 bps.
+      Required for findings in this class: demonstrated profitability under realistic, sourced parameters; scenarios that assume R near or above P * s0 fall outside this regime.
+    references:
+      - src/rewards/RevenueReward.sol
+      - src/tokens/DustLock.sol
+
+  - id: AS-013
+    name: Emissions claim pipeline and pricing
+    details: |
+      Enforced by code:
+      - Claims flow from DustRewardsController to DustLockTransferStrategy.performTransfer to DustLock with no try/catch; any revert unwinds the claim. The controller zeroes accrued rewards before calling the strategy, so the strategy mapped by EMISSION_MANAGER controls where accrued rewards go. RewardsClaimed reports the gross amount; RewardClaimPriced reports gross, penalty, and net.
+      - DustRewardsController is a modified copy of the Aave RewardsController built on RewardsDistributor and VersionedInitializable; it does not inherit RewardsController, reward oracles are removed, and claim functions take lockTime and tokenId. EMISSION_MANAGER is an immutable of the implementation; it configures assets, emissions, distribution ends, and transfer strategies (setTransferStrategy) and can set any user's claimer, and a user can set their own claimer with setClaimer. An authorized claimer chooses to, lockTime, and tokenId freely and can direct the user's rewards to any nonzero address. claimAllRewards variants apply one lockTime and tokenId to every reward and call the strategy even for zero amounts; per-reward claimRewards variants isolate rewards and accept partial amounts. handleAction, called by aTokens, only accrues and never touches the strategy, DustLock, or DUST_VAULT.
+      - DustLockTransferStrategy is a direct contract with immutables INCENTIVES_CONTROLLER, REWARDS_ADMIN, DUST_LOCK, DUST_VAULT, and DUST, and no storage. Only the incentives controller calls performTransfer; only DUST is accepted (InvalidRewardAddress); amount = 0 returns true before any validation. For tokenId > 0, lockTime is ignored, the recipient must own the NFT (NotTokenOwner; nonexistent IDs revert InvalidTokenId), and the NFT must be permanent or unexpired with 28 to 365 days remaining. lockTime = type(uint256).max creates a permanent lock through createLockPermanentFor(net, 365 days, to). Before pulling funds the strategy requires the DustLock claim-reform capability (a staticcall to earlyWithdrawPenaltyAmount(0) that returns exactly one zero word, else DustLockClaimReformInactive). It pulls the gross amount from DUST_VAULT with transferFrom against an allowance, transfers any nonzero fee to DustLock.earlyWithdrawTreasury (read live, must be nonzero), and approves DustLock for exactly the net amount, resetting the approval afterward. REWARDS_ADMIN can call emergencyWithdrawal on tokens held by the strategy, never on DUST_VAULT funds. assertActivationState(bool) is a view used by operations.
+      - Pricing (constants immutable and independent of DustLock.earlyWithdrawPenalty): the liquid route (tokenId = 0, lockTime = 0) sends floor(amount / 2) to the treasury and the remainder to the user; permanent locks and timed commitments of at least ZERO_TOLL_COMMITMENT (358 days) pay no fee; other timed commitments pay ceil(amount * 4000 * (365 days - commitment) / (10000 * 337 days)), so the fee steps from about 0.83% to 0 at 358 days by design. New timed commitment is computed after weekly rounding, and DustLock minimums apply to the net locked amount. Liquid rounding favors the user by at most 1 wei, while timed fees round up.
+      - previewClaim reproduces the execution arithmetic at the same block but skips recipient, ownership, capability, treasury, minimum-amount, and boundary checks.
+      Trusted: EMISSION_MANAGER, REWARDS_ADMIN, every authorized claimer, and the DUST_VAULT funding wallet, an external multisig whose balance and MaxUint256 allowance to the active strategy are operational.
+      Intentional: anyone can deposit claim proceeds into another user's NFT by naming that NFT's owner as to; the lock end does not change, and depositFor is permissionless anyway.
+    references:
+      - src/emissions/DustRewardsController.sol
+      - src/emissions/DustLockTransferStrategy.sol
+      - src/emissions/DustTransferStrategyBase.sol
+      - test/claim-reform/unit/DustLockTransferStrategyPricing.t.sol
+      - test/claim-reform/e2e/ClaimReformControllerE2E.t.sol
+
+  - id: AS-014
+    name: ERC-2771 trusted forwarder
+    details: |
+      Enforced by code: DustLock.isTrustedForwarder compares msg.sender against the storage forwarder set once in initialize, with no setter; the constructor's immutable forwarder value is inert. RevenueReward's trusted forwarder is an immutable of its implementation (ERC2771ContextUpgradeable); its initializer argument is checked nonzero but not stored. While a transfer validator is configured, DustLock rejects every forwarded ERC721 transfer (ForwarderTransferNotAllowed) to preserve operator identity for creator-fee enforcement.
+      Current configuration: both contracts trust 0x1111111111111111111111111111111111111111, an address with no code that cannot relay, so _msgSender() equals msg.sender in practice.
+      Operational requirement: keep the two forwarder identities aligned across upgrades (deployment validation tooling includes optional alignment checks). Enabling a real relay requires new implementations. A live forwarder would be trusted for every role check, including team, rewardDistributor, owners, and onlyDustLock.
+    references:
+      - src/tokens/DustLock.sol
+      - src/rewards/RevenueReward.sol
+      - CONTEXT.md
+
+  - id: AS-015
+    name: ERC721-C transfer validation and royalties
+    details: |
+      Enforced by code: CreatorTokenLibrary is an external linked library. DustLock invokes the transfer validator only inside _transferFrom, only while transferValidator is nonzero, and only when the raw msg.sender is a listed fee-enforced operator. The call uses the configured selector (default validateTransfer(address,address,address,uint256), 0xcaee23ea, as a view call) through staticcall or call according to configuration. A successful call passes regardless of return data; a revert bubbles up, or reverts TransferValidationFailed when it carries no data. The team manages setTransferValidator (a nonzero address must have code), setTransferValidationFunction (any selector; a zero selector restores the default view call), setFeeEnforcedOperator, and setRoyaltyInfo (EIP-2981, fee up to 10,000 bps).
+      Current configuration: DustLock has a transfer validator set (an external CreatorTokenTransferValidator deployment), uses the default view selector, and lists fee-enforced operators, so forwarded ERC721 transfers are blocked (AS-014).
+      Trusted: the configured validator denies invalid transfers by reverting; validator internals are out of scope; the team chooses a compatible selector, call type, and operator list.
+      Accepted: fee enforcement is intentionally limited to listed operators on ERC721 transfers (KI-007).
+    references:
+      - src/libraries/CreatorTokenLibrary.sol
+      - src/tokens/DustLock.sol
+      - src/interfaces/ITransferValidator.sol
+
+  - id: AS-016
+    name: UserVault custody and executor model
+    details: |
+      Enforced by code:
+      - One vault per user: UserVaultFactory.getOrCreateUserVault(user) is permissionless, deploys a BeaconProxy with CREATE, initializes it in the same call, and records it once with no reassignment; getUserVault returns address(0) when no vault exists. RevenueReward.enableSelfRepayLoan creates the owner's vault.
+      - Executor only (UserVaultRegistry.executor() is read on every call): getTokenIdsReward, repayUserDebt, swapAndVerify, repayDebt, and depositCollateral. The user or the executor can call recoverERC20 and recoverETH, which always pay the vault's user. RevenueReward merge and split closeouts, and claims by the owner, an approved operator, or the receiver, can also pay a vault without the executor (AS-011); transfer and burn closeouts pay the previous owner directly (KI-013).
+      - Value destinations: repay(debtToken, amount, 2, user) and supply(token, amount, user, 0) on the pool of an executor-chosen provider that has a nonzero ID in the PoolAddressesProviderRegistry (pool and oracle resolved per call); swap input to an allowlisted aggregator through an exact approval that is reset to zero after the call; swap output wherever aggregatorData directs it, bounded only by the vault's output-balance and oracle check (KI-018).
+      - UserVaultRegistry (Ownable2Step, renounce disabled): setExecutor (nonzero), setSupportedAggregators (any address), and setMaxSwapSlippageBps (any value); every change is immediate and applies to all vaults.
+      Trusted: the executor, the registry owner, allowlisted aggregators (genuine swap routers, never token contracts or contracts that act on msg.sender's assets), and the pool and AaveOracle wiring of every registered market (the PoolAddressesProviderRegistry owner can add markets immediately, AS-003). The correctness of src/ price sources is not covered by this trust.
+      Intentional: UserVault has no reentrancy guard, because every state-changing entrypoint is executor- or user-gated and the vault keeps no internal accounting (balances are read live). It has no receive, fallback, or onERC721Received: native currency arrives only by force, and an ERC721 sent by transferFrom cannot be recovered. Repayment is variable-rate only. Users cannot replace or block the executor, but they can recover funds at any time and stop new routing per token with RevenueReward.disableSelfRepayLoan.
+    references:
+      - src/self-repaying-loans/UserVault.sol
+      - src/self-repaying-loans/UserVaultFactory.sol
+      - src/self-repaying-loans/UserVaultRegistry.sol
+
+  - id: AS-017
+    name: Monad lending price sources, shared semantics
+    details: |
+      Scope: RatioOracleAggregator, YieldBearingOracleAdapter, PendlePtDiscountOracleAdapter, HardcodedPriceOracle, and GovernedPriceOracle (MarketHoursPriceAdapter follows AS-025). Their only on-chain consumer is AaveOracle through latestAnswer(); nothing in src/ consumes their roundId, answeredInRound, or startedAt values.
+      Enforced by code:
+      - Legacy reads (latestAnswer, latestTimestamp, latestRound, getAnswer, getTimestamp) return 0 for invalid data: zero or future timestamps, stale rounds, nonpositive answers, failed upstream calls, arithmetic failure, and non-latest round IDs. Exceptions: decoding failures in RatioOracleAggregator, YieldBearingOracleAdapter, and the version 1 PendlePtDiscountOracleAdapter instance revert (KI-021), and HardcodedPriceOracle has no invalid state. V3 reads (latestRoundData, getRoundData) revert for invalid data, with the RatioOracleAggregator and PendlePtDiscountOracleAdapter path differences in AS-019 and AS-020.
+      - Composite feeds are not single-source Chainlink feeds: RatioOracleAggregator anchors roundId to its ratio feed; YieldBearingOracleAdapter and PendlePtDiscountOracleAdapter pass base-feed round metadata through while the answer moves with live vault state or block.timestamp within one round; getRoundData serves only the latest round. Single-feed round invariants do not apply to these adapters.
+      - Freshness: a round is stale when block.timestamp - updatedAt > maxDelay (an age equal to maxDelay passes); zero and future timestamps are rejected first; maxDelay is immutable, and 0 disables only the age check.
+      - Decimals: upstream decimals are read once at construction, bounded to [6, 18] (InvalidDecimals), and stored immutably; outputs use 8 decimals; scaling and products round down, and a result of 0 is invalid.
+      - Answers are a pure function of block.timestamp, upstream state, and owner or keeper configuration; they can change within a block when those inputs change.
+      Trusted: upstream Chainlink-style feeds are accurate and ABI-conformant with immutable decimals; ERC-4626 vaults are standard yield vaults whose convertToAssets reflects holdings (donation sensitivity is inherent and bounded by AS-018).
+      Current configuration: the recorded YieldBearingOracleAdapter, HardcodedPriceOracle, and sUSDE PendlePtDiscountOracleAdapter instances are not AaveOracle sources; PT-AUSD and PT-shMON PendlePtDiscountOracleAdapter instances price reserves on isolated markets.
+    references:
+      - src/libraries/OracleLib.sol
+      - src/oracles/RatioOracleAggregator.sol
+      - src/oracles/YieldBearingOracleAdapter.sol
+      - src/oracles/PendlePtDiscountOracleAdapter.sol
+
+  - id: AS-018
+    name: YieldBearingOracleAdapter growth cap and snapshots
+    details: |
+      Enforced by code:
+      - Price = floor(basePrice * effectiveRatio / 10^assetDecimals), rescaled with a floor to 8 decimals, where effectiveRatio is the live convertToAssets(shareUnit) ratio after the growth cap. The cap applies only with an effective snapshot: cap = snapshotRatio + floor(rate * (block.timestamp - effectiveAt) / 1e18), with rate = floor(snapshotRatio * growthBps * 1e18 / (10000 * 365 days)), so headroom grows linearly, not compounding. A live ratio above the cap but at most floor(cap * (10000 + rejectionGraceBps) / 10000) is served at the cap; above that, legacy reads return 0 and V3 reads revert; with rejectionGraceBps = 0 every above-cap ratio is rejected. There is no lower bound: share losses pass through.
+      - Snapshots: the first snapshot activates immediately; later updateSnapshot calls (owner or keeper) queue the current ratio, effective at block.timestamp + minimumSnapshotDelay (an immutable that may be 0); a matured pending snapshot applies on read; each updateSnapshot replaces any pending snapshot and restarts its delay; updateSnapshotImmediate (owner only) bypasses the delay. Snapshot functions revert until setGrowthCapBounds has been called, and bounds cannot be unset. Owner-only setters: setGrowthCapBounds ([1, 10000] bps), setRejectionGraceBps ([0, 10000]), and setKeeper. Snapshot ratios are not validated against the prior cap; re-baselining is the recovery mechanism.
+      - maxDelay applies to the base feed only; the vault ratio is sampled live; maximumSnapshotAge is validated at construction and never enforced in pricing; isCapped and getCurrentSlackBps fail soft, so false or (0, false) does not mean healthy.
+      Trusted: the owner and keeper submit snapshots without exposing them to ratio manipulation, and configure cap bounds and an initial snapshot before AaveOracle uses the adapter (KI-022).
+    references:
+      - src/oracles/YieldBearingOracleAdapter.sol
+      - src/interfaces/IYieldBearingOracleAdapter.sol
+      - test/oracles/unit/YieldBearingOracleAdapter.t.sol
+
+  - id: AS-019
+    name: RatioOracleAggregator semantics
+    details: |
+      Enforced by code: RatioOracleAggregator is an immutable composition of a ratio feed and a base feed with one shared immutable maxDelay applied to each feed independently; it has no owner and no mutable storage. answer = floor(ratio * base / 10^ratioDecimals), rescaled to 8 decimals.
+      Intentional path difference: V3 latestRoundData reports the ratio feed's roundId and the minimum of the constituent startedAt, updatedAt, and answeredInRound values (answeredInRound mixes two round-ID spaces and can be below roundId for healthy data). It validates per-feed roundId != 0, timestamps, freshness, and positive answers, but not startedAt <= updatedAt or answeredInRound. The legacy path that AaveOracle uses also requires startedAt <= updatedAt and answeredInRound of 0 or at least roundId, so legacy is the stricter path, and V3 can return a price where legacy returns 0. Cross-feed timestamp alignment is not validated.
+    references:
+      - src/oracles/RatioOracleAggregator.sol
+      - test/oracles/unit/RatioOracleAggregator.t.sol
+
+  - id: AS-020
+    name: PendlePtDiscountOracleAdapter semantics
+    details: |
+      Enforced by current source (version 2):
+      - answer = base price * (1e18 - discountWad) / 1e18, with discountWad = floor(timeToMaturity * rateBps * 1e14 / 31,536,000), scaled to 8 decimals with a single final floor. The discount is 0 at and after maturity, so the answer equals the base price.
+      - The owner (Ownable2Step, renounce disabled) calls setDiscountRatePerYear with a rate in (0, immutable ceiling]. The call reverts if the rate implies a discount of 100% or more, or with InvalidPtPrice if no valid positive base round exists (which includes a base-feed outage) or the normalized price floors to 0. Feed, PT, maturity, maxDelay, and ceiling are immutable; maxDelay = 0 disables the staleness check.
+      - Legacy reads use a bounded raw staticcall that requires exactly 160 bytes and canonical uint80 fields, so malformed upstream data yields 0, not a revert. answeredInRound != 0 with answeredInRound < roundId is rejected. An oversized reply yields a legacy 0 while V3 can still return a price.
+      Version 1 (the PT-AUSD-8OCT2026 instance): legacy reads use typed try/catch (KI-021), answeredInRound == 0 is rejected, and neither the constructor nor setDiscountRatePerYear checks for a live positive base round.
+      Accepted: the answer is a governed model valuation, not a Pendle market quote, with no market floor or post-maturity haircut; restricting PT reserves to collateral-only use is a listing rule the adapter does not enforce. With maxDelay = 0, a frozen base feed that still answers keeps pricing, drifting toward par but never above the stale base price.
+      Current configuration: each live PT adapter uses the same base feed as its market's debt asset (AUSD/USD on the Pendle AUSD market, MON/USD on the Pendle shMON market); the PT-shMON instance has maxDelay = 0; PT reserves have borrowing disabled.
+    references:
+      - src/oracles/PendlePtDiscountOracleAdapter.sol
+      - test/oracles/unit/PendlePtDiscountOracleAdapter.t.sol
+
+  - id: AS-021
+    name: HardcodedPriceOracle and GovernedPriceOracle semantics
+    details: |
+      Enforced by code:
+      - HardcodedPriceOracle is ownerless with an immutable positive answer (decimals() returns 8). latestRoundData and getRoundData(any ID) return (1, answer, block.timestamp, block.timestamp, 1), so the source always appears fresh.
+      - GovernedPriceOracle: the owner (Ownable2Step, renounce disabled) posts any answer in [1, type(int256).max] with setPrice(uint256). Each post, including a same-value post, increments roundId and sets startedAt = updatedAt = the post time. Non-latest rounds revert StaleRound (V3) or return 0 (legacy). There is no heartbeat expiry, market check, step bound, delay, or expected-prior-value argument (KI-023).
+      Current configuration: the main market prices loAZND with the GovernedPriceOracle loAZND instance owned by the Governance Safe, and the loAZND reserve is frozen with LTV and liquidation threshold of 1 bps and a supply cap of 1; the recorded HardcodedPriceOracle loAZND instance is not wired.
+    references:
+      - src/oracles/HardcodedPriceOracle.sol
+      - src/oracles/GovernedPriceOracle.sol
+      - ADDRESS_BOOK.md
+
+  - id: AS-022
+    name: UI helper contracts are informational
+    details: |
+      NeverlandUiProvider and its linked libraries are read-only and ownerless. No value-moving path consumes them, so their failures affect only off-chain reads (KI-026 and KI-037). Callers must handle whole-call failures, including getRegisteredPoolMarkets when a registered provider has no code (KI-037).
+      NeverlandDustHelper is owner-configured and stateful. It prices DUST from AMM spot sources (Uniswap V4, Balancer reCLAMM, Uniswap V3, Uniswap V2) or feed compositions, and uses the owner-set hardcoded price only when no source is configured; a configured source that fails yields 0. Only the owner writes its cache; after the cache TTL, getPrice reads live, manipulable spot prices. Its Chainlink-style feed interface advances rounds only on owner refreshes and can record 0. It has no TWAP; its only on-chain reader is the read-only NeverlandUiProvider, and it must never serve as a lending collateral or liquidation oracle.
+      Still reportable: spot manipulation of NeverlandDustHelper outputs only if a value-moving on-chain consumer uses them.
+    references:
+      - src/utils/NeverlandUiProvider.sol
+      - src/utils/NeverlandDustHelper.sol
+
+  - id: AS-023
+    name: Native gateway, profile seller, and legendary ledger behavior
+    details: |
+      NeverlandNativeGateway (direct; immutable POOL and WRAPPED_NATIVE; the deployed instance runs earlier source, KI-025): the constructor grants the pool an unlimited wrapped-native approval; borrow always acts for msg.sender and needs that user's credit delegation, so third parties cannot spend it; repay refunds excess msg.value to msg.sender, including when repaying for another user; withdrawals pull the caller's aTokens; receive accepts native currency only from WRAPPED_NATIVE; the owner can recover stranded tokens and native currency with emergencyTokenTransfer and emergencyNativeTransfer.
+      NeverlandProfileItemsSeller (transparent proxy): DUST moves directly from the purchaser to fundsRecipient with an exact recipient balance-delta check, except that a purchase by fundsRecipient itself is a self-transfer with no check and no net cost; purchases bind the exact expected price; a batch holds at most 64 lines; anyone can buy items for any recipient, and a gift marks a permanent item owned by that recipient; eligibility and fulfillment are off-chain; the owner controls catalog, recipient, and pause.
+      DustLockLegendaryLedger (direct; renounce disabled): pulls DUST, mints a timed or permanent lock to the caller through DustLock (the ledger is DustLock's deposit provider), resets its DUST approval within the same call, and records a write-once attempt flag; mints below the threshold revert; flags are not migrated on merge, split, or burn; legendary outcomes resolve off-chain; the owner can recover any ERC20 or native balance (recoverERC20, recoverNative), and the ledger holds no DUST at rest; an ERC721 sent to the ledger by transferFrom cannot be recovered.
+      NeverlandAssetRedemption: KI-024.
+    references:
+      - src/utils/NeverlandNativeGateway.sol
+      - src/utils/NeverlandProfileItemsSeller.sol
+      - src/tokens/DustLockLegendaryLedger.sol
+
+  - id: AS-024
+    name: Pendle maturity gateway dependencies and market assumptions
+    details: |
+      Scope: deployed direct Ownable2Step contract; renunciation disabled, transient reentrancy/callback state, no persistent user balances or pause. The owner registers/removes migration targets and recovers held tokens; it cannot pull user positions. The constructor registers initialMarket with the same checks as later targets.
+      Trusted: lending core and pool oracle, official Pendle PT/YT/SY/market/router contracts, zero-fee Morpho, and the separate global flash pool. Market provenance is checked off chain; there is no factory check. Global-pool use requires FLASH_BORROWER and an eligible reserve. Token assumptions are AS-005.
+      Par checks at registration/use: equal PT/debt reserve decimals, SY exchangeRate and stored PY index exactly 1e18, one-unit redemption at par, and source/target PT normalized income exactly 1e27. Drift intentionally blocks close as well as migrate. Sources must be listed, matured, and support debt-asset output. Targets require registration, which checks debt-asset input/output support, and must remain unexpired at use.
+      Authorization/custody: actions use caller positions; permit failure is tolerated only if the subsequent allowance-gated pull succeeds. Callbacks bind sender, active call, amount, and round-context hash; authorization is consumed once. Approvals are exact and cleared. Completion preserves entry debt-asset and source/target PT balances; close pays surplus to the selected recipient, migrate to the caller. Nonzero surplus sent to the gateway itself fails the entry-balance check.
+      Lending/Pendle semantics: migration buys and supplies target PT before pulling/redeeming source collateral, including when debt-free. Intermediate pool health checks apply. Aggregate purchase bounds and final health requirements are KI-027. The live router ignores the fixed fallback approximation constants. redeemPY sweeps all YT-held PT, so donated PT increases redemption proceeds.
+      Execution: maxRounds bounds atomic flashes; one greatest-capacity eligible lender is selected per action, Morpho on ties. Failed bounded global-pool reads exclude that source; a selected-lender failure reverts without fallback. There is no per-round user cap or lender selector.
+      Previews execute the same caller action through four selector-restricted, reverting simulation paths. They roll back effects and reserve no execution state. Actions have no deadline; a permit deadline does not expire an action funded by an existing allowance. Accepted rounding, liquidity, and collateral constraints are KI-028 and KI-029.
+    references:
+      - src/utils/NeverlandPendleMaturityGateway.sol
+      - src/interfaces/INeverlandPendleMaturityGateway.sol
+      - CONTEXT.md
+      - ADDRESS_BOOK.md
+      - test/utils/unit/NeverlandPendleMaturityGateway.t.sol
+
+  - id: AS-025
+    name: Market-hours safety design and integration requirements
+    details: |
+      Design: SessionCalendar (Ownable2Step, renounce disabled), MarketHoursPriceAdapter (immutable feed, calendar, and age bounds; no admin), and MarketHoursSentinel (immutable provider and calendar; opening grace set by risk or pool admins through the provider's current ACLManager) have source and local tests but no entries in ADDRESS_BOOK.md (AS-001). Session and closure age bounds and opening grace are constructor or configuration inputs, not established deployed settings.
+      Enforced by code:
+      - SessionCalendar: the owner appends future, sorted, non-overlapping UTC windows (adjacent windows allowed), each 8 hours to 7 days long and starting at most 400 days ahead; the owner can remove only unstarted tail windows and truncate the running window, but not to before the current time.
+      - MarketHoursPriceAdapter requires an 8-decimal feed (checked at construction); rounds posted since the current session began use the session age bound, while other rounds use the closure bound and must also have been fresh at the last recorded close; invalid answers are served as 0.
+      - MarketHoursSentinel.isBorrowAllowed() always returns true; isLiquidationAllowed holds liquidations until min(lastStartedWindow.start + openingGrace, lastStartedWindow.end), so the grace starts at the window start, not at the first feed round after the open; setOpeningGrace accepts 0 to 12 hours at any time, and zero grace skips the calendar read.
+      - The lending core calls isBorrowAllowed on every borrow and consults isLiquidationAllowed only for liquidations with health factor in [0.95, 1) (a health factor of exactly 0.95 consults it), after reading prices; with no sentinel installed (setPriceOracleSentinel), the core skips both hooks.
+      Operational requirements: install the sentinel through setPriceOracleSentinel; keep the AaveOracle fallback unset and set no E-mode price source for stock reserves; bind the adapter and the sentinel to the same calendar; maintain future windows; list stocks as collateral with continuously priced USDG debt (a listing rule, not enforced); size LTV, liquidation threshold, caps, and liquidity for closed-market gaps, the opening grace, and liquidation depth.
+      Out of scope: issuer actions on stock tokens (AS-005, KI-035). No sequencer-outage detection exists, by design. Accepted residuals: KI-031, KI-032.
+    references:
+      - src/oracles/SessionCalendar.sol
+      - src/oracles/MarketHoursPriceAdapter.sol
+      - src/risk/MarketHoursSentinel.sol
+      - lib/neverland-lending/contracts/protocol/libraries/logic/ValidationLogic.sol
+      - CONTEXT.md
+      - test/oracles/unit/SessionCalendar.t.sol
+      - test/oracles/unit/MarketHoursPriceAdapter.t.sol
+      - test/risk/integration/MarketSafetyLendingCore.t.sol
+
+  - id: AS-026
+    name: Leaderboard off-chain trust model
+    details: |
+      Scope: EpochManager, LeaderboardConfig, NFTPartnershipRegistry, VotingPowerMultiplier, LeaderboardKeeper, and SpecialEditionRegistry hold no funds and pay nothing, and no other src/ contract reads them. Their events, configuration, and memberships feed off-chain scoring.
+      Enforced by current source:
+      - LeaderboardKeeper emits keeper- or owner-supplied voting-power, NFT-balance, and LP values without on-chain verification (its dustLock and nftRegistry immutables are never read); the live implementation also reads DustLock and partner registries on-chain (AS-002). settle is callable by the keeper or the owner. syncMyState emits only UserSettled and updates the shared lastSettlement; UserSettled also comes from settle and from owner emergencySettle, and only settle emits BatchComplete("settle", count), with count = users.length including skipped users.
+      - SpecialEditionRegistry accepts any nonzero token ID without DustLock checks; the publisher can only add memberships (also into disabled editions); the owner corrects memberships, editions, and the publisher; no lock lifecycle event updates memberships.
+      - LeaderboardConfig manual points exist only as events; no contract reads the blacklist.
+      - VotingPowerMultiplier uses the highest single veNFT's balanceOfNFT (ties keep the first listed token); tiers are uncapped and only minVotingPower must ascend; multipliers are bounded to [10,000, 50,000] bps; users without a veNFT get 10,000, and users whose veNFTs all have zero voting power get tier 0's multiplier.
+      Trusted: leaderboard owners, keeper, and publisher. Scoring-integrity findings that depend on these parties supplying wrong data are out of scope; unprivileged manipulation of emitted data or memberships remains in scope. Accepted limits: KI-030.
+    references:
+      - src/leaderboard/LeaderboardKeeper.sol
+      - src/leaderboard/SpecialEditionRegistry.sol
+      - src/leaderboard/VotingPowerMultiplier.sol
+      - src/leaderboard/LeaderboardConfig.sol
+      - src/leaderboard/EpochManager.sol
+      - src/leaderboard/NFTPartnershipRegistry.sol
+
+  - id: AS-027
+    name: Pendle leverager market, lending, and custody assumptions
+    details: |
+      Scope/trust: deployed direct Ownable2Step contract, one instance per PT market, with immutable dependencies, disabled renunciation, and transient reentrancy/callback state; the deployed instances fix its ABI, so a source change requires new instances. Recorded instances: PT-AUSD-8OCT2026 (market expired, so every action and preview reverts MarketExpired) and PT-AUSD-17DEC2026, each with a constructor-set Governance Safe owner. Positions remain on the caller's lending account; only that caller receives action surplus. The owner can recover held ERC20s, but has no route setter, pause, or user-position authority. Trust the lending core, pool oracle, official Pendle contracts, and fee-free lenders; provenance is verified off chain. Token assumptions are AS-005.
+      Market checks at construction/entry: listed equal-decimal PT/debt reserves; distinct PT/SY/debt assets; consistent market/PT/SY/YT bindings; SY accepts/returns the debt asset; SY exchangeRate and stored PY index equal 1e18; one-unit redemption reaches par; PT normalized income equals 1e27. The operator keeps PT borrowing disabled, LTV nonzero, and debt ceiling zero. Index drift permanently blocks every action, including decreases; LTV/debt-ceiling restrictions can prevent automatic collateral enablement. Donated aTokens of a nonzero-LTV reserve without a debt ceiling can auto-enable as the caller's collateral, adding bounded health-check gas but no flash rounds.
+      Increase ordering: supply caller PT principal when creating, then optionally buy/supply PT through one position-pool mode-2 flash. Flash increases require caller credit delegation. The core creates variable debt after the callback; debt/health checks run after settlement. Mode 2 has zero premium, grants no flash-repayment allowance, and needs no FLASH_BORROWER role. The debt reserve must permit flash loans and borrowing and remain unfrozen with cap headroom; reported capacity does not establish caller borrowing eligibility.
+      Decrease budgets: max PT resolves to min(balance, allowance). Finite repayAmount is a required initial cash target capped at entry debt; max repayAmount re-reads debt and requires zero debt on success. Nonzero maxCashRepaid bounds total measured underlying payments in either mode; max uint opts out. A target above the unused cap reverts rather than shrinks. All selected PT is converted. After flash settlement and residual PT conversion, repay min(operation cash, fresh debt, unused cap); skip a zero-share partial payment and refund remaining cash. The threshold is ceil(index / 1e27) for the current normalized variable-debt index (getReserveNormalizedVariableDebt), with full debt cleared by the core's full-balance branch. Paid cash can differ from indexed debt retired.
+      Round ordering: after the cap check, action-generated cash repays the entire remaining target directly if sufficient; direct payments consume no flash round. Otherwise flash, repay, pull caller aPT, withdraw/convert PT, and settle the flash. For target T and capacity C, flash amount is ceil(T / ceil(T / C)); PT allocation is floor(ptLeft * amount / T), or all ptLeft when amount equals T. Earlier proceeds can fund later rounds; future proceeds cannot fund an earlier callback. maxRounds counts actual flashes.
+      Lenders: select the largest eligible external source once, Morpho on ties; no fallback after a selected loan fails. Selection uses capacity only, so a capacity change between estimation and inclusion can switch the route. The global pool is distinct from the position pool and requires FLASH_BORROWER plus active/unpaused/flash-enabled reserve state; the global-pool route is available only while the required authorization exists, which recorded addresses do not establish. The global-pool route costs more gas than Morpho at equal rounds, so frontends keep gas headroom. Pool capacity is capped at aToken supply. Its 500,000-gas optional capacity read fails to zero; direct diagnostic and Morpho cash reads propagate failures.
+      Authorization/custody: inclusive deadlines, typed fixed routes, no caller-supplied receiver or executable swap calldata. Authenticate callback source, amount, and context hash; pool callbacks also require the expected initiator, debt asset, singleton arrays, and zero premium. Consume authorization before external work. Cash receipt must equal round-entry cash plus principal. Before flash settlement, balance must cover action-entry cash plus principal. Repayments use exact finite approvals and measured underlying expenditure. Clear approvals and preserve entry debt-asset/PT/SY balances and scaled aPT custody; donated entry cash cannot subsidize the action.
+      Output/risk: buys meet max(minPtOut, ceil(spent * debtPrice * 9000 / (ptPrice * 10000)), spent - floor(spent / 10000)); aggregate conversions meet max(minDebtAssetOut, ceil(ptConverted * ptPrice * 9000 / (debtPrice * 10000))). Oracle/par floors do not guarantee a market quote or expected yield. Final pool-reported HF is read even without debt and must meet max(1e18, caller minimum), plus entry HF for decreases.
+      Pendle/preview semantics: actions and previews reject market or PT expiry (MarketExpired), but deadline and market validation run first. Decreases always sell through the Pendle market; matured positions exit through NeverlandPendleMaturityGateway (AS-024). The live router ignores fixed fallback approximation constants. Selector-restricted previews execute the same caller action and roll back all effects, including post-callback debt/delegation changes; approvals must exist. EVM STATICCALL cannot execute the simulated writes; previews do not reserve future state.
+      Accepted atomic failures: action proceeds insufficient to settle a flash, liquidity, PT or cash cap; indexed repayment tails and zero-share required partial burns; intermediate/final health checks, including proportional rounding and other zero-LTV collateral; lending caps; Pendle rounded-zero fees and market depth limits. Full repayment can require more cash than entry debt through partial-burn rounding or interest since the quote; finite repayment can leave indexed debt. These constraints do not waive cash caps, custody, callback authentication, output bounds, or zero debt on a successful max repayment.
+    references:
+      - src/utils/NeverlandPendleLeverager.sol
+      - src/interfaces/INeverlandPendleLeverager.sol
+      - src/interfaces/IPendlePtLeverageRouter.sol
+      - test/utils/unit/NeverlandPendleLeverager.t.sol
+      - test/utils/integration/NeverlandPendleLeveragerLending.t.sol
+      - lib/neverland-lending/contracts/protocol/libraries/logic/FlashLoanLogic.sol
+      - lib/neverland-lending/contracts/protocol/libraries/logic/SupplyLogic.sol
+      - lib/neverland-lending/contracts/protocol/libraries/logic/ValidationLogic.sol
+      - lib/neverland-lending/contracts/protocol/tokenization/VariableDebtToken.sol
+      - CONTEXT.md
+      - ADDRESS_BOOK.md
+      - test/utils/integration/NeverlandPendleLeveragerHealthRounding.t.sol

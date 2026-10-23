@@ -21,9 +21,10 @@ import {OracleLib} from "../libraries/OracleLib.sol";
  *          PT/USD      = baseAssetUSD * (WAD - discountWad) / WAD                           // then 8 decimals
  *
  *      The discount decays to zero at maturity, where the PT prices at par. The price is a pure function of
- *      `block.timestamp` and the base feed and never reads a Pendle AMM/TWAP, so it has no manipulation surface
- *      beyond the Chainlink feed it wraps. Independent implementation of the linear-discount model Pendle
- *      publicly documents for lending integrations; no third-party source code is reused.
+ *      `block.timestamp`, the governed `discountRatePerYear`, and the base feed and never reads a Pendle
+ *      AMM/TWAP, so it has no manipulation surface beyond the governed rate and the Chainlink feed it wraps.
+ *      The discount model is independently implemented from Pendle public documentation for lending
+ *      integrations; no Pendle source code is reused.
  *
  *      The PT must be a non-borrowable, collateral-only reserve. `discountRatePerYear` is a risk parameter owned
  *      by the market's risk admin (Safe/timelock), hard-capped by the immutable `maxDiscountRatePerYear`.
@@ -34,7 +35,7 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
      * @notice Initializes the Pendle PT discount oracle adapter
      * @param _baseAggregator The accounting-asset USD price aggregator address
      * @param _principalToken The Pendle principal token address
-     * @param _maxDelay Maximum staleness delay for base feed data in seconds
+     * @param _maxDelay Maximum staleness delay for base feed data in seconds (0 disables the staleness check)
      * @param _maxDiscountRatePerYear Immutable hard ceiling for the annual discount rate, in basis points
      * @param _discountRatePerYear Initial annual discount rate, in basis points
      * @param _description Human-readable description of the oracle
@@ -50,7 +51,6 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
         if (_baseAggregator == address(0) || _principalToken == address(0)) {
             revert CommonChecksLibrary.AddressZero();
         }
-        if (_maxDelay == 0) revert InvalidMaxDelay();
 
         // The ceiling must be a real, sub-100% rate; the active rate must be positive and within it.
         if (_maxDiscountRatePerYear == 0 || _maxDiscountRatePerYear >= BPS_DENOMINATOR) {
@@ -64,7 +64,6 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
         principalToken = IPendlePrincipalToken(_principalToken);
         maxDelay = _maxDelay;
         maxDiscountRatePerYear = _maxDiscountRatePerYear;
-        discountRatePerYear = _discountRatePerYear;
 
         baseDecimals = baseAggregator.decimals();
         if (baseDecimals < OracleLib.MIN_DECIMALS || baseDecimals > OracleLib.MAX_DECIMALS) {
@@ -77,9 +76,15 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
 
         maturity = ptMaturity;
 
-        // A fresh listing must price strictly above zero: reject a rate that already implies a full discount.
+        // Reject a rate that already implies a discount of 100% or more at the current time.
         if (_discountWadFor(_discountRatePerYear) >= WAD) revert DiscountExceedsHundredPercent();
+        /*
+         * A sub-100% WAD factor can still floor to zero after decimal normalization. Bind construction to a
+         * currently valid base round and reject any initial rate that would expose a zero-valued oracle source.
+         */
+        if (!_hasPositivePriceForRate(_discountRatePerYear)) revert InvalidPtPrice();
 
+        discountRatePerYear = _discountRatePerYear;
         description = _description;
     }
 
@@ -98,6 +103,9 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
 
     /// @dev Seconds in a year, used to pro-rate the annual discount rate
     uint256 private constant SECONDS_PER_YEAR = 365 days;
+
+    /// @dev Exact returndata size in bytes of a conforming latestRoundData() reply (five 32-byte words)
+    uint256 private constant LATEST_ROUND_DATA_SIZE = 160;
 
     /*//////////////////////////////////////////////////////////////
                           IMMUTABLE STATE
@@ -141,6 +149,11 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
         if (newRatePerYear == 0 || newRatePerYear > maxDiscountRatePerYear) revert InvalidDiscountRate();
         // The new rate must not imply a full discount at the current time (PT must price above zero).
         if (_discountWadFor(newRatePerYear) >= WAD) revert DiscountExceedsHundredPercent();
+        /*
+         * Validate against the current base round before mutating state. A nonzero WAD factor is insufficient
+         * when decimal normalization would still floor the final Aave-facing answer to zero.
+         */
+        if (!_hasPositivePriceForRate(newRatePerYear)) revert InvalidPtPrice();
 
         uint16 previous = discountRatePerYear;
         discountRatePerYear = newRatePerYear;
@@ -207,7 +220,7 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
 
     /// @inheritdoc IPendlePtDiscountOracleAdapter
     function version() external pure returns (uint256) {
-        return 1;
+        return 2;
     }
 
     /// @inheritdoc IPendlePtDiscountOracleAdapter
@@ -249,34 +262,121 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
 
     /**
      * @notice Attempts to fetch the latest base round and compute a discounted PT price without reverting
-     * @dev Returns (false, 0, 0, 0) on any failure or invalid/stale data
+     * @dev Returns (false, 0, 0, 0) on any failure or invalid/stale base data; round validation is shared
+     *      with the config-time rate guard via `_tryValidBaseRound`.
      * @return ok True if the latest data was fetched and validated
      * @return roundId The base round ID used for the answer
      * @return answer The computed PT price scaled to target decimals
      * @return updatedAt The base round updatedAt timestamp
      */
     function _tryLatestData() internal view returns (bool ok, uint80 roundId, int256 answer, uint256 updatedAt) {
-        try baseAggregator.latestRoundData() returns (
+        (bool valid, uint80 baseRoundId, int256 basePrice, uint256 baseUpdatedAt) = _tryValidBaseRound();
+
+        if (!valid) return (false, 0, 0, 0);
+
+        int256 price = _computePtPriceSafe(basePrice);
+
+        if (price == 0) return (false, 0, 0, 0);
+
+        return (true, baseRoundId, price, baseUpdatedAt);
+    }
+
+    /**
+     * @notice Reads and fully validates the latest base round without reverting
+     * @dev Shared validation core for the lenient read path and the config-time rate guard: bounded raw
+     *      read, then round validity and metadata checks.
+     * @return ok True when the base round is valid, fresh, and metadata-consistent
+     * @return roundId The base round ID
+     * @return basePrice The validated positive base price
+     * @return updatedAt The base round updatedAt timestamp
+     */
+    function _tryValidBaseRound() internal view returns (bool ok, uint80 roundId, int256 basePrice, uint256 updatedAt) {
+        (
+            bool success,
             uint80 baseRoundId,
-            int256 basePrice,
+            int256 basePriceRaw,
             uint256 baseStartedAt,
             uint256 baseUpdatedAt,
             uint80 baseAnsweredInRound
-        ) {
-            if (!_isValidRound(basePrice, baseUpdatedAt)) return (false, 0, 0, 0);
+        ) = _tryReadBaseRoundData();
 
-            if (!_isValidRoundMetadata(baseRoundId, baseStartedAt, baseUpdatedAt, baseAnsweredInRound)) {
-                return (false, 0, 0, 0);
-            }
+        if (!success) return (false, 0, 0, 0);
 
-            int256 price = _computePtPriceSafe(basePrice);
+        if (!_isValidRound(basePriceRaw, baseUpdatedAt)) return (false, 0, 0, 0);
 
-            if (price == 0) return (false, 0, 0, 0);
-
-            return (true, baseRoundId, price, baseUpdatedAt);
-        } catch {
+        if (!_isValidRoundMetadata(baseRoundId, baseStartedAt, baseUpdatedAt, baseAnsweredInRound)) {
             return (false, 0, 0, 0);
         }
+
+        return (true, baseRoundId, basePriceRaw, baseUpdatedAt);
+    }
+
+    /**
+     * @notice Reads the base feed into a fixed five-word buffer without copying unbounded returndata
+     * @dev Exact-size and canonical-uint80 checks happen before narrowing. This keeps malformed successful
+     *      replies and return-data amplification from reverting the legacy fail-soft path.
+     * @return ok True when the call succeeded with a canonical five-word reply
+     * @return roundId The decoded base round ID
+     * @return answer The decoded base price
+     * @return startedAt The decoded base round start timestamp
+     * @return updatedAt The decoded base round update timestamp
+     * @return answeredInRound The decoded answer round ID
+     */
+    function _tryReadBaseRoundData()
+        internal
+        view
+        returns (bool ok, uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
+    {
+        address aggregator = address(baseAggregator);
+        uint256 selector = uint32(AggregatorV3Interface.latestRoundData.selector);
+        bool success;
+        uint256 returnSize;
+        uint256 rawRoundId;
+        uint256 rawAnsweredInRound;
+
+        /*
+         * A bounded output buffer is the safety property; Solidity's bytes-returning low-level call would copy
+         * the entire returndata before its length could be checked.
+         */
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            let data := mload(0x40)
+            mstore(0x40, add(data, 0xa0))
+            mstore(data, shl(224, selector))
+
+            success := staticcall(gas(), aggregator, data, 0x04, data, 0xa0)
+            returnSize := returndatasize()
+
+            rawRoundId := mload(data)
+            answer := mload(add(data, 0x20))
+            startedAt := mload(add(data, 0x40))
+            updatedAt := mload(add(data, 0x60))
+            rawAnsweredInRound := mload(add(data, 0x80))
+        }
+
+        if (
+            !success || returnSize != LATEST_ROUND_DATA_SIZE || rawRoundId > type(uint80).max
+                || rawAnsweredInRound > type(uint80).max
+        ) {
+            return (false, 0, 0, 0, 0, 0);
+        }
+
+        return (true, uint80(rawRoundId), answer, startedAt, updatedAt, uint80(rawAnsweredInRound));
+    }
+
+    /**
+     * @notice Checks whether a proposed rate produces a positive normalized price from the current valid round
+     * @dev Used by construction and governance updates so an accepted configuration cannot immediately expose
+     *      a zero-valued Aave source. Feed failures surface as an invalid proposed price.
+     * @param rate The proposed annual discount rate, in basis points
+     * @return hasPositivePrice True when the current valid base round normalizes to a positive PT price
+     */
+    function _hasPositivePriceForRate(uint16 rate) internal view returns (bool hasPositivePrice) {
+        (bool ok,, int256 basePrice,) = _tryValidBaseRound();
+
+        if (!ok) return false;
+
+        return _computePtPriceSafeForRate(basePrice, rate) > 0;
     }
 
     /**
@@ -299,7 +399,18 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
      * @return ptPrice The computed PT price scaled to target decimals, or 0 if computation fails
      */
     function _computePtPriceSafe(int256 basePrice) internal view returns (int256 ptPrice) {
-        uint256 discountWad = _currentDiscountWad();
+        return _computePtPriceSafeForRate(basePrice, discountRatePerYear);
+    }
+
+    /**
+     * @notice Safely computes the discounted PT price for an explicitly supplied annual rate
+     * @dev Caller must ensure basePrice is positive; a negative value would wrap in the uint256 cast.
+     * @param basePrice The accounting-asset USD price from the base aggregator
+     * @param rate The annual discount rate to evaluate, in basis points
+     * @return ptPrice The computed PT price scaled to target decimals, or 0 if computation fails
+     */
+    function _computePtPriceSafeForRate(int256 basePrice, uint16 rate) internal view returns (int256 ptPrice) {
+        uint256 discountWad = _discountWadFor(rate);
 
         // A full (>=100%) discount means the PT is valued at zero; surface as a failed read.
         if (discountWad >= WAD) return 0;
@@ -363,7 +474,8 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
 
     /**
      * @notice Validates additional round metadata checks with strict behavior
-     * @dev Reverts on inconsistent round metadata.
+     * @dev Reverts on inconsistent round metadata. `answeredInRound` is informational (deprecated by
+     *      Chainlink); it is rejected only when nonzero and behind `roundId`.
      * @param roundId The round ID returned by the aggregator
      * @param startedAt Timestamp when the round started
      * @param updatedAt Timestamp when the round was last updated
@@ -375,7 +487,7 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
     {
         if (roundId == 0) revert CommonChecksLibrary.StaleRound();
         if (startedAt > updatedAt) revert CommonChecksLibrary.StaleRound();
-        if (answeredInRound == 0 || answeredInRound < roundId) revert CommonChecksLibrary.StaleRound();
+        if (answeredInRound != 0 && answeredInRound < roundId) revert CommonChecksLibrary.StaleRound();
     }
 
     /**
@@ -393,7 +505,8 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
 
     /**
      * @notice Checks if additional round metadata is valid without reverting
-     * @dev Mirrors strict metadata checks but returns false on invalid data.
+     * @dev Mirrors strict metadata checks but returns false on invalid data. `answeredInRound` is
+     *      informational (deprecated by Chainlink); it is rejected only when nonzero and behind `roundId`.
      * @param roundId The round ID returned by the aggregator
      * @param startedAt Timestamp when the round started
      * @param updatedAt Timestamp when the round was last updated
@@ -407,32 +520,34 @@ contract PendlePtDiscountOracleAdapter is IPendlePtDiscountOracleAdapter, Ownabl
     {
         if (roundId == 0) return false;
         if (startedAt > updatedAt) return false;
-        if (answeredInRound == 0 || answeredInRound < roundId) return false;
+        if (answeredInRound != 0 && answeredInRound < roundId) return false;
 
         return true;
     }
 
     /**
      * @notice Validates that base oracle data is fresh based on maxDelay
-     * @dev Reverts if data is too old according to configured maxDelay
+     * @dev Reverts if data is too old according to the configured maxDelay; a zero maxDelay disables the
+     *      staleness bound while zero and future-dated timestamps stay rejected.
      * @param updatedAt Timestamp when the data was last updated
      */
     function _validateFreshness(uint256 updatedAt) internal view {
         if (updatedAt == 0 || updatedAt > block.timestamp) revert CommonChecksLibrary.StaleRound();
-        if (block.timestamp - updatedAt > maxDelay) {
+        if (maxDelay != 0 && block.timestamp - updatedAt > maxDelay) {
             revert CommonChecksLibrary.PriceTooOld(block.timestamp, updatedAt, updatedAt + maxDelay);
         }
     }
 
     /**
      * @notice Checks if base oracle data is fresh based on maxDelay
-     * @dev Returns true when data is within maxDelay
+     * @dev Returns true when data is within maxDelay; a zero maxDelay disables the staleness bound while
+     *      zero and future-dated timestamps stay rejected.
      * @param updatedAt Timestamp when the data was last updated
      * @return isFresh True if data is fresh, false otherwise
      */
     function _isFresh(uint256 updatedAt) internal view returns (bool isFresh) {
         if (updatedAt == 0 || updatedAt > block.timestamp) return false;
 
-        return block.timestamp - updatedAt <= maxDelay;
+        return maxDelay == 0 || block.timestamp - updatedAt <= maxDelay;
     }
 }

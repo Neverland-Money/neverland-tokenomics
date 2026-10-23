@@ -2,11 +2,8 @@
 pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
-import {stdJson} from "forge-std/StdJson.sol";
 
 abstract contract GovernanceAddressBookReader is Test {
-    using stdJson for string;
-
     struct GovernanceAddressBook {
         address governanceSafe;
         address sentinelSafe;
@@ -18,7 +15,8 @@ abstract contract GovernanceAddressBookReader is Test {
         address lendingWrappedTokenGateway;
         address coreProxyAdmin;
         address leaderboardProxyAdmin;
-        address hardcodedPriceOracleLoAznd;
+        address historicalHardcodedPriceOracleLoAznd;
+        address governedPriceOracleLoAznd;
         address pendlePtDiscountOracleAdapter;
         address specialEditionRegistry;
         address specialEditionRegistryImplementation;
@@ -29,84 +27,47 @@ abstract contract GovernanceAddressBookReader is Test {
         address tokenomicsUiEmissionLibrary;
     }
 
-    function _loadGovernanceAddressBook(string memory network)
-        internal
-        view
-        returns (GovernanceAddressBook memory book)
-    {
-        string memory json = vm.readFile(string.concat(vm.projectRoot(), "/deployments/", network, "/addresses.json"));
+    function _loadGovernanceAddressBook() internal view returns (GovernanceAddressBook memory book) {
+        string memory markdown = vm.readFile(string.concat(vm.projectRoot(), "/ADDRESS_BOOK.md"));
 
-        book.governanceSafe = _readOptionalAddress(json, ".governance.governanceSafe");
-        if (book.governanceSafe == address(0)) {
-            book.governanceSafe = json.readAddress(".governance.foundationSafe");
-        }
-        book.sentinelSafe = _readOptionalAddress(json, ".governance.sentinelSafe");
-        book.governanceTimelock = _readOptionalAddress(json, ".governance.timelocks.governance");
-        book.riskTimelock = _readOptionalAddress(json, ".governance.timelocks.risk");
-        book.lendingPoolAddressesProvider = _readOptionalAddress(json, ".governance.lending.poolAddressesProvider");
-        if (book.lendingPoolAddressesProvider == address(0)) {
-            book.lendingPoolAddressesProvider = json.readAddress(".governance.aave.poolAddressesProvider");
-        }
+        book.governanceSafe = _readAddress(markdown, "governance.governanceSafe");
+        book.sentinelSafe = _readAddress(markdown, "governance.sentinelSafe");
+        book.governanceTimelock = _readAddress(markdown, "governance.timelocks.governance");
+        book.riskTimelock = _readAddress(markdown, "governance.timelocks.risk");
+        book.lendingPoolAddressesProvider = _readAddress(markdown, "governance.lending.poolAddressesProvider");
         book.lendingPoolAddressesProviderRegistry =
-            _readOptionalAddress(json, ".governance.lending.poolAddressesProviderRegistry");
-        if (book.lendingPoolAddressesProviderRegistry == address(0)) {
-            book.lendingPoolAddressesProviderRegistry =
-                json.readAddress(".governance.aave.poolAddressesProviderRegistry");
-        }
-        book.lendingReservesSetupHelper = _readOptionalAddress(json, ".governance.lending.reservesSetupHelper");
-        if (book.lendingReservesSetupHelper == address(0)) {
-            book.lendingReservesSetupHelper = json.readAddress(".governance.aave.reservesSetupHelper");
-        }
-        book.lendingWrappedTokenGateway = _readOptionalAddress(json, ".governance.lending.wrappedTokenGateway");
-        if (book.lendingWrappedTokenGateway == address(0)) {
-            book.lendingWrappedTokenGateway = json.readAddress(".governance.aave.wrappedTokenGateway");
-        }
-        book.coreProxyAdmin = _readOptionalAddress(json, ".governance.tokenomics.upgradeability.coreProxyAdmin");
-        if (book.coreProxyAdmin == address(0)) {
-            book.coreProxyAdmin = _readOptionalAddress(json, ".governance.neverland.upgradeability.coreProxyAdmin");
-        }
-        if (book.coreProxyAdmin == address(0)) {
-            book.coreProxyAdmin = _readOptionalAddress(json, ".proxyAdmin");
-        }
+            _readAddress(markdown, "governance.lending.poolAddressesProviderRegistry");
+        book.lendingReservesSetupHelper = _readAddress(markdown, "governance.lending.reservesSetupHelper");
+        book.lendingWrappedTokenGateway = _readAddress(markdown, "governance.lending.wrappedTokenGateway");
+        book.coreProxyAdmin = _readAddress(markdown, "governance.tokenomics.upgradeability.coreProxyAdmin");
         book.leaderboardProxyAdmin =
-            _readOptionalAddress(json, ".governance.tokenomics.upgradeability.leaderboardProxyAdmin");
-        if (book.leaderboardProxyAdmin == address(0)) {
-            book.leaderboardProxyAdmin =
-                _readOptionalAddress(json, ".governance.neverland.upgradeability.leaderboardProxyAdmin");
-        }
-        book.hardcodedPriceOracleLoAznd = _readOptionalAddress(json, ".addresses.HardcodedPriceOracle-loAZND-103500000");
+            _readAddress(markdown, "governance.tokenomics.upgradeability.leaderboardProxyAdmin");
+        book.historicalHardcodedPriceOracleLoAznd =
+            _readAddress(markdown, "addresses.HardcodedPriceOracle-loAZND-103500000");
+        book.governedPriceOracleLoAznd = _readAddress(markdown, "addresses.GovernedPriceOracle-LOAZND");
         book.pendlePtDiscountOracleAdapter =
-            _readOptionalAddress(json, ".addresses.PendlePtDiscountOracleAdapter-AUSD-1791417600");
-        book.specialEditionRegistry = _readOptionalAddress(json, ".addresses.SpecialEditionRegistry");
-        book.specialEditionRegistryImplementation =
-            _readOptionalAddress(json, ".implementations.SpecialEditionRegistry");
-        book.userVaultBeacon = _readOptionalAddress(json, ".governance.tokenomics.upgradeability.userVaultBeacon");
-        if (book.userVaultBeacon == address(0)) {
-            book.userVaultBeacon = _readOptionalAddress(json, ".governance.neverland.upgradeability.userVaultBeacon");
-        }
-        if (book.userVaultBeacon == address(0)) {
-            book.userVaultBeacon = _readOptionalAddress(json, ".addresses.UserVaultBeacon");
-        }
-        book.dustLockTransferStrategy = _readOptionalAddress(json, ".addresses.DustLockTransferStrategy");
-        book.tokenomicsDustHelper = _readOptionalAddress(json, ".addresses.NeverlandDustHelper");
-        book.tokenomicsUiProvider = _readOptionalAddress(json, ".addresses.NeverlandUiProvider");
-        book.tokenomicsUiEmissionLibrary = _readOptionalAddress(json, ".addresses.NeverlandUiEmissionLibrary");
+            _readAddress(markdown, "addresses.PendlePtDiscountOracleAdapter-AUSD-1797465600");
+        book.specialEditionRegistry = _readAddress(markdown, "addresses.SpecialEditionRegistry");
+        book.specialEditionRegistryImplementation = _readAddress(markdown, "implementations.SpecialEditionRegistry");
+        book.userVaultBeacon = _readAddress(markdown, "governance.tokenomics.upgradeability.userVaultBeacon");
+        book.dustLockTransferStrategy = _readAddress(markdown, "addresses.DustLockTransferStrategy");
+        book.tokenomicsDustHelper = _readAddress(markdown, "addresses.NeverlandDustHelper");
+        book.tokenomicsUiProvider = _readAddress(markdown, "addresses.NeverlandUiProvider");
+        book.tokenomicsUiEmissionLibrary = _readAddress(markdown, "addresses.NeverlandUiEmissionLibrary");
     }
 
-    function readOptionalAddress(string memory json, string memory path) external pure returns (address) {
-        string memory raw = json.readString(path);
-        if (bytes(raw).length == 0) {
-            return address(0);
-        }
+    function _readAddress(string memory markdown, string memory key) internal pure returns (address) {
+        string memory prefix = string.concat("| `", key, "` | `");
+        uint256 position = vm.indexOf(markdown, prefix);
+        require(position != type(uint256).max, string.concat("Missing address-book key: ", key));
+        position += bytes(prefix).length;
 
-        return vm.parseAddress(raw);
-    }
-
-    function _readOptionalAddress(string memory json, string memory path) internal view returns (address) {
-        try this.readOptionalAddress(json, path) returns (address value) {
-            return value;
-        } catch {
-            return address(0);
+        bytes memory document = bytes(markdown);
+        require(position + 42 < document.length && document[position + 42] == bytes1("`"), "Invalid address row");
+        bytes memory value = new bytes(42);
+        for (uint256 i; i < value.length; ++i) {
+            value[i] = document[position + i];
         }
+        return vm.parseAddress(string(value));
     }
 }

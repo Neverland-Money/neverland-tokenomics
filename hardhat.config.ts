@@ -1,13 +1,15 @@
-import "@nomicfoundation/hardhat-ethers";
-import "@nomicfoundation/hardhat-chai-matchers";
-import "@nomicfoundation/hardhat-foundry";
-import "@typechain/hardhat";
-require("dotenv").config();
+import hardhatEthers from "@nomicfoundation/hardhat-ethers";
+import hardhatFoundry from "@nomicfoundation/hardhat-foundry";
+import { defineConfig } from "hardhat/config";
 
-const ETHERS_V5 = process.env.ETHERS_V5 === "true";
-
-export default {
+export default defineConfig({
+  plugins: [hardhatEthers, hardhatFoundry],
+  paths: {
+    sources: "./src",
+    cache: "./cache_hardhat",
+  },
   solidity: {
+    splitTestsCompilation: true,
     version: "0.8.30",
     settings: {
       evmVersion: "cancun",
@@ -23,11 +25,8 @@ export default {
   },
   networks: {
     hardhat: {
+      type: "edr-simulated",
       chainId: 31337,
     },
   },
-  typechain: {
-    outDir: ETHERS_V5 ? "typechain-v5" : "typechain-v6",
-    target: ETHERS_V5 ? "ethers-v5" : "ethers-v6",
-  },
-};
+});

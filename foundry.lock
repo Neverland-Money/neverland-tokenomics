@@ -14,6 +14,12 @@
   "lib/forge-std": {
     "rev": "77041d2ce690e692d6e03cc812b57d1ddaa4d505"
   },
+  "lib/neverland-lending": {
+    "tag": {
+      "name": "neverland-v1.1.0",
+      "rev": "a26582fcc24df718a57efd505d51d8cdeeed388d"
+    }
+  },
   "lib/openzeppelin-contracts": {
     "rev": "dc44c9f1a4c3b10af99492eed84f83ed244203f6"
   },

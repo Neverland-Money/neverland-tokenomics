@@ -1,61 +1,126 @@
 {
-  "name": "neverland-contracts",
-  "version": "1.1.0",
-  "description": "Neverland Protocol public smart-contract mirror",
+  "name": "@neverland-money/tokenomics-core",
+  "version": "1.2.0",
+  "description": "Neverland tokenomics contracts, ABIs, and ethers v6 bindings",
   "license": "BUSL-1.1",
-  "packageManager": "yarn@4.14.1",
+  "packageManager": "yarn@4.18.1",
   "engines": {
-    "node": "24.15.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "solhint": "solhint 'src/**/*.sol'",
-    "solhint:report": "solhint 'src/**/*.sol' > solhint.txt 2>&1 || true",
-    "aderyn:report": "aderyn -o aderyn.md --skip-update-check",
-    "clean": "yarn run clean:foundry && yarn run clean:hardhat",
+    "lint": "yarn solhint",
+    "typecheck": "tsc --noEmit --pretty false",
+    "clean": "yarn clean:foundry && yarn clean:hardhat && node tools/package.cjs clean",
     "clean:foundry": "forge clean",
     "clean:hardhat": "hardhat clean",
-    "coverage": "forge coverage --exclude-tests --no-match-coverage '^(script|test)/|^src/leaderboard/ProxyImports\\.sol$' --no-match-test '(GasCosts|UnderTightGas|ProviderArtifactFitsEip170WithLinkedLibraries)' --no-match-path 'test/{audit,journey}/**'",
-    "build": "yarn run clean && yarn run build:foundry && yarn run build:hardhat && yarn run build:wagmi",
-    "build:foundry": "forge build",
-    "build:hardhat": "hardhat compile",
+    "build": "yarn build:foundry && yarn build:hardhat && yarn build:wagmi && yarn build:types && yarn build:package",
+    "rebuild": "yarn clean && yarn build",
+    "build:foundry": "forge build src/",
+    "build:hardhat": "hardhat build --force --no-tests && node tools/bindings.mjs",
     "build:wagmi": "wagmi generate",
-    "governance:test:foundry": "forge test --match-path 'test/governance/*.t.sol' --no-match-contract '.*Fork.*'",
-    "governance:test:lending-fork": "RUN_LENDING_FORK_GOVERNANCE_TESTS=true forge test --match-path 'test/governance/LendingTimelockBoundariesFork.t.sol' -vv",
-    "test:claim-reform:workbook-contract": "RUN_CLAIM_REFORM_CONTRACT_WORKBOOK=true forge test --match-contract '^ClaimReformContractWorkbookTest$' -v",
-    "test:claim-reform:predeploy": "FOUNDRY_PROFILE=claim-reform-predeploy forge test --match-contract '^(ClaimReformStatefulInvariantTest|RevenueRewardEpochLedgerInvariantTest)$' -v && yarn test:claim-reform:workbook-contract",
-    "test:claim-reform:fork": "RUN_CLAIM_REFORM_FORK_TESTS=true forge test --match-path test/claim-reform/fork/ClaimReformMainnetFork.t.sol -v",
-    "test:invariants:deep": "FOUNDRY_PROFILE=deep-invariants forge test --match-path 'test/oracles/invariant/**' -v",
-    "tests": "yarn run tests:foundry",
-    "tests:foundry": "forge test -v --no-match-contract '.*Fork.*'",
+    "build:addresses": "node tools/package.cjs addresses",
+    "build:types": "yarn build:addresses && node tools/package.cjs clean-dist && tsc --project tsconfig.build.json && node tools/package.cjs dist",
+    "build:package": "node tools/package.cjs prepare",
+    "check:sizes": "forge build --sizes src/",
+    "source:hash": "node tools/package.cjs hash",
+    "test": "yarn build && yarn tests:foundry && yarn test:release && yarn test:package-verifier && yarn test:package",
+    "tests": "yarn test",
+    "tests:foundry": "forge test -v",
+    "test:package": "node --test test/package/*.test.cjs",
+    "test:release": "node --test test/release/*.test.cjs",
+    "verify:package": "node tools/package.cjs verify",
+    "check": "yarn format:check && yarn lint && yarn test:release && yarn build && yarn typecheck && yarn check:sizes && yarn tests:foundry && yarn test:package-verifier && yarn verify:package && yarn test:package",
+    "prepack": "yarn build && yarn verify:package",
+    "prepublishOnly": "yarn verify:package",
     "format": "forge fmt && yarn prettier --write .",
-    "format:check": "forge fmt --check && yarn prettier --check ."
+    "format:check": "forge fmt --check && yarn prettier --check .",
+    "test:package-verifier": "node --test test/package-verifier/*.test.cjs"
   },
   "devDependencies": {
-    "@cyfrin/aderyn": "^0.6.1",
-    "@nomicfoundation/hardhat-chai-matchers": "^2.1.0",
-    "@nomicfoundation/hardhat-ethers": "^3.1.0",
-    "@nomicfoundation/hardhat-foundry": "^1.2.0",
-    "@nomicfoundation/hardhat-network-helpers": "^1.1.0",
-    "@typechain/ethers-v5": "^11.1.2",
+    "@nomicfoundation/hardhat-ethers": "^4.2.1",
+    "@nomicfoundation/hardhat-foundry": "^3.0.5",
     "@typechain/ethers-v6": "^0.5.1",
-    "@typechain/hardhat": "^9.1.0",
-    "@types/chai": "^5.2.2",
-    "@types/mocha": ">=9.1.0",
     "@types/node": ">=20.0.0",
-    "@wagmi/cli": "^2.6.0",
-    "chai": "^4.2.0",
-    "dotenv": "^17.2.3",
-    "ethers": "^6.15.0",
-    "hardhat": "^2.26.3",
-    "hardhat-gas-reporter": "^2.3.0",
-    "prettier": "^3.6.2",
-    "solhint": "^6.0.1",
-    "solidity-coverage": "^0.8.16",
-    "ts-node": ">=8.0.0",
+    "@wagmi/cli": "^2.10.0",
+    "hardhat": "^3.21.0",
+    "prettier": "3.6.2",
+    "solhint": "^6.2.5",
     "typechain": "^8.3.2",
     "typescript": "^5.9.3"
   },
   "resolutions": {
-    "@types/minimatch": "5.1.2"
-  }
+    "@types/minimatch": "5.1.2",
+    "typechain/glob": "13.0.6"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "addresses": [
+        "dist/generated/addresses.json"
+      ],
+      "types": [
+        "dist/generated/types/index.d.ts"
+      ],
+      "types/*": [
+        "dist/generated/types/*.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "src",
+    "artifacts/src",
+    "dist",
+    "vendor",
+    "remappings.package.txt",
+    "foundry.lock",
+    "ADDRESS_BOOK.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./types": {
+      "types": "./dist/generated/types/index.d.ts",
+      "require": "./dist/generated/types/index.js",
+      "default": "./dist/generated/types/index.js"
+    },
+    "./types/*": {
+      "types": "./dist/generated/types/*.d.ts",
+      "require": "./dist/generated/types/*.js",
+      "default": "./dist/generated/types/*.js"
+    },
+    "./artifacts/*": "./artifacts/*",
+    "./src/*": "./src/*",
+    "./vendor/*": "./vendor/*",
+    "./addresses": "./dist/generated/addresses.json",
+    "./remappings": "./remappings.package.txt",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Neverland-Money/neverland-tokenomics.git"
+  },
+  "homepage": "https://github.com/Neverland-Money/neverland-tokenomics#readme",
+  "keywords": [
+    "neverland",
+    "monad",
+    "solidity",
+    "tokenomics"
+  ],
+  "neverland": {
+    "developmentCommit": "71c2d0658d6e12e61018156808f1bd6e9a24675c",
+    "sourceHash": "sha256:7661b070f4d34ff11edf7ea05a0f7825d961db3c624a2f4669eb5f63951dad4b"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0"
+  },
+  "type": "module"
 }

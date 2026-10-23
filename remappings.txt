@@ -6,6 +6,7 @@ forge-std/=lib/forge-std/src/
 contracts/=./contracts/
 @aave/core-v3/contracts/=lib/aave-v3-core/contracts/
 @aave-v3-periphery/contracts/=lib/aave-v3-periphery/contracts/
+@neverland-money/lending-core/contracts/=lib/neverland-lending/contracts/
 @chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/
 @prb/math/=lib/prb-math/
 @uniswap/v2-core/=lib/v2-core/
