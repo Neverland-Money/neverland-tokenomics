@@ -186,7 +186,7 @@ const MAINNET_RESERVES: Record<string, OracleReserveConfig> = {
     // Accounting asset of SY-sUSDE (0x06fC2568fa3C8A9862D8f35bc6758355b3A32F51): assetInfo()
     // reports USDe, not sUSDe, so PT-sUSDE prices off the USDe reserve. Consumed by the
     // Pendle PT deploy gate (resolvePendlePtExpectedAccountingAsset).
-    symbol: "sUSDE",
+    symbol: "USDe",
     reserveAddress: "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34",
     reserveDecimals: 18,
   },

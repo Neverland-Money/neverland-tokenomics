@@ -179,8 +179,15 @@ test("plan cannot release a pull request, another branch, or a repository fork",
   const cwd = fixture(t);
   for (const changes of [
     { GITHUB_EVENT_NAME: "pull_request" },
-    { GITHUB_EVENT_NAME: "workflow_dispatch" },
     { GITHUB_REF: "refs/heads/feature" },
+    {
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_REF: "refs/heads/feature",
+    },
+    {
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_REPOSITORY: "someone/neverland-tokenomics",
+    },
     { GITHUB_REPOSITORY: "someone/neverland-tokenomics" },
   ]) {
     assert.equal(
@@ -220,15 +227,20 @@ test("plan rejects downgrades, prereleases, leading zeroes, and unsafe before re
     "0".repeat(40),
     "a".repeat(40) + ":other",
   ]) {
-    assert.throws(() =>
-      planRelease({
-        cwd,
-        env: environment({ GITHUB_EVENT_BEFORE: before }),
-        execFile() {
-          assert.fail("unsafe revision reached git");
-        },
-      })
+    let gitCalled = false;
+    assert.throws(
+      () =>
+        planRelease({
+          cwd,
+          env: environment({ GITHUB_EVENT_BEFORE: before }),
+          execFile() {
+            gitCalled = true;
+            return JSON.stringify({ name, version: "1.1.0" });
+          },
+        }),
+      /full, nonzero Git commit SHA/
     );
+    assert.equal(gitCalled, false);
   }
 });
 
@@ -262,6 +274,9 @@ test("release rejects unauthorized GitHub contexts before remote operations", as
   const c = candidate(t);
   for (const changes of [
     { GITHUB_REF: "refs/heads/other" },
+    { GITHUB_EVENT_NAME: "pull_request" },
+    { GITHUB_REPOSITORY: "someone/neverland-tokenomics" },
+    { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/other" },
     { GITHUB_TOKEN: "" },
     { GITHUB_SHA: "HEAD" },
   ]) {
@@ -273,14 +288,32 @@ test("release rejects unauthorized GitHub contexts before remote operations", as
   }
 });
 
-test("release publishes the tested tarball, verifies the registry install, then creates matching GitHub records", async (t) => {
+test("main dispatch requests recovery even without a version change, without reading before SHA", (t) => {
+  const cwd = fixture(t);
+  const result = planRelease({
+    cwd,
+    env: environment({
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_EVENT_BEFORE: undefined,
+    }),
+    execFile() {
+      assert.fail("dispatch has no before commit");
+    },
+  });
+  assert.equal(result.release_requested, true);
+});
+
+test("publish phase never executes consumers or creates GitHub records", async (t) => {
   const c = candidate(t);
   const ops = operations(c);
+  const output = join(c.cwd, "output");
   const result = await runRelease({
     ...c,
-    env: environment(),
+    phase: "publish",
+    env: environment({ GITHUB_OUTPUT: output }),
     operations: ops,
   });
+  assert.equal(result.status, "published");
   assert.equal(result.published, true);
   assert.deepEqual(ops.events, [
     "read-tag",
@@ -289,86 +322,141 @@ test("release publishes the tested tarball, verifies the registry install, then 
     "read-package",
     "publish",
     "read-version",
-    "install",
+  ]);
+  assert.equal(readFileSync(output, "utf8"), "release_ready=true\n");
+});
+
+test("registry phase verifies consumers without publishing or creating GitHub records", async (t) => {
+  const c = candidate(t);
+  const ops = operations(c, {
+    async getVersion() {
+      return { dist: { integrity: c.integrity } };
+    },
+  });
+  const result = await runRelease({
+    ...c,
+    phase: "registry-check",
+    env: environment(),
+    operations: ops,
+  });
+  assert.equal(result.status, "verified");
+  assert.deepEqual(ops.events, ["read-tag", "read-release", "install"]);
+});
+
+test("finalize phase creates matching GitHub records without executing package code", async (t) => {
+  const c = candidate(t);
+  const ops = operations(c, {
+    async getVersion() {
+      return { dist: { integrity: c.integrity } };
+    },
+  });
+  const result = await runRelease({
+    ...c,
+    phase: "finalize",
+    env: environment(),
+    operations: ops,
+  });
+  assert.equal(result.status, "released");
+  assert.deepEqual(ops.events, [
+    "read-tag",
+    "read-release",
     "create-tag",
     "create-release",
   ]);
 });
 
-test("equal registry integrity and existing matching GitHub records make a rerun safe", async (t) => {
+test("unknown phases and OIDC credentials outside publication fail before remote operations", async (t) => {
   const c = candidate(t);
-  const ops = operations(c, {
-    async getTag() {
-      return sha;
-    },
-    async getRelease() {
-      return { tag_name: "v1.2.0", target_commitish: sha };
-    },
-    async getVersion() {
-      return { dist: { integrity: c.integrity } };
-    },
-    async packageExists() {
-      assert.fail("existing version does not need package creation detection");
-    },
-    async publish() {
-      assert.fail("must not publish existing bytes");
-    },
-    async createTag() {
-      assert.fail("must not recreate tag");
-    },
-    async createRelease() {
-      assert.fail("must not recreate release");
-    },
-  });
-  assert.equal(
-    (await runRelease({ ...c, env: environment(), operations: ops })).published,
-    false
-  );
-  assert.deepEqual(ops.events, ["install"]);
+  for (const [phase, changes] of [
+    ["all", {}],
+    ["registry-check", { ACTIONS_ID_TOKEN_REQUEST_TOKEN: "unexpected" }],
+    ["finalize", { ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.example" }],
+  ]) {
+    const ops = operations(c);
+    await assert.rejects(
+      runRelease({ ...c, phase, env: environment(changes), operations: ops }),
+      /phase|OIDC/
+    );
+    assert.deepEqual(ops.events, []);
+  }
 });
 
-test("a conflicting registry integrity cannot be overwritten", async (t) => {
+test("matching registry and GitHub identities make every phase safe to rerun", async (t) => {
   const c = candidate(t);
-  const ops = operations(c, {
-    async getVersion() {
-      return { dist: { integrity: "sha512-different" } };
-    },
-  });
-  await assert.rejects(
-    runRelease({ ...c, env: environment(), operations: ops }),
-    /integrity/i
-  );
-  assert(!ops.events.includes("publish"));
-  assert(!ops.events.includes("create-tag"));
-});
-
-test("conflicting tags and release commits stop before an npm write", async (t) => {
-  for (const changes of [
-    {
-      async getTag() {
-        return previousSha;
-      },
-    },
-    {
+  for (const phase of ["publish", "registry-check", "finalize"]) {
+    const ops = operations(c, {
       async getTag() {
         return sha;
       },
       async getRelease() {
-        return { tag_name: "v1.2.0", target_commitish: previousSha };
+        return { tag_name: "v1.2.0", target_commitish: sha };
       },
-    },
-  ]) {
-    const c = candidate(t);
-    const ops = operations(c, changes);
-    await assert.rejects(
-      runRelease({ ...c, env: environment(), operations: ops }),
-      /SHA|commit/i
-    );
-    assert(!ops.events.includes("publish"));
+      async getVersion() {
+        return { dist: { integrity: c.integrity } };
+      },
+    });
+    await runRelease({ ...c, phase, env: environment(), operations: ops });
+    assert.deepEqual(ops.events, phase === "registry-check" ? ["install"] : []);
   }
 });
 
-test("a release keeps its actual tag identity when its advisory target branch moves", async (t) => {
+test("all phases reject mismatched registry integrity and missing versions outside publication", async (t) => {
+  const c = candidate(t);
+  for (const phase of ["publish", "registry-check", "finalize"]) {
+    const ops = operations(c, {
+      async getVersion() {
+        return { dist: { integrity: "sha512-different" } };
+      },
+    });
+    await assert.rejects(
+      runRelease({ ...c, phase, env: environment(), operations: ops }),
+      /integrity/
+    );
+    assert(
+      !ops.events.some((event) =>
+        ["publish", "install", "create-tag", "create-release"].includes(event)
+      )
+    );
+  }
+  for (const phase of ["registry-check", "finalize"]) {
+    const ops = operations(c);
+    await assert.rejects(
+      runRelease({ ...c, phase, env: environment(), operations: ops }),
+      /not.*registry|absent|missing/i
+    );
+    assert.deepEqual(ops.events, ["read-tag", "read-release", "read-version"]);
+  }
+});
+
+test("conflicting tags, targets, draft/prerelease, and releases without tags fail before publication", async (t) => {
+  const c = candidate(t);
+  const release = { tag_name: "v1.2.0", target_commitish: sha };
+  for (const [tag, record, expected] of [
+    [previousSha, null, /SHA/],
+    [sha, { ...release, target_commitish: previousSha }, /commit SHA/],
+    [sha, { ...release, draft: true }, /published stable/],
+    [sha, { ...release, prerelease: true }, /published stable/],
+    [null, release, /no matching commit tag/],
+    [sha, { ...release, tag_name: "v9.9.9" }, /identity/],
+    [sha, { ...release, target_commitish: null }, /identity/],
+  ]) {
+    const ops = operations(c, {
+      async getTag() {
+        return tag;
+      },
+      async getRelease() {
+        return record;
+      },
+    });
+    await assert.rejects(
+      runRelease({ ...c, env: environment(), operations: ops }),
+      expected
+    );
+    assert.deepEqual(ops.events, []);
+  }
+});
+
+test("an advisory target branch may move while the authoritative tag matches", async (t) => {
   const c = candidate(t);
   const ops = operations(c, {
     async getTag() {
@@ -380,20 +468,25 @@ test("a release keeps its actual tag identity when its advisory target branch mo
     async getVersion() {
       return { dist: { integrity: c.integrity } };
     },
-    async createRelease() {
-      assert.fail("matching release already exists");
-    },
   });
   assert.equal(
-    (await runRelease({ ...c, env: environment(), operations: ops })).published,
-    false
+    (
+      await runRelease({
+        ...c,
+        phase: "finalize",
+        env: environment(),
+        operations: ops,
+      })
+    ).status,
+    "released"
   );
+  assert.deepEqual(ops.events, []);
 });
 
-test("registry visibility retries are bounded and tags wait for a successful install", async (t) => {
+test("publication visibility retries are bounded and integrity checked after publication", async (t) => {
   const c = candidate(t);
-  let reads = 0;
-  let waits = 0;
+  let reads = 0,
+    waits = 0;
   const ops = operations(c, {
     async getVersion() {
       return ++reads < 4 ? null : { dist: { integrity: c.integrity } };
@@ -403,42 +496,35 @@ test("registry visibility retries are bounded and tags wait for a successful ins
     ...c,
     env: environment(),
     operations: ops,
-    sleep: async () => waits++,
     maxAttempts: 3,
+    sleep: async () => waits++,
   });
   assert.equal(waits, 2);
-  assert(ops.events.indexOf("install") < ops.events.indexOf("create-tag"));
-  const neverVisible = operations(c, {
-    async getVersion() {
-      return null;
-    },
-  });
-  await assert.rejects(
-    runRelease({
-      ...c,
-      env: environment(),
-      operations: neverVisible,
-      sleep: async () => {},
-      maxAttempts: 2,
-    }),
-    /visible|registry/i
-  );
-  assert(!neverVisible.events.includes("create-tag"));
-  const failedInstall = operations(c, {
-    async verifyInstall() {
-      throw new Error("consumer failed");
-    },
-  });
-  await assert.rejects(
-    runRelease({ ...c, env: environment(), operations: failedInstall }),
-    /consumer failed/
-  );
-  assert(!failedInstall.events.includes("create-tag"));
+  for (const answer of [null, { dist: { integrity: "sha512-wrong" } }]) {
+    let reads = 0;
+    const ops = operations(c, {
+      async getVersion() {
+        return ++reads === 1 ? null : answer;
+      },
+    });
+    await assert.rejects(
+      runRelease({
+        ...c,
+        env: environment(),
+        operations: ops,
+        maxAttempts: 2,
+        sleep: async () => {},
+      }),
+      /registry|integrity/
+    );
+    assert(!ops.events.includes("create-tag"));
+  }
 });
 
-test("a missing package waits for manual publication without npm or GitHub writes", async (t) => {
+test("a missing first package waits and explains exact archive publication and recovery", async (t) => {
   const c = candidate(t);
   const summary = join(c.cwd, "summary.md");
+  const output = join(c.cwd, "output");
   const ops = operations(c, {
     async packageExists() {
       this.events.push("read-package");
@@ -449,58 +535,61 @@ test("a missing package waits for manual publication without npm or GitHub write
     ...c,
     env: environment({
       GITHUB_STEP_SUMMARY: summary,
+      GITHUB_OUTPUT: output,
       GITHUB_RUN_ID: "123",
-      GITHUB_RUN_ATTEMPT: "2",
       TOKENOMICS_RELEASE_ARTIFACT_ID: "456",
     }),
     operations: ops,
   });
   assert.equal(result.status, "awaiting-first-publication");
   assert.equal(result.published, false);
-  assert.equal(result.sha, sha);
   assert.deepEqual(ops.events, [
     "read-tag",
     "read-release",
     "read-version",
     "read-package",
   ]);
-  const status = readFileSync(summary, "utf8");
-  assert(status.includes(sha));
-  assert(status.includes(c.filename));
-  assert(status.includes(c.integrity));
-  assert(status.includes("/actions/runs/123/artifacts/456"));
+  const text = readFileSync(summary, "utf8");
+  for (const value of [
+    sha,
+    c.filename,
+    c.integrity,
+    "/actions/runs/123/artifacts/456",
+    "node tools/release.cjs verify",
+    "npm publish",
+    "--ignore-scripts",
+    "exact",
+    "30 days",
+    "rerun",
+    "environment",
+    "direct publishing",
+    "stage-only",
+    "main",
+  ])
+    assert(text.includes(value), value);
+  assert(!existsSync(output));
 });
 
-test("rerunning after manual publication verifies the exact version before creating GitHub records", async (t) => {
+test("failed registry consumers cannot produce a successful verification result", async (t) => {
   const c = candidate(t);
   const ops = operations(c, {
     async getVersion() {
-      this.events.push("read-version");
       return { dist: { integrity: c.integrity } };
     },
-    async packageExists() {
-      assert.fail("the manually published version already exists");
-    },
-    async publish() {
-      assert.fail("the manually published archive must not be republished");
+    async verifyInstall() {
+      throw new Error("consumer failed");
     },
   });
-  const result = await runRelease({
-    ...c,
-    env: environment(),
-    operations: ops,
-  });
-  assert.equal(result.status, "released");
-  assert.equal(result.published, false);
-  assert.deepEqual(ops.events, [
-    "read-tag",
-    "read-release",
-    "read-version",
-    "read-version",
-    "install",
-    "create-tag",
-    "create-release",
-  ]);
+  await assert.rejects(
+    runRelease({
+      ...c,
+      phase: "registry-check",
+      env: environment(),
+      operations: ops,
+    }),
+    /consumer failed/
+  );
+  assert(!ops.events.includes("create-tag"));
 });
 
 test("local archive verification accepts the tested identity and rejects changed bytes or SHA", (t) => {
@@ -552,30 +641,73 @@ test("registry 404 is absence, while auth failures, server errors, and bad JSON 
   await assert.rejects(nullMetadata.packageExists(name));
 });
 
-test("concurrent matching tag and release creation is safe to retry", async (t) => {
+test("concurrent tag creation accepts only a rechecked matching commit", async (t) => {
   const c = candidate(t);
-  let tagExists = false;
-  let releaseExists = false;
-  const ops = operations(c, {
-    async getTag() {
-      return tagExists ? sha : null;
-    },
-    async getRelease() {
-      return releaseExists
-        ? { tag_name: "v1.2.0", target_commitish: sha }
-        : null;
-    },
-    async createTag() {
-      tagExists = true;
-      throw Object.assign(new Error("already exists"), { status: 422 });
-    },
-    async createRelease() {
-      releaseExists = true;
-      throw Object.assign(new Error("already exists"), { status: 422 });
-    },
-  });
-  await runRelease({ ...c, env: environment(), operations: ops });
-  assert(tagExists && releaseExists);
+  for (const status of [409, 422])
+    for (const concurrent of [sha, previousSha, null]) {
+      let reads = 0;
+      const ops = operations(c, {
+        async getVersion() {
+          return { dist: { integrity: c.integrity } };
+        },
+        async getTag() {
+          return ++reads === 1 ? null : concurrent;
+        },
+        async createTag() {
+          throw Object.assign(new Error("concurrent tag"), { status });
+        },
+      });
+      const result = runRelease({
+        ...c,
+        phase: "finalize",
+        env: environment(),
+        operations: ops,
+      });
+      if (concurrent === sha) await result;
+      else await assert.rejects(result, /concurrent tag/);
+      assert.equal(reads, 2);
+      assert.equal(ops.events.includes("create-release"), concurrent === sha);
+    }
+});
+
+test("concurrent release creation rechecks identity, publication status, and presence", async (t) => {
+  const c = candidate(t);
+  for (const status of [409, 422])
+    for (const record of [
+      null,
+      { tag_name: "v1.2.0", target_commitish: previousSha },
+      { tag_name: "v1.2.0", target_commitish: sha, draft: true },
+      { tag_name: "v1.2.0", target_commitish: sha },
+    ]) {
+      let reads = 0;
+      const ops = operations(c, {
+        async getVersion() {
+          return { dist: { integrity: c.integrity } };
+        },
+        async getTag() {
+          return sha;
+        },
+        async getRelease() {
+          return ++reads === 1 ? null : record;
+        },
+        async createRelease() {
+          throw Object.assign(new Error("concurrent release"), { status });
+        },
+      });
+      const result = runRelease({
+        ...c,
+        phase: "finalize",
+        env: environment(),
+        operations: ops,
+      });
+      if (record?.target_commitish === sha && !record.draft) await result;
+      else
+        await assert.rejects(
+          result,
+          /concurrent release|commit SHA|published stable/
+        );
+      assert.equal(reads, 2);
+    }
 });
 
 test("a failed npm publication cannot create a GitHub release", async (t) => {
@@ -741,4 +873,90 @@ test("registry consumer verification installs the exact version, checks lock int
     ["install", "ls", "consumer.cjs", "consumer.mjs"]
   );
   assert(!existsSync(installDirectory));
+});
+
+test("registry lock integrity or version mismatches fail before executing any installed code", (t) => {
+  const c = candidate(t);
+  for (const installed of [
+    undefined,
+    { version: "1.2.0", integrity: "sha512-wrong" },
+    { version: "1.3.0", integrity: c.integrity },
+  ]) {
+    const commands = [];
+    assert.throws(
+      () =>
+        verifyInstall(c, {
+          env: environment(),
+          execFile(command, args, options) {
+            commands.push(args[0]);
+            if (args[0] === "install")
+              writeFileSync(
+                join(options.cwd, "package-lock.json"),
+                JSON.stringify({
+                  packages: { [`node_modules/${name}`]: installed },
+                })
+              );
+          },
+        }),
+      /tested candidate integrity/
+    );
+    assert.deepEqual(commands, ["install"]);
+  }
+});
+
+test("registry gitHead, when present, must match the same full candidate SHA in every phase", async (t) => {
+  const c = candidate(t);
+  for (const phase of ["publish", "registry-check", "finalize"])
+    for (const gitHead of [previousSha, "main", "0".repeat(40), sha]) {
+      const ops = operations(c, {
+        async getVersion() {
+          return { gitHead, dist: { integrity: c.integrity } };
+        },
+      });
+      const result = runRelease({
+        ...c,
+        phase,
+        env: environment(),
+        operations: ops,
+      });
+      if (gitHead === sha) await result;
+      else {
+        await assert.rejects(result, /gitHead|commit SHA/);
+        assert(
+          !ops.events.some((value) =>
+            ["publish", "install", "create-tag", "create-release"].includes(
+              value
+            )
+          )
+        );
+      }
+    }
+});
+
+test("registry consumers require no GitHub token and public metadata sends no authorization", async (t) => {
+  const c = candidate(t);
+  const ops = operations(c, {
+    async getVersion() {
+      return { dist: { integrity: c.integrity } };
+    },
+  });
+  assert.equal(
+    (
+      await runRelease({
+        ...c,
+        phase: "registry-check",
+        env: environment({ GITHUB_TOKEN: undefined }),
+        operations: ops,
+      })
+    ).status,
+    "verified"
+  );
+  const publicOps = createOperations({
+    env: environment({ GITHUB_TOKEN: undefined }),
+    fetchImpl: async (url, options) => {
+      assert.equal(options.headers.Authorization, undefined);
+      return new Response("missing", { status: 404 });
+    },
+  });
+  assert.equal(await publicOps.getTag("v1.2.0"), null);
 });

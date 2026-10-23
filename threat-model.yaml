@@ -402,9 +402,9 @@ known_issues:
 
   - id: KI-037
     description: |
-      Behavior: NeverlandUiPriceMarketLibrary.getTokenPriceInUSDResolved has no code-length guard before its typed provider/oracle calls. If canonical registry id 1 is unregistered, resolves to a provider with no code, or the provider returns a nonzero oracle address with no code, a call can return empty data and revert during caller-side ABI decoding outside try/catch. When a non-DUST reward token needs the oracle path, getAllPrices, getUiBootstrap, and getUiFullBundle can revert instead of returning an unresolved zero price. The zero-oracle-address case is already handled; the canonical-provider NatSpec overstates graceful degradation for missing/no-code providers.
+      Behavior: NeverlandUiPriceMarketLibrary.getTokenPriceInUSDResolved has no code-length guard before its typed provider/oracle calls. If canonical registry id 1 is unregistered, resolves to a provider with no code, or the provider returns a nonzero oracle address with no code, a call can return empty data and revert during caller-side ABI decoding outside try/catch. When a non-DUST reward token needs the oracle path, getAllPrices, getUiBootstrap, and getUiFullBundle can revert instead of returning an unresolved zero price. The zero-oracle-address case is already handled; the canonical-provider NatSpec overstates graceful degradation for missing/no-code providers. NeverlandUiProvider._tryMarketId has the same missing guard: getRegisteredPoolMarkets reverts if any registered provider has no code, instead of returning an empty market label; its NatSpec also overstates failure isolation.
       Accepted for public version 1.2.0: this is a read-only UI availability limitation, and no value-moving path consumes these helpers (AS-022). This release preserves its pinned contract snapshot.
-      Remediation: provider/oracle code-length guards and regression tests are prepared in neverland-contracts for the next release; they are excluded from this version.
+      Remediation: price-path provider/oracle code-length guards and regression tests are prepared in neverland-contracts for the next release; they are excluded from this version. The market-discovery provider guard remains pending there.
       Reported by: CodeRabbit in PR #2, review comment 4352121746 (https://github.com/Neverland-Money/neverland-tokenomics/pull/2#discussion_r4352121746).
       Still reportable: value-moving effects, unauthorized provider/oracle changes, or a distinct failure mechanism, including malformed return data from a contract with code.
     references:
@@ -710,7 +710,7 @@ assumptions:
   - id: AS-022
     name: UI helper contracts are informational
     details: |
-      NeverlandUiProvider and its linked libraries are read-only and ownerless. No value-moving path consumes them, so their failures affect only off-chain reads (KI-026 and KI-037).
+      NeverlandUiProvider and its linked libraries are read-only and ownerless. No value-moving path consumes them, so their failures affect only off-chain reads (KI-026 and KI-037). Callers must handle whole-call failures, including getRegisteredPoolMarkets when a registered provider has no code (KI-037).
       NeverlandDustHelper is owner-configured and stateful. It prices DUST from AMM spot sources (Uniswap V4, Balancer reCLAMM, Uniswap V3, Uniswap V2) or feed compositions, and uses the owner-set hardcoded price only when no source is configured; a configured source that fails yields 0. Only the owner writes its cache; after the cache TTL, getPrice reads live, manipulable spot prices. Its Chainlink-style feed interface advances rounds only on owner refreshes and can record 0. It has no TWAP; its only on-chain reader is the read-only NeverlandUiProvider, and it must never serve as a lending collateral or liquidation oracle.
       Still reportable: spot manipulation of NeverlandDustHelper outputs only if a value-moving on-chain consumer uses them.
     references:

@@ -11,11 +11,25 @@ const inputPath = path.resolve(
   `artifacts/build-info/${artifact.buildInfoId}.json`
 );
 const outputPath = inputPath.replace(/\.json$/, ".output.json");
+const linkedArtifactPath = path.resolve(
+  "artifacts/src/utils/NeverlandUiProvider.sol/NeverlandUiProvider.json"
+);
+const vendorPath = path.resolve(
+  "vendor/openzeppelin-contracts-upgradeable/contracts/token/ERC20/ERC20Upgradeable.sol"
+);
 
 // Run serially so each tamper is restored before another verifier or consumer reads it.
-test("the package verifier rejects stale or mismatched Hardhat 3 compiler evidence", async (t) => {
+test("the package verifier rejects corrupted source, dependency, and compiler evidence", async (t) => {
   await verify();
   const cases = [
+    [
+      "wrong recorded source hash",
+      path.resolve("package.json"),
+      (manifest) => {
+        manifest.neverland.sourceHash = `sha256:${"0".repeat(64)}`;
+      },
+      /Solidity sources changed since the recorded sync/,
+    ],
     [
       "unknown build id",
       artifactPath,
@@ -89,6 +103,30 @@ test("the package verifier rejects stale or mismatched Hardhat 3 compiler eviden
       /stale bytecode/,
     ],
     [
+      "missing creation library links",
+      linkedArtifactPath,
+      (a) => {
+        assert(
+          Object.keys(a.linkReferences).length,
+          "fixture must use libraries"
+        );
+        a.linkReferences = {};
+      },
+      /stale library link references/,
+    ],
+    [
+      "missing runtime library links",
+      linkedArtifactPath,
+      (a) => {
+        assert(
+          Object.keys(a.deployedLinkReferences).length,
+          "fixture must use runtime libraries"
+        );
+        a.deployedLinkReferences = {};
+      },
+      /stale runtime link references/,
+    ],
+    [
       "stale runtime",
       artifactPath,
       (a) => {
@@ -110,6 +148,18 @@ test("the package verifier rejects stale or mismatched Hardhat 3 compiler eviden
       }
     });
   }
+  await t.test(
+    "vendored Solidity differs from the pinned dependency",
+    async () => {
+      const original = fs.readFileSync(vendorPath);
+      try {
+        fs.appendFileSync(vendorPath, "\n// corrupted package dependency\n");
+        await assert.rejects(verify(), /vendored dependency drift/);
+      } finally {
+        fs.writeFileSync(vendorPath, original);
+      }
+    }
+  );
   await t.test("missing artifact", async () => {
     fs.rmSync(artifactPath);
     try {

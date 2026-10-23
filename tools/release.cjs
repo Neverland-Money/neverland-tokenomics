@@ -40,10 +40,10 @@ function commitSha(sha) {
   return sha;
 }
 
-function mainPush(env) {
+function mainRelease(env) {
   return (
     env.GITHUB_REPOSITORY === repository &&
-    env.GITHUB_EVENT_NAME === "push" &&
+    ["push", "workflow_dispatch"].includes(env.GITHUB_EVENT_NAME) &&
     env.GITHUB_REF === "refs/heads/main"
   );
 }
@@ -63,7 +63,7 @@ function planRelease({
 } = {}) {
   const current = manifest(cwd);
   let requested = false;
-  if (mainPush(env)) {
+  if (mainRelease(env) && env.GITHUB_EVENT_NAME === "push") {
     const before = commitSha(env.GITHUB_EVENT_BEFORE);
     const previous = JSON.parse(
       execFile("git", ["show", `${before}:package.json`], {
@@ -88,6 +88,8 @@ function planRelease({
       requested = true;
     }
   }
+  if (mainRelease(env) && env.GITHUB_EVENT_NAME === "workflow_dispatch")
+    requested = true;
   const result = { release_requested: requested, version: current.version };
   if (env.GITHUB_OUTPUT)
     appendFileSync(
@@ -243,7 +245,8 @@ function createOperations({
   async function request(url, { github = false, method = "GET", body } = {}) {
     const headers = { Accept: "application/json" };
     if (github) {
-      headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
+      if (env.GITHUB_TOKEN)
+        headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
       headers["X-GitHub-Api-Version"] = "2022-11-28";
     }
     if (body) headers["Content-Type"] = "application/json";
@@ -344,6 +347,13 @@ async function checkGitHub(operations, tag, sha) {
 }
 
 function checkIntegrity(version, candidate) {
+  if (
+    version.gitHead !== undefined &&
+    commitSha(version.gitHead) !== candidate.sha
+  )
+    throw new Error(
+      "Registry version gitHead differs from the release candidate SHA"
+    );
   if (version.dist?.integrity !== candidate.integrity)
     throw new Error(
       "Registry version integrity differs from the tested candidate"
@@ -352,6 +362,7 @@ function checkIntegrity(version, candidate) {
 
 async function runRelease({
   artifactDirectory,
+  phase = "publish",
   env = process.env,
   cwd = root,
   operations,
@@ -359,12 +370,21 @@ async function runRelease({
   delayMs = 5_000,
   sleep: wait = sleep,
 } = {}) {
-  if (!mainPush(env))
+  if (!["publish", "registry-check", "finalize"].includes(phase))
+    throw new Error("Unknown release phase");
+  if (
+    phase !== "publish" &&
+    (env.ACTIONS_ID_TOKEN_REQUEST_URL || env.ACTIONS_ID_TOKEN_REQUEST_TOKEN)
+  )
     throw new Error(
-      "Releases require a push to the public repository main branch"
+      "OIDC credentials are forbidden outside the publication phase"
+    );
+  if (!mainRelease(env))
+    throw new Error(
+      "Releases require a push or workflow dispatch on the public repository main branch"
     );
   const sha = commitSha(env.GITHUB_SHA);
-  if (!env.GITHUB_TOKEN)
+  if (phase !== "registry-check" && !env.GITHUB_TOKEN)
     throw new Error("GITHUB_TOKEN is required for release verification");
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 12)
     throw new Error("Registry retry count is invalid");
@@ -374,7 +394,7 @@ async function runRelease({
   const existing = await checkGitHub(ops, tag, sha);
   const registered = await ops.getVersion(candidate.name, candidate.version);
   if (registered) checkIntegrity(registered, candidate);
-  else {
+  else if (phase === "publish") {
     if (!(await ops.packageExists(candidate.name))) {
       const artifact =
         /^\d+$/.test(env.GITHUB_RUN_ID || "") &&
@@ -394,6 +414,20 @@ async function runRelease({
         "",
         "Package checks passed. This job made no npm, tag, or GitHub release changes.",
         "",
+        "Download and extract this exact artifact. From the reviewed checkout, verify its metadata and archive bytes:",
+        "",
+        `\`node tools/release.cjs verify <artifact-directory> ${sha}\``,
+        "",
+        "Publish exactly the verified .tgz below with your interactive npm credentials. Do not publish from a checkout or rebuild the archive:",
+        "",
+        `\`npm publish <artifact-directory>/${candidate.filename} --ignore-scripts --access public --registry ${registry}\``,
+        "",
+        "Configure the npm trusted publisher for this repository, workflow test.yml, and environment npm. Explicitly allow direct publishing: this workflow uses npm publish, and stage-only publisher permissions are insufficient. In GitHub, restrict that environment to the selected branch main before enabling automation.",
+        "",
+        "Then rerun this publication job in this original Actions run to verify the published bytes and finalize its tag/release. The original artifact is retained for 30 days. If it expires within GitHub's rerun window, rerun ALL jobs at this original commit; rebuilt bytes must still match the published integrity.",
+        "",
+        "For an unpublished version missed by an earlier failed check, workflow_dispatch on main builds a fresh checked candidate even without another version bump. For an already published version, use the original run: a rebuilt candidate with different bytes, registry gitHead, or tag SHA fails closed. Beyond the rerun window, preserve the original artifact for reviewed manual recovery; never bypass integrity checks.",
+        "",
       ].join("\n");
       if (env.GITHUB_STEP_SUMMARY)
         appendFileSync(env.GITHUB_STEP_SUMMARY, summary);
@@ -406,20 +440,44 @@ async function runRelease({
       };
     }
     await ops.publish(candidate);
+  } else {
+    throw new Error("Release version is not visible in the registry");
   }
-  let visible = false;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const version = await ops.getVersion(candidate.name, candidate.version);
-    if (version) {
-      checkIntegrity(version, candidate);
-      visible = true;
-      break;
+  if (phase === "publish") {
+    let visible = false;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const version = await ops.getVersion(candidate.name, candidate.version);
+      if (version) {
+        checkIntegrity(version, candidate);
+        visible = true;
+        break;
+      }
+      if (attempt + 1 < maxAttempts) await wait(delayMs);
     }
-    if (attempt + 1 < maxAttempts) await wait(delayMs);
+    if (!visible)
+      throw new Error(
+        "Published version did not become visible in the registry"
+      );
+    if (env.GITHUB_OUTPUT)
+      appendFileSync(env.GITHUB_OUTPUT, "release_ready=true\n");
+    return {
+      name: candidate.name,
+      version: candidate.version,
+      sha,
+      status: "published",
+      published: !registered,
+    };
   }
-  if (!visible)
-    throw new Error("Published version did not become visible in the registry");
-  await ops.verifyInstall(candidate);
+  if (phase === "registry-check") {
+    await ops.verifyInstall(candidate);
+    return {
+      name: candidate.name,
+      version: candidate.version,
+      sha,
+      status: "verified",
+      published: false,
+    };
+  }
   if (!existing.tag) {
     try {
       await ops.createTag(tag, sha);
@@ -442,7 +500,7 @@ async function runRelease({
     version: candidate.version,
     sha,
     status: "released",
-    published: !registered,
+    published: false,
   };
 }
 
@@ -450,15 +508,21 @@ async function main() {
   const [command, artifactDirectory, ...extra] = process.argv.slice(2);
   if (command === "plan" && !artifactDirectory)
     console.log(JSON.stringify(planRelease()));
-  else if (command === "publish" && artifactDirectory && !extra.length)
-    console.log(JSON.stringify(await runRelease({ artifactDirectory })));
+  else if (
+    ["publish", "registry-check", "finalize"].includes(command) &&
+    artifactDirectory &&
+    !extra.length
+  )
+    console.log(
+      JSON.stringify(await runRelease({ artifactDirectory, phase: command }))
+    );
   else if (command === "verify" && artifactDirectory && extra.length === 1)
     console.log(
       JSON.stringify(readCandidate(artifactDirectory, root, extra[0]))
     );
   else
     throw new Error(
-      "Usage: node tools/release.cjs plan | publish <artifact-directory> | verify <artifact-directory> <commit-sha>"
+      "Usage: node tools/release.cjs plan | publish <artifact-directory> | registry-check <artifact-directory> | finalize <artifact-directory> | verify <artifact-directory> <commit-sha>"
     );
 }
 

@@ -20,7 +20,7 @@ This repository is the public source and package mirror for Neverland tokenomics
 ### Emissions layer
 
 - `DustRewardsController` adapts Aave-style reward accrual for DUST emissions.
-- `DustLockTransferStrategy` delivers claimed DUST to a wallet or veDUST lock. Gross accrual is preserved; the realized commitment determines the release penalty, which is sent to the configured early-exit burn wallet.
+- `DustLockTransferStrategy` delivers claimed DUST to a wallet or veDUST lock. Gross accrual is preserved; the realized commitment determines the release penalty, which is transferred to `DustLock.earlyWithdrawTreasury`, a team-mutable address. This transfer does not burn DUST.
 
 ### Self-repaying loan layer
 

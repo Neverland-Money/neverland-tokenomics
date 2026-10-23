@@ -57,6 +57,9 @@
   "types": "./dist/index.d.ts",
   "typesVersions": {
     "*": {
+      "addresses": [
+        "dist/generated/addresses.json"
+      ],
       "types": [
         "dist/generated/types/index.d.ts"
       ],

@@ -139,6 +139,7 @@ test("the installed release supports JS, TypeScript, and every Solidity source",
       "--target",
       "es2022",
       "--strict",
+      "--resolveJsonModule",
       "consumer.mts",
     ]);
 
@@ -156,6 +157,7 @@ test("the installed release supports JS, TypeScript, and every Solidity source",
       "--target",
       "es2022",
       "--strict",
+      "--resolveJsonModule",
       "consumer.cts",
     ]);
     run(process.execPath, [
@@ -168,6 +170,7 @@ test("the installed release supports JS, TypeScript, and every Solidity source",
       "--target",
       "es2022",
       "--strict",
+      "--resolveJsonModule",
       "consumer.cts",
     ]);
 
