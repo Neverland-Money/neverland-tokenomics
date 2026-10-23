@@ -50,10 +50,21 @@
     "typescript": "^5.9.3"
   },
   "resolutions": {
-    "@types/minimatch": "5.1.2"
+    "@types/minimatch": "5.1.2",
+    "typechain/glob": "13.0.6"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "types": [
+        "dist/generated/types/index.d.ts"
+      ],
+      "types/*": [
+        "dist/generated/types/*.d.ts"
+      ]
+    }
+  },
   "files": [
     "src",
     "artifacts/src",

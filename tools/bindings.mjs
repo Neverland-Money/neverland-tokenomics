@@ -3,12 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { id } from "ethers";
-import { glob, runTypeChain } from "typechain";
+import { glob as typechainGlob, runTypeChain } from "typechain";
 import packaging from "./package.cjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const slash = (file) => file.split(path.sep).join("/");
+// Preserve the POSIX paths expected by TypeChain when glob returns Windows paths.
+const glob = (...args) => typechainGlob(...args).map(slash);
 const { sources, remappings } = packaging.productionSources();
 const names = new Map();
 const legacyNames = new Set();

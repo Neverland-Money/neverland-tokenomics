@@ -158,6 +158,18 @@ test("the installed release supports JS, TypeScript, and every Solidity source",
       "--strict",
       "consumer.cts",
     ]);
+    run(process.execPath, [
+      resolve("node_modules/typescript/bin/tsc"),
+      "--noEmit",
+      "--module",
+      "commonjs",
+      "--moduleResolution",
+      "node",
+      "--target",
+      "es2022",
+      "--strict",
+      "consumer.cts",
+    ]);
 
     const packageRoot = join(
       directory,
